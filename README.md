@@ -130,6 +130,19 @@ const route = stack.router.routeTask({
 
 ---
 
+## 🤗 Open-Weights Models & SFT Dataset (Trained Through `krusch-stack`)
+
+We use `krusch-stack` to generate AST-grounded 11-phase code audit trajectories and unit-test-verified (`npm test` / `pytest`, exit `0`) bug remediations, then distill them back into open-weights QLoRA adapters for the `L2` and `L2.5` Cascade Router tiers:
+
+| Resource | Hugging Face Hub | Cascade Role / Base Model |
+|----------|------------------|---------------------------|
+| **SFT Dataset (`17,899` rows)** | [`krush420/sovereign-code-audit-sft`](https://huggingface.co/datasets/krush420/sovereign-code-audit-sft) | 3 Splits: `argon_golden_remediations` (`401`), `elitist_120b_teacher` (`2,208`), `code_audit_11phase_sft` (`15,290`) |
+| **30B Student QLoRA (`L2`)** | [`krush420/qwen3-coder-30b-sre-lora`](https://huggingface.co/krush420/qwen3-coder-30b-sre-lora) | [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) (`30.5B` total / `3.3B` active MoE) |
+| **120B Teacher QLoRA (`L2.5`)** | [`krush420/gpt-oss-120b-sre-lora`](https://huggingface.co/krush420/gpt-oss-120b-sre-lora) | [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) (`116.8B` total / `5.1B` active MXFP4 MoE) |
+
+---
+
 ## 📜 License
 
 MIT © Kevin Ruschman (`kruschdev`)
+
