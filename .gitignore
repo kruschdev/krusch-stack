@@ -1,0 +1,7 @@
+node_modules/
+.krusch-stack/
+.agent/context.db*
+.env
+*.log
+.DS_Store
+coverage/

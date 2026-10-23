@@ -1,0 +1,80 @@
+{
+  "name": "krusch-stack",
+  "version": "1.0.0",
+  "description": "The unified Sovereign AI & Coding Agent Stack — one-command installer and MCP gateway bundling Tier 1 Working Memory (krusch-context-mcp), Tier 2A Git DAG & AST Graph (krusch-git), Tier 2B Page-Anchored OS Filesystem (krusch-fs), Tier 3 2PC Staged Execution Harness (krusch-harness), Frontend Design Engine (krusch-frontend-mcp), Google Workspace Hub (g-krusch), and L1-L3 Cascade Router.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "krusch-stack": "./bin/krusch-stack.js",
+    "kruschstack": "./bin/krusch-stack.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./mcp": "./src/mcp/server.js",
+    "./sqlite": "./src/db/sqlite.js",
+    "./installer": "./src/installer/ide-config.js",
+    "./doctor": "./src/installer/doctor.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin",
+    "src",
+    "db",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".env.example",
+    "spec.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/krusch-stack.js mcp",
+    "mcp": "node bin/krusch-stack.js mcp",
+    "init": "node bin/krusch-stack.js init",
+    "doctor": "node bin/krusch-stack.js doctor",
+    "serve": "node bin/krusch-stack.js serve",
+    "test": "node --test tests/*.test.js"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "coding-agents",
+    "agentic-ai",
+    "claude-code",
+    "cursor",
+    "windsurf",
+    "antigravity",
+    "ast-graph",
+    "git-dag",
+    "episodic-memory",
+    "coding-harness",
+    "cascade-router",
+    "design-system",
+    "google-workspace",
+    "sqlite",
+    "pgvector",
+    "sovereign-ai"
+  ],
+  "author": "Kevin Ruschman (kruschdev)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kruschdev/krusch-stack.git"
+  },
+  "homepage": "https://github.com/kruschdev/krusch-stack#readme",
+  "bugs": {
+    "url": "https://github.com/kruschdev/krusch-stack/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "optionalDependencies": {
+    "pg": "^8.20.0"
+  }
+}

@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: krusch-stack-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-krusch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-krusch_stack_local}
+      POSTGRES_DB: ${POSTGRES_DB:-krusch_stack}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - krusch_postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-krusch} -d $${POSTGRES_DB:-krusch_stack}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  krusch-stack:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: krusch-stack
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      KRUSCH_STACK_PORT: 3780
+      KRUSCH_STACK_PROFILE: ${KRUSCH_STACK_PROFILE:-full}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-krusch}:${POSTGRES_PASSWORD:-krusch_stack_local}@postgres:5432/${POSTGRES_DB:-krusch_stack}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://127.0.0.1:11434}
+    ports:
+      - "${KRUSCH_STACK_PORT:-3780}:3780"
+    volumes:
+      - krusch_stack_data:/app/.krusch-stack
+
+volumes:
+  krusch_postgres_data:
+  krusch_stack_data:
