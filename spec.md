@@ -35,14 +35,14 @@
 ## 3. Frozen Module Contracts (Subagent Boundaries)
 
 ### Module Group A — Tiers 1 & 2 Engines (`src/engines/context-engine.js`, `src/engines/git-engine.js`, `src/engines/fs-engine.js`)
-- **`src/engines/context-engine.js`**:
-  - Exports `createContextEngine({ db, workspaceRoot })` returning:
-    - `retrieve({ query = "*", category, include_state = true, limit_tokens = 4000 })`
-    - `remember({ category, content, provenance })`
-    - `revise({ action, target_id, new_content, reason })`
+- **`src/engines/context-engine.js`**, **`src/engines/context-lexical.js`**, **`src/engines/context-epistemic.js`**, **`src/engines/context-prune.js`**:
+  - Exports `createContextEngine({ db, workspaceRoot, ephemeral, embedEndpoint, embedModel, autoEmbed })` returning:
+    - `retrieve({ query = "*", category, include_state = true, include_lineage = null, condense = null, include_markdown = false, limit_tokens = 4000, _embedding = null })` & `retrieveAsync(...)`
+    - `remember({ category, content, provenance, _embedding = null })` & `rememberAsync(...)`
+    - `revise({ action, target_id, new_content, reason, provenance, _embedding = null })` & `reviseAsync(...)`
     - `nudge({ trigger = "pre_commit", code = "" })`
     - `health()`
-  - Anchors provenance (`file`, `locator`, `quoted_sentence`, `anchor_hash`) and computes `INV-12` span drift (`VALID`, `HEALED_LINE_SHIFT`, `STALE_DRIFT`).
+  - Supports optional 1024-dim dense embeddings in SQLite (`context_memories.embedding TEXT` with automatic `ALTER TABLE` migration), RM3 pseudo-relevance feedback, in-session episode kernel smoothing, 3-tier `prunePreSynthesis` (`680 / 440 / 320` char) progressive condensation, and `INV-12` span drift (`VALID`, `HEALED_LINE_SHIFT`, `STALE_DRIFT`).
 - **`src/engines/git-engine.js`**:
   - Exports `createGitEngine({ db, workspaceRoot })` returning:
     - `listRepos()`

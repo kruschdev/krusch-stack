@@ -1,8 +1,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -11,7 +13,8 @@ import {
   maskCodePreservingNewlines,
   generateIdeConfig,
   writeIdeConfigs,
-  runStackDoctor
+  runStackDoctor,
+  prunePreSynthesis
 } from '../src/index.js';
 import {
   ALL_STACK_TOOLS,
@@ -286,6 +289,185 @@ describe('KruschStack Unified Ecosystem Suite (v1.0.0)', () => {
       const rotatedFiles = fs.readdirSync(path.dirname(corruptDbPath)).filter((f) => f.includes('.corrupt.'));
       assert.ok(rotatedFiles.length >= 1, 'Corrupted SQLite file must be rotated with .corrupt.<ts> suffix');
       healedStack.db.close();
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  test('Tier 1 Hybrid Vector, 3-Tier Progressive Condensation, Episode Smoothing & Legacy Schema Auto-Migration', async () => {
+    const ws = makeTempWorkspace();
+    try {
+      // Helper to synthesize deterministic unit vectors along orthogonal basis axes (CI=true safe)
+      const makeBasisVec = (axis, mixAxis = -1, mixWeight = 0) => {
+        const v = new Array(1024).fill(0);
+        v[axis] = 1.0;
+        if (mixAxis >= 0) v[mixAxis] = mixWeight;
+        const norm = Math.hypot(...v) || 1;
+        return v.map((x) => Number((x / norm).toFixed(6)));
+      };
+
+      // 1. Legacy SQLite schema without `embedding` column auto-migrates cleanly without data loss
+      const legacyDbPath = path.join(ws, '.krusch-stack', 'legacy.db');
+      fs.mkdirSync(path.dirname(legacyDbPath), { recursive: true });
+      const rawLegacy = new DatabaseSync(legacyDbPath);
+      rawLegacy.exec(`
+        CREATE TABLE context_memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          category TEXT NOT NULL,
+          content TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          superseded_by INTEGER,
+          revocation_reason TEXT,
+          provenance_file TEXT,
+          provenance_locator TEXT,
+          quoted_sentence TEXT,
+          anchor_hash TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO context_memories (category, content) VALUES ('invariant', 'Legacy pre-embedding rule preserved');
+      `);
+      rawLegacy.close();
+
+      const migratedStack = createKruschStack({ workspaceRoot: ws, dbPath: legacyDbPath });
+      const cols = migratedStack.db.prepare('PRAGMA table_info(context_memories);').all();
+      assert.ok(cols.some((c) => c.name === 'embedding'), 'Legacy DB must auto-migrate embedding TEXT column');
+      const legacyCheck = migratedStack.context.retrieve({ query: 'Legacy pre-embedding rule' });
+      assert.equal(legacyCheck.data.items.length, 1);
+
+      // 2. Zero-lexical-overlap standing directive & semantic recall via _embedding
+      const directiveVec = makeBasisVec(7, 8, 0.25);
+      const queryVec = makeBasisVec(7, 8, 0.22); // cosine ~ 0.999, zero shared words
+      migratedStack.context.remember({
+        category: 'decision',
+        content: '[Session 1 | Turn #2] USER: Whenever you craft scripts for me, favor lightweight stdlib modules with minimal dependencies. | ASSISTANT: Understood, stdlib first.',
+        _embedding: directiveVec
+      });
+      for (let i = 0; i < 34; i++) {
+        const uniqWords = Array.from({ length: 18 }, (_, k) => `astro_${i}_metric_${k}`).join(' ');
+        migratedStack.context.remember({
+          category: 'decision',
+          content: `[Session ${(i % 4) + 1} | Turn #${(i + 2) * 2}/${(i + 2) * 2 + 1}] USER: Discussing astronomy telescope calibration step ${i} (${uniqWords}) ${'optical鏡 '.repeat(35)} | ASSISTANT: Detailed mirror grinding schedule for step ${i}: ${'1. Check focal ratio\n2. Measure wavefront error\n'.repeat(14)}`,
+          _embedding: makeBasisVec(20 + i, 7, 0.55)
+        });
+      }
+
+      // Add a continuation turn right after a high-signal turn in Session 4 to test Episode Kernel Smoothing
+      const anchorTurn = migratedStack.context.remember({
+        category: 'decision',
+        content: '[Session 4 | Turn #90/91] USER: My PostgreSQL connection pooler pgbouncer max_client_conn is set to 450 in production. | ASSISTANT: Noted pgbouncer max_client_conn=450.',
+        _embedding: makeBasisVec(90)
+      });
+      const contTurn = migratedStack.context.remember({
+        category: 'decision',
+        content: '[Session 4 | Turn #92/93] USER: Thanks, that sounds good! Also bump reserve_pool_size to 25 on the same host. | ASSISTANT: Updated reserve_pool_size=25.',
+        _embedding: makeBasisVec(91)
+      });
+
+      const zeroLexRet = migratedStack.context.retrieve({
+        query: 'Write a small CSV parser utility in Python',
+        limit_tokens: 8000,
+        _embedding: queryVec
+      });
+      assert.equal(zeroLexRet.ok, true);
+      assert.ok(
+        zeroLexRet.data.items.some((it) => it.content.includes('minimal dependencies')),
+        'Zero-lexical-overlap standing directive must be recalled via dense _embedding'
+      );
+
+      // 3. 3-Tier Progressive Condensation (680 / 440 / 320 chars) + zero 92-char stubs
+      assert.ok(zeroLexRet.data.items.length >= 25, '3-Tier condensation must pack >=25 multi-session turns in 8K budget');
+      for (const it of zeroLexRet.data.items) {
+        if (it.content.includes('USER:')) {
+          assert.ok(it.content.includes('| ASSISTANT:'), 'Condensed dialogue turns must preserve both USER: and | ASSISTANT: segments');
+        }
+      }
+      assert.ok(zeroLexRet.data.items[0].content.length <= 700, 'Tier 1 condensed turn must respect ~680 char ceiling');
+
+      // 4. Episode Kernel Smoothing forward-anchors continuation turn (#92/93) when #90/91 matches strongly
+      const smoothRet = migratedStack.context.retrieve({
+        query: 'What is my PostgreSQL pgbouncer max_client_conn setting?',
+        limit_tokens: 8000,
+        _embedding: makeBasisVec(90, 91, 0.05)
+      });
+      const packedIds = new Set(smoothRet.data.items.map((it) => it.id));
+      assert.ok(packedIds.has(anchorTurn.data.id));
+      assert.ok(packedIds.has(contTurn.data.id), 'In-session continuation turn must be boosted by Episode Kernel Smoothing');
+
+      // 5. Temporal multi-session query emits timeline_markdown & Session-by-Session Macro Progression
+      const timelineRet = migratedStack.context.retrieve({
+        query: 'Give me a chronological timeline of how our astronomy telescope sessions progressed across sessions',
+        limit_tokens: 8000,
+        _embedding: makeBasisVec(20, 21, 0.5)
+      });
+      assert.ok(timelineRet.data.timeline_markdown, 'Temporal multi-session query must populate timeline_markdown');
+      assert.match(timelineRet.data.timeline_markdown, /Chronological Event Sequence/);
+      assert.ok(timelineRet.data.rendered_context.length > 200);
+      migratedStack.db.close();
+
+      // 6. Live async Ollama/HTTP embedding auto-hydration via dispatchStackTool + graceful offline fallback
+      const mockEmbedServer = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', () => {
+          const parsed = JSON.parse(body || '{}');
+          const input = String(parsed.input || parsed.prompt || '');
+          const vec = input.includes('zephyr') || input.includes('breeze')
+            ? makeBasisVec(300)
+            : makeBasisVec(301);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ embeddings: [vec] }));
+        });
+      });
+      await new Promise((resolve) => mockEmbedServer.listen(0, '127.0.0.1', resolve));
+      const embedPort = mockEmbedServer.address().port;
+      try {
+        const liveStack = createKruschStack({
+          workspaceRoot: ws,
+          ephemeral: true,
+          embedEndpoint: `http://127.0.0.1:${embedPort}/api/embed`,
+          autoEmbed: true
+        });
+        const mcpRem = await dispatchStackTool(liveStack, 'krusch_context_remember', {
+          category: 'invariant',
+          content: 'Always route zephyr telemetry frames over QUIC streams.'
+        });
+        assert.equal(mcpRem.ok, true);
+        assert.equal(mcpRem.data.has_embedding, true);
+
+        const mcpRet = await dispatchStackTool(liveStack, 'krusch_context_retrieve', {
+          query: 'How should breeze network packets be transported?'
+        });
+        assert.equal(mcpRet.ok, true);
+        assert.equal(mcpRet.data.items.length, 1);
+        assert.match(mcpRet.data.items[0].content, /zephyr telemetry/);
+      } finally {
+        mockEmbedServer.close();
+      }
+
+      // Offline unreachable port falls back cleanly without throwing
+      const offlineStack = createKruschStack({
+        workspaceRoot: ws,
+        ephemeral: true,
+        embedEndpoint: 'http://127.0.0.1:1/api/embed',
+        autoEmbed: true
+      });
+      const offRem = await offlineStack.context.rememberAsync({
+        category: 'decision',
+        content: 'Offline fallback lexical decision on SQLite WAL checkpoints'
+      });
+      assert.equal(offRem.ok, true);
+      assert.equal(offRem.data.has_embedding, false);
+      const offRet = await offlineStack.context.retrieveAsync({ query: 'SQLite WAL checkpoints' });
+      assert.equal(offRet.ok, true);
+      assert.equal(offRet.data.items.length, 1);
+
+      // Direct prunePreSynthesis check
+      const condensedTurn = prunePreSynthesis(
+        `[Session 2 | Turn #4/5] USER: Please check my schema ${'x '.repeat(400)} | ASSISTANT: # Summary\n- Oct 24 launch\n${'detail '.repeat(400)}`,
+        { maxChars: 320 }
+      );
+      assert.ok(condensedTurn.includes('USER:') && condensedTurn.includes('| ASSISTANT:'));
     } finally {
       fs.rmSync(ws, { recursive: true, force: true });
     }

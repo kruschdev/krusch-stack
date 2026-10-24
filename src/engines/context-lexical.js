@@ -150,3 +150,217 @@ export function estimateTokens(text) {
   if (!text) return 0;
   return Math.ceil(String(text).length / CHARS_PER_ESTIMATED_TOKEN);
 }
+
+/**
+ * Checks if an embedding vector is a synthetic constant vector (e.g. new Array(1024).fill(0.05) in unit tests).
+ * @param {Array<number>|Float64Array|null} vec
+ * @returns {boolean}
+ */
+export function isSyntheticConstantVector(vec) {
+  if (!vec || vec.length < 4) return false;
+  const first = vec[0];
+  for (let i = 1; i < vec.length; i++) {
+    if (Math.abs(first - vec[i]) > 1e-9) return false;
+  }
+  return true;
+}
+
+/**
+ * Computes cosine similarity between two numeric arrays or Float64Arrays.
+ * @param {Array<number>|Float64Array|null} vecA
+ * @param {Array<number>|Float64Array|null} vecB
+ * @returns {number}
+ */
+export function cosineSimilarity(vecA, vecB) {
+  if (!vecA || !vecB || !vecA.length || !vecB.length) return 0;
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  const len = Math.min(vecA.length, vecB.length);
+  for (let i = 0; i < len; i++) {
+    const a = vecA[i];
+    const b = vecB[i];
+    dotProduct += a * b;
+    normA += a * a;
+    normB += b * b;
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+const PARSED_VECTOR_CACHE = new Map();
+const MAX_PARSED_VECTOR_CACHE = 4096;
+
+/**
+ * Parses and caches a serialized embedding vector string into a Float64Array.
+ * @param {string|Array<number>|Float64Array|null} raw
+ * @returns {Float64Array|Array<number>|null}
+ */
+export function parseEmbeddingVector(raw) {
+  if (!raw) return null;
+  if (ArrayBuffer.isView(raw)) {
+    return raw.length > 0 ? raw : null;
+  }
+  if (Array.isArray(raw)) {
+    return raw.length > 0 ? raw : null;
+  }
+  if (typeof raw !== 'string') return null;
+
+  const cached = PARSED_VECTOR_CACHE.get(raw);
+  if (cached) return cached;
+
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr) || arr.length === 0) return null;
+    const typed = Float64Array.from(arr);
+    if (PARSED_VECTOR_CACHE.size >= MAX_PARSED_VECTOR_CACHE) {
+      const oldestKey = PARSED_VECTOR_CACHE.keys().next().value;
+      if (oldestKey !== undefined) PARSED_VECTOR_CACHE.delete(oldestKey);
+    }
+    PARSED_VECTOR_CACHE.set(raw, typed);
+    return typed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validates and serializes a numeric embedding vector for SQLite TEXT persistence.
+ * @param {Array<number>|Float64Array|string|null} vec
+ * @returns {string|null}
+ */
+export function serializeEmbeddingVector(vec) {
+  if (!vec) return null;
+  if (typeof vec === 'string') {
+    const parsed = parseEmbeddingVector(vec);
+    return parsed ? vec : null;
+  }
+  if (Array.isArray(vec) || ArrayBuffer.isView(vec)) {
+    if (vec.length === 0) return null;
+    for (let i = 0; i < vec.length; i++) {
+      if (!Number.isFinite(Number(vec[i]))) return null;
+    }
+    return JSON.stringify(Array.from(vec));
+  }
+  return null;
+}
+
+const LIVE_EMBED_CACHE = new Map();
+const MAX_LIVE_EMBED_CACHE = 256;
+let lastEmbedFailureAt = 0;
+const EMBED_FAILURE_COOLDOWN_MS = 15_000;
+
+export function clearOptionalEmbeddingCache() {
+  LIVE_EMBED_CACHE.clear();
+  lastEmbedFailureAt = 0;
+}
+
+/**
+ * Fetches an optional dense embedding from a local Ollama or OpenAI-compatible endpoint.
+ * Honors INV-STACK-01: fails fast and silently returns null when offline, ephemeral, or CI=true.
+ * @param {string} text
+ * @param {object} [options={}]
+ * @param {string} [options.endpoint]
+ * @param {string} [options.model]
+ * @param {number} [options.timeoutMs=1500]
+ * @param {boolean} [options.ephemeral=false]
+ * @param {boolean} [options.autoEmbed]
+ * @returns {Promise<number[]|null>}
+ */
+export async function fetchOptionalEmbedding(text, options = {}) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return null;
+
+  const explicitEndpoint =
+    options.endpoint ||
+    process.env.KRUSCH_EMBED_URL ||
+    process.env.OLLAMA_EMBED_URL ||
+    process.env.EMBEDDING_URL ||
+    null;
+
+  if (options.autoEmbed === false || process.env.KRUSCH_DISABLE_EMBEDDINGS === '1') {
+    return null;
+  }
+  if (
+    !explicitEndpoint &&
+    options.autoEmbed !== true &&
+    (options.ephemeral ||
+      process.env.KRUSCH_EPHEMERAL === '1' ||
+      process.env.CI === 'true' ||
+      process.env.CI === '1' ||
+      process.env.MOCK_EMBEDDINGS === '1')
+  ) {
+    return null;
+  }
+
+  const baseHost = (process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+  const endpoint = explicitEndpoint || `${baseHost}/api/embed`;
+  const model =
+    options.model ||
+    process.env.KRUSCH_EMBED_MODEL ||
+    process.env.EMBED_MODEL ||
+    process.env.EMBEDDING_MODEL ||
+    'bge-large:latest';
+  const truncated = trimmed.slice(0, 1800);
+  const cacheKey = `${endpoint}:${model}:${truncated}`;
+
+  if (LIVE_EMBED_CACHE.has(cacheKey)) {
+    const val = LIVE_EMBED_CACHE.get(cacheKey);
+    LIVE_EMBED_CACHE.delete(cacheKey);
+    LIVE_EMBED_CACHE.set(cacheKey, val);
+    return val;
+  }
+
+  if (!explicitEndpoint && Date.now() - lastEmbedFailureAt < EMBED_FAILURE_COOLDOWN_MS) {
+    return null;
+  }
+
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 1500;
+  try {
+    const isOpenAiCompat = endpoint.includes('/v1/embeddings') || endpoint.includes('openrouter.ai');
+    const isLegacyOllama = endpoint.endsWith('/api/embeddings');
+    const payload = isLegacyOllama
+      ? { model, prompt: truncated, truncate: true }
+      : { model, input: truncated };
+    const headers = { 'Content-Type': 'application/json' };
+    const apiKey = process.env.KRUSCH_EMBED_API_KEY || process.env.EMBEDDING_API_KEY || null;
+    if (apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) {
+      if (!explicitEndpoint) lastEmbedFailureAt = Date.now();
+      return null;
+    }
+
+    const data = await res.json();
+    let vec = null;
+    if (Array.isArray(data?.embeddings) && Array.isArray(data.embeddings[0])) {
+      vec = data.embeddings[0];
+    } else if (Array.isArray(data?.embedding)) {
+      vec = data.embedding;
+    } else if (isOpenAiCompat && Array.isArray(data?.data?.[0]?.embedding)) {
+      vec = data.data[0].embedding;
+    }
+
+    if (!Array.isArray(vec) || vec.length === 0) {
+      return null;
+    }
+
+    if (LIVE_EMBED_CACHE.size >= MAX_LIVE_EMBED_CACHE) {
+      const oldestKey = LIVE_EMBED_CACHE.keys().next().value;
+      if (oldestKey !== undefined) LIVE_EMBED_CACHE.delete(oldestKey);
+    }
+    LIVE_EMBED_CACHE.set(cacheKey, vec);
+    return vec;
+  } catch {
+    if (!explicitEndpoint) lastEmbedFailureAt = Date.now();
+    return null;
+  }
+}

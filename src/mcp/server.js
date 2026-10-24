@@ -77,6 +77,9 @@ export const ALL_STACK_TOOLS = [
         query: { type: 'string', description: 'Search query or "*" for full state hydration' },
         category: { type: 'string', enum: ['decision', 'invariant', 'bug', 'lesson', 'blocker'] },
         include_state: { type: 'boolean', default: true },
+        include_lineage: { type: 'boolean', description: 'Include superseded lineage history (auto-enabled on temporal queries)' },
+        condense: { type: 'boolean', description: 'Enable 3-tier progressive condensation (auto-enabled on episodic stores >=30 turns)' },
+        include_markdown: { type: 'boolean', default: false },
         limit_tokens: { type: 'number', default: 4000 }
       }
     }
@@ -808,11 +811,11 @@ export async function dispatchStackTool(stack, toolName, args = {}) {
   switch (toolName) {
     // Tier 1: Context
     case 'krusch_context_retrieve':
-      return context.retrieve(args);
+      return context.retrieveAsync(args);
     case 'krusch_context_remember':
-      return context.remember(args);
+      return context.rememberAsync(args);
     case 'krusch_context_revise':
-      return context.revise(args);
+      return context.reviseAsync(args);
     case 'krusch_context_nudge':
       return context.nudge(args);
     case 'krusch_context_health':

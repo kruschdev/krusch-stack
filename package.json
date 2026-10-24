@@ -38,7 +38,8 @@
     "init": "node bin/krusch-stack.js init",
     "doctor": "node bin/krusch-stack.js doctor",
     "serve": "node bin/krusch-stack.js serve",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "bench:beam:parity": "node scripts/benchmark_beam_parity.js"
   },
   "keywords": [
     "mcp",

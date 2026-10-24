@@ -25,6 +25,7 @@ export const STACK_SCHEMA_SQL = `
     provenance_locator TEXT,
     quoted_sentence TEXT,
     anchor_hash TEXT,
+    embedding TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -128,6 +129,18 @@ export const STACK_SCHEMA_SQL = `
 `;
 
 /**
+ * Apply idempotent forward schema migrations for existing SQLite stack databases.
+ * Ensures legacy .krusch-stack/stack.db files gain the optional `embedding TEXT` column cleanly.
+ * @param {DatabaseSync} db
+ */
+export function ensureStackSchemaMigrations(db) {
+  const cols = db.prepare('PRAGMA table_info(context_memories);').all();
+  if (cols.length > 0 && !cols.some((c) => c.name === 'embedding')) {
+    db.exec('ALTER TABLE context_memories ADD COLUMN embedding TEXT;');
+  }
+}
+
+/**
  * Open or initialize a KruschStack SQLite database instance.
  * @param {object} [options]
  * @param {string} [options.workspaceRoot]
@@ -142,6 +155,7 @@ export function openStackDatabase(options = {}) {
     memDb.exec('PRAGMA busy_timeout = 5000;');
     memDb.exec('PRAGMA foreign_keys = ON;');
     memDb.exec(STACK_SCHEMA_SQL);
+    ensureStackSchemaMigrations(memDb);
     return memDb;
   }
 
@@ -160,6 +174,7 @@ export function openStackDatabase(options = {}) {
       throw new Error(`SQLite quick_check failed: ${check.quick_check}`);
     }
     db.exec(STACK_SCHEMA_SQL);
+    ensureStackSchemaMigrations(db);
   } catch (corruptErr) {
     try {
       db.close();
@@ -176,6 +191,7 @@ export function openStackDatabase(options = {}) {
     db.exec('PRAGMA busy_timeout = 5000;');
     db.exec('PRAGMA foreign_keys = ON;');
     db.exec(STACK_SCHEMA_SQL);
+    ensureStackSchemaMigrations(db);
   }
   return db;
 }

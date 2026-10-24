@@ -7,8 +7,20 @@
  */
 
 import path from 'node:path';
-import { openStackDatabase, okEnvelope, STACK_SCHEMA_SQL } from './db/sqlite.js';
-import { createContextEngine } from './engines/context-engine.js';
+import { openStackDatabase, ensureStackSchemaMigrations, okEnvelope, STACK_SCHEMA_SQL } from './db/sqlite.js';
+import { createContextEngine, packStackTokenBudget } from './engines/context-engine.js';
+import {
+  prunePreRetrieval,
+  prunePostRetrieval,
+  prunePreSynthesis,
+  selectMinimalCoveringSet
+} from './engines/context-prune.js';
+import {
+  cosineSimilarity,
+  parseEmbeddingVector,
+  serializeEmbeddingVector,
+  fetchOptionalEmbedding
+} from './engines/context-lexical.js';
 import { createGitEngine, maskCodePreservingNewlines } from './engines/git-engine.js';
 import { createFsEngine } from './engines/fs-engine.js';
 import { createHarnessEngine } from './engines/harness-engine.js';
@@ -28,19 +40,30 @@ export const VERSION = '1.0.0';
  * @param {boolean} [options.ephemeral]
  * @param {'core'|'full'} [options.profile='full']
  * @param {object} [options.routerConfig]
+ * @param {string} [options.embedEndpoint]
+ * @param {string} [options.embedModel]
+ * @param {boolean} [options.autoEmbed]
  */
 export function createKruschStack(options = {}) {
   const workspaceRoot = path.resolve(
     options.workspaceRoot || process.env.KRUSCH_WORKSPACE_ROOT || process.cwd()
   );
   const profile = (options.profile || process.env.KRUSCH_STACK_PROFILE || 'full') === 'core' ? 'core' : 'full';
+  const ephemeral = Boolean(options.ephemeral || options.dbPath === ':memory:' || process.env.KRUSCH_EPHEMERAL === '1');
   const db = options.db || openStackDatabase({
     workspaceRoot,
     dbPath: options.dbPath,
-    ephemeral: options.ephemeral
+    ephemeral
   });
 
-  const context = createContextEngine({ db, workspaceRoot });
+  const context = createContextEngine({
+    db,
+    workspaceRoot,
+    ephemeral,
+    embedEndpoint: options.embedEndpoint,
+    embedModel: options.embedModel,
+    autoEmbed: options.autoEmbed
+  });
   const git = createGitEngine({ db, workspaceRoot });
   const fs = createFsEngine({ db, workspaceRoot });
   const harness = createHarnessEngine({ db, workspaceRoot, contextEngine: context });
@@ -78,9 +101,19 @@ export function createKruschStack(options = {}) {
 
 export {
   openStackDatabase,
+  ensureStackSchemaMigrations,
   okEnvelope,
   STACK_SCHEMA_SQL,
   createContextEngine,
+  packStackTokenBudget,
+  prunePreRetrieval,
+  prunePostRetrieval,
+  prunePreSynthesis,
+  selectMinimalCoveringSet,
+  cosineSimilarity,
+  parseEmbeddingVector,
+  serializeEmbeddingVector,
+  fetchOptionalEmbedding,
   createGitEngine,
   maskCodePreservingNewlines,
   createFsEngine,

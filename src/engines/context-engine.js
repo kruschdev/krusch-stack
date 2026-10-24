@@ -1,17 +1,32 @@
 /**
  * @module engines/context-engine
  * Tier 1: Working Memory, Architectural Invariants & Lineage (krusch-context-mcp).
- * Implements retrieve, remember, revise, nudge, and health with INV-12 span-grounded drift detection.
+ * Implements retrieve, remember, revise, nudge, and health with:
+ * - INV-12 span-grounded drift detection
+ * - Optional 1024-dim dense vector embeddings (synchronous `_embedding` + async Ollama hydration)
+ * - RM3 pseudo-relevance feedback & in-session episode kernel smoothing
+ * - 3-Tier `prunePreSynthesis` (680 / 440 / 320 char) progressive condensation & session timelines
  */
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { okEnvelope } from '../db/sqlite.js';
+import { okEnvelope, ensureStackSchemaMigrations } from '../db/sqlite.js';
 import {
+  CHARS_PER_ESTIMATED_TOKEN,
+  fnv1a32,
+  STOP_WORDS,
+  TEMPORAL_CUE_WORDS,
+  GENERIC_INFRA_WORDS,
+  META_QUERY_WORDS,
   DIRECTIVE_REGEX,
   stemToken,
   isTemporalOrLineageQuery,
+  isSyntheticConstantVector,
+  cosineSimilarity,
+  parseEmbeddingVector,
+  serializeEmbeddingVector,
+  fetchOptionalEmbedding,
   extractQueryTokens,
   estimateTokens
 } from './context-lexical.js';
@@ -20,9 +35,17 @@ import {
   detectStackConflicts,
   computeUnattestedQueryTerms
 } from './context-epistemic.js';
+import {
+  prunePreRetrieval,
+  prunePostRetrieval,
+  prunePreSynthesis
+} from './context-prune.js';
 
 const VALID_CATEGORIES = new Set(['decision', 'invariant', 'bug', 'lesson', 'blocker']);
 const VALID_REVISE_ACTIONS = new Set(['supersede', 'invalidate']);
+const DECAY_RATE = 0.01;
+const MAX_FEAT_CACHE_ENTRIES = 10000;
+const dbRowFeatureCache = new WeakMap();
 
 /**
  * Compute SHA-256 hex digest of a string.
@@ -220,13 +243,295 @@ function extractForbiddenPatterns(ruleText) {
 }
 
 /**
+ * Packs ranked context items within a token budget using multi-arm candidate pooling,
+ * conflict-preserving Jaccard deduplication, 2-round submodular query-facet & session diversity,
+ * and 3-tier `prunePreSynthesis` (`680 / 440 / 320` char) progressive condensation.
+ * @param {Array<object>} items
+ * @param {number} limitTokens
+ * @param {string[]} [queryTerms=[]]
+ * @param {object} [options={}]
+ * @param {boolean|null} [options.condense=null]
+ * @param {boolean} [options.markdownAccounting=false]
+ * @param {boolean} [options.preserveOrder=false]
+ */
+export function packStackTokenBudget(items, limitTokens = 4000, queryTerms = [], options = {}) {
+  const sorted = options.preserveOrder
+    ? [...items]
+    : [...items].sort((a, b) => b.score - a.score);
+  const maxCandidates = Math.min(sorted.length, Math.max(160, Math.ceil(limitTokens / 20)));
+
+  const poolSet = new Set(sorted.slice(0, maxCandidates));
+  if (!options.preserveOrder && sorted.length > maxCandidates) {
+    const bySem = [...sorted].sort((a, b) => (b.semanticScore || 0) - (a.semanticScore || 0));
+    const byIdf = [...sorted].sort((a, b) => (b.idfOverlap || 0) - (a.idfOverlap || 0));
+    const byUserIdf = [...sorted].sort((a, b) => (b.userOverlap || 0) - (a.userOverlap || 0));
+    for (const it of bySem.slice(0, 24)) poolSet.add(it);
+    for (const it of byIdf.slice(0, 24)) poolSet.add(it);
+    for (const it of byUserIdf.slice(0, 28)) poolSet.add(it);
+  }
+  const topSlice = [...poolSet];
+
+  // Ensure items involved in active value/polarity conflicts are never collapsed by prunePostRetrieval
+  const conflictPairs = options.preserveOrder ? [] : detectStackConflicts(topSlice, queryTerms);
+  const conflictedIds = new Set();
+  for (const c of conflictPairs) {
+    for (const cid of c.memory_ids) conflictedIds.add(Number(cid));
+  }
+
+  const deduped = options.preserveOrder
+    ? topSlice
+    : (() => {
+        const nonConflicted = topSlice.filter((cand) => !conflictedIds.has(Number(cand.id)));
+        const keptNonConflicted = new Set(
+          prunePostRetrieval(nonConflicted, { similarityThreshold: 0.92 })
+        );
+        return topSlice.filter(
+          (cand) => conflictedIds.has(Number(cand.id)) || keptNonConflicted.has(cand)
+        );
+      })();
+
+  let orderedCandidates = deduped;
+  if (!options.preserveOrder && Array.isArray(queryTerms) && queryTerms.length >= 2 && deduped.length > 1) {
+    const queryStems = [...new Set(queryTerms.map((t) => stemToken(t)))];
+    const remaining = [...deduped];
+    const reordered = [];
+
+    for (let round = 0; round < 2 && remaining.length > 0; round++) {
+      const uncovered = new Set(queryStems);
+      const seenSessions = new Set();
+
+      while (remaining.length > 0 && uncovered.size > 0) {
+        let bestIdx = -1;
+        let bestEffectiveScore = -Infinity;
+        let bestNewCovered = [];
+        let bestSessionTag = null;
+
+        for (let i = 0; i < remaining.length; i++) {
+          const cand = remaining[i];
+          if (cand.score < 0.50) continue;
+          const textLower = `${cand.content || ''} ${cand.lineageText || ''}`.toLowerCase();
+          const candStems =
+            cand._stems ||
+            new Set(
+              textLower
+                .split(/[^a-z0-9_]+/)
+                .filter((w) => w.length >= 2)
+                .map(stemToken)
+            );
+          const newlyCovered = [...uncovered].filter(
+            (t) => candStems.has(t) || textLower.includes(t)
+          );
+          if (newlyCovered.length === 0) continue;
+          const sessionMatch = textLower.match(/\bsession\s+(\d+)\b/);
+          const sessionTag = sessionMatch ? sessionMatch[1] : null;
+          const sessionBonus = sessionTag && !seenSessions.has(sessionTag) ? 0.08 : 0;
+          const coverageBonus =
+            (newlyCovered.length / Math.max(1, uncovered.size)) * 0.32 + sessionBonus;
+          const effective = cand.score + coverageBonus;
+          if (effective > bestEffectiveScore) {
+            bestEffectiveScore = effective;
+            bestIdx = i;
+            bestNewCovered = newlyCovered;
+            bestSessionTag = sessionTag;
+          }
+        }
+
+        if (bestIdx === -1) break;
+        const [picked] = remaining.splice(bestIdx, 1);
+        reordered.push(picked);
+        for (const t of bestNewCovered) uncovered.delete(t);
+        if (bestSessionTag) seenSessions.add(bestSessionTag);
+      }
+    }
+
+    if (deduped.length > 4 && limitTokens >= 2000) {
+      const isBroad = deduped.some((x) => x._isBroad);
+      const bySess = new Map();
+      for (const x of deduped) {
+        const sKey = x._sessionId ?? 0;
+        if (!bySess.has(sKey)) bySess.set(sKey, []);
+        bySess.get(sKey).push(x);
+      }
+      const sessStratified = [];
+      const sessLists = [...bySess.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map((e) => e[1]);
+      const maxSessLen = Math.max(0, ...sessLists.map((l) => l.length));
+      for (let r = 0; r < maxSessLen; r++) {
+        for (const list of sessLists) {
+          if (r < list.length) sessStratified.push(list[r]);
+        }
+      }
+
+      const topDirectives = [...deduped]
+        .filter((x) => x._isStandingDirective)
+        .sort(
+          (a, b) =>
+            (b.userOverlap || 0) * 0.55 +
+            (b.semanticScore || 0) * 0.45 -
+            ((a.userOverlap || 0) * 0.55 + (a.semanticScore || 0) * 0.45)
+        );
+      const topSessOpeners = deduped.filter(
+        (x) => x._sessionPos !== undefined && x._sessionPos <= 2
+      );
+      const topUserIdf = [...deduped]
+        .sort((a, b) => (b.userOverlap || 0) - (a.userOverlap || 0))
+        .slice(0, 20);
+      const topSemRem = [...deduped]
+        .sort((a, b) => (b.semanticScore || 0) - (a.semanticScore || 0))
+        .slice(0, 20);
+      const topIdfRem = [...deduped]
+        .sort((a, b) => (b.idfOverlap || 0) - (a.idfOverlap || 0))
+        .slice(0, 16);
+      const boundedSessStratified = sessStratified.slice(0, Math.max(15, sessLists.length * 3));
+      const prioritySet = isBroad
+        ? new Set([
+            ...deduped.slice(0, 16),
+            ...reordered.slice(0, 10),
+            ...topSessOpeners.slice(0, 8),
+            ...boundedSessStratified,
+            ...topUserIdf,
+            ...topSemRem,
+            ...deduped
+          ])
+        : new Set([
+            ...deduped.slice(0, 12),
+            ...reordered.slice(0, 8),
+            ...topDirectives.slice(0, 8),
+            ...deduped.slice(12, 24),
+            ...topUserIdf,
+            ...topSemRem,
+            ...topIdfRem,
+            ...topDirectives,
+            ...boundedSessStratified,
+            ...deduped
+          ]);
+      orderedCandidates = [...prioritySet];
+    } else {
+      orderedCandidates = [...reordered, ...remaining];
+    }
+  }
+
+  const isLargeEpisodic =
+    options.condense === true ||
+    (options.condense !== false && items.length >= 30 && limitTokens >= 2000);
+  const useMarkdownAccounting = Boolean(options.markdownAccounting || isLargeEpisodic);
+
+  let currentTokens = 0;
+  const packedEntries = [];
+  const packedItems = [];
+
+  for (const item of orderedCandidates) {
+    const maxBodyChars = isLargeEpisodic
+      ? packedEntries.length < 8
+        ? 680
+        : packedEntries.length < 20
+          ? 440
+          : 320
+      : 4000;
+
+    let bodyText = isLargeEpisodic
+      ? prunePreSynthesis(item.content || '', { maxChars: maxBodyChars }).trim()
+      : String(item.content || '');
+
+    let markdownBody = bodyText;
+    if (item.lineage && item.lineage.length > 1) {
+      const chainSummary = item.lineage
+        .map((step) => {
+          const stepBody = prunePreSynthesis(String(step.content || ''), { maxChars: 240 }).trim();
+          return `Step ${step.step} [#${step.id} ${String(step.status || '').toUpperCase()}${step.created_at ? ` @ ${step.created_at}` : ''}]: ${stepBody}`;
+        })
+        .join(' → ');
+      markdownBody += `\n> **Lineage History (${item.lineage.length} versions)**: ${chainSummary}`;
+    }
+
+    const statusBadge =
+      item.status && String(item.status).toLowerCase() !== 'active'
+        ? ` [${String(item.status).toUpperCase()}]`
+        : '';
+    const title = `Memory #${item.id} (${item.category})${statusBadge}`;
+    let entryText = `### [MEMORY] ${title} (Score: ${(item.score * 100).toFixed(1)}%)\n${markdownBody}\n\n---\n`;
+
+    let itemTokens;
+    if (useMarkdownAccounting) {
+      itemTokens = estimateTokens(entryText);
+    } else {
+      const lineageChars = item.lineage
+        ? item.lineage.reduce((acc, s) => acc + String(s.content || '').length + 16, 0)
+        : 0;
+      itemTokens = Math.max(1, estimateTokens(bodyText) + Math.ceil(lineageChars / 4));
+    }
+
+    if (currentTokens + itemTokens > limitTokens) {
+      if (packedItems.length > 0) {
+        break;
+      }
+      if (limitTokens < 250 && itemTokens > limitTokens) {
+        continue;
+      }
+      const maxAllowedChars = Math.max(
+        80,
+        Math.floor(Math.max(20, limitTokens - 25) * CHARS_PER_ESTIMATED_TOKEN)
+      );
+      bodyText = bodyText.slice(0, maxAllowedChars);
+      markdownBody = bodyText;
+      entryText = `### [MEMORY] ${title} (Score: ${(item.score * 100).toFixed(1)}%)\n${markdownBody}\n\n---\n`;
+      itemTokens = useMarkdownAccounting ? estimateTokens(entryText) : estimateTokens(bodyText);
+      if (currentTokens + itemTokens > limitTokens) {
+        continue;
+      }
+    }
+
+    packedEntries.push(entryText);
+    currentTokens += itemTokens;
+    packedItems.push({
+      ...item,
+      condensedContent: bodyText,
+      isCondensed: bodyText.length < String(item.content || '').length
+    });
+  }
+
+  return {
+    contextText: packedEntries.join(''),
+    packedCount: packedItems.length,
+    totalTokens: currentTokens,
+    packedItems,
+    conflicts: conflictPairs,
+    isLargeEpisodic
+  };
+}
+
+/**
  * Create a Tier 1 Context Engine instance.
  * @param {object} options
  * @param {import('node:sqlite').DatabaseSync} options.db
  * @param {string} [options.workspaceRoot]
+ * @param {boolean} [options.ephemeral]
+ * @param {string} [options.embedEndpoint]
+ * @param {string} [options.embedModel]
+ * @param {boolean} [options.autoEmbed]
  */
-export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
+export function createContextEngine({
+  db,
+  workspaceRoot = process.cwd(),
+  ephemeral = false,
+  embedEndpoint = null,
+  embedModel = null,
+  autoEmbed = undefined
+}) {
   const root = path.resolve(workspaceRoot);
+  try {
+    ensureStackSchemaMigrations(db);
+  } catch {
+    // Allow graceful STORAGE_ERROR handling if context_memories table was intentionally dropped
+  }
+
+  const embedOptions = {
+    endpoint: embedEndpoint,
+    model: embedModel,
+    ephemeral: Boolean(ephemeral || process.env.KRUSCH_EPHEMERAL === '1'),
+    autoEmbed
+  };
 
   const insertMemoryStmt = db.prepare(`
     INSERT INTO context_memories (
@@ -236,8 +541,9 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       provenance_file,
       provenance_locator,
       quoted_sentence,
-      anchor_hash
-    ) VALUES (?, ?, 'active', ?, ?, ?, ?)
+      anchor_hash,
+      embedding
+    ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
   `);
 
   const selectActiveStmt = db.prepare(`
@@ -252,6 +558,7 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       provenance_locator,
       quoted_sentence,
       anchor_hash,
+      embedding,
       created_at,
       updated_at
     FROM context_memories
@@ -260,8 +567,86 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
     LIMIT 250
   `);
 
+  const selectActivePoolStmt = db.prepare(`
+    SELECT
+      id,
+      category,
+      content,
+      status,
+      superseded_by,
+      revocation_reason,
+      provenance_file,
+      provenance_locator,
+      quoted_sentence,
+      anchor_hash,
+      embedding,
+      created_at,
+      updated_at
+    FROM context_memories
+    WHERE status = 'active'
+    ORDER BY id DESC
+    LIMIT ?
+  `);
+
+  const selectActivePoolByCatStmt = db.prepare(`
+    SELECT
+      id,
+      category,
+      content,
+      status,
+      superseded_by,
+      revocation_reason,
+      provenance_file,
+      provenance_locator,
+      quoted_sentence,
+      anchor_hash,
+      embedding,
+      created_at,
+      updated_at
+    FROM context_memories
+    WHERE status = 'active' AND category = ?
+    ORDER BY id DESC
+    LIMIT ?
+  `);
+
+  const selectActiveCountsByCatStmt = db.prepare(`
+    SELECT category, COUNT(*) AS cnt
+    FROM context_memories
+    WHERE status = 'active'
+    GROUP BY category
+  `);
+
+  const hasSupersededStmt = db.prepare(`
+    SELECT 1 FROM context_memories WHERE status = 'superseded' LIMIT 1
+  `);
+
+  const selectAllSupersededStmt = db.prepare(`
+    SELECT
+      id,
+      category,
+      content,
+      status,
+      superseded_by,
+      revocation_reason,
+      provenance_file,
+      provenance_locator,
+      quoted_sentence,
+      anchor_hash,
+      embedding,
+      created_at,
+      updated_at
+    FROM context_memories
+    WHERE status = 'superseded'
+    ORDER BY id ASC
+    LIMIT 2000
+  `);
+
   const selectByIdStmt = db.prepare(`
     SELECT * FROM context_memories WHERE id = ?
+  `);
+
+  const selectParentBySupersededByStmt = db.prepare(`
+    SELECT * FROM context_memories WHERE superseded_by = ? ORDER BY id ASC LIMIT 1
   `);
 
   const markSupersededStmt = db.prepare(`
@@ -281,14 +666,22 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
     WHERE id = ?
   `);
 
+  const maxScanLimit = Math.max(400, Number(process.env.KRUSCH_MAX_ACTIVE_SCAN) || 5000);
+
+  function isWildcardQuery(q) {
+    const trimmed = String(q ?? '*').trim();
+    return !trimmed || trimmed === '*';
+  }
+
   /**
-   * Persist a durable decision, invariant, bug, lesson, or blocker.
+   * Persist a durable decision, invariant, bug, lesson, or blocker (synchronous).
    * @param {object} [params]
    * @param {string} [params.category='decision']
    * @param {string} params.content
    * @param {object} [params.provenance={}]
+   * @param {Array<number>|Float64Array|string|null} [params._embedding=null]
    */
-  function remember({ category = 'decision', content, provenance = {} } = {}) {
+  function remember({ category = 'decision', content, provenance = {}, _embedding = null } = {}) {
     const normalizedCategory = String(category || 'decision').trim().toLowerCase();
     if (!VALID_CATEGORIES.has(normalizedCategory)) {
       return okEnvelope(
@@ -322,6 +715,7 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       },
       root
     );
+    const serializedEmbedding = serializeEmbeddingVector(_embedding);
 
     const result = insertMemoryStmt.run(
       normalizedCategory,
@@ -329,7 +723,8 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       provenanceFile,
       provenanceLocator,
       quotedSentence,
-      anchorHash
+      anchorHash,
+      serializedEmbedding
     );
 
     const id = Number(result.lastInsertRowid);
@@ -348,65 +743,196 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
         category: normalizedCategory,
         content: trimmedContent,
         status: 'active',
+        has_embedding: Boolean(serializedEmbedding),
         provenance: normalizedProvenance
       },
       true
     );
   }
 
-  const maxScanLimit = Math.max(250, Number(process.env.KRUSCH_MAX_ACTIVE_SCAN) || 5000);
-
-  const selectAllActiveAndSupersededStmt = db.prepare(`
-    SELECT
-      id,
-      category,
-      content,
-      status,
-      superseded_by,
-      revocation_reason,
-      provenance_file,
-      provenance_locator,
-      quoted_sentence,
-      anchor_hash,
-      created_at,
-      updated_at
-    FROM context_memories
-    WHERE status IN ('active', 'superseded')
-    ORDER BY id DESC
-    LIMIT ?
-  `);
-
-  const selectParentBySupersededByStmt = db.prepare(`
-    SELECT * FROM context_memories WHERE superseded_by = ? ORDER BY id ASC LIMIT 1
-  `);
-
-  function isWildcardQuery(q) {
-    const trimmed = String(q ?? '*').trim();
-    return !trimmed || trimmed === '*';
+  /**
+   * Async wrapper for `remember` that auto-hydrates an optional dense embedding when Ollama is available.
+   * @param {object} [params]
+   */
+  async function rememberAsync(params = {}) {
+    let emb = params?._embedding || null;
+    if (!emb && params?.content && String(params.content).trim()) {
+      emb = await fetchOptionalEmbedding(String(params.content), embedOptions);
+    }
+    return remember({ ...params, _embedding: emb });
   }
 
   /**
-   * Retrieve active working memories, state briefing, and INV-12 drift telemetry.
+   * Retrieve active working memories, state briefing, progressive condensation, and INV-12 drift telemetry.
    * @param {object} [params]
    * @param {string} [params.query='*']
    * @param {string} [params.category]
    * @param {boolean} [params.include_state=true]
-   * @param {boolean} [params.include_lineage]
+   * @param {boolean|null} [params.include_lineage=null]
    * @param {number} [params.limit_tokens=4000]
+   * @param {boolean|null} [params.condense=null]
+   * @param {boolean} [params.include_markdown=false]
+   * @param {Array<number>|Float64Array|string|null} [params._embedding=null]
    */
-  function retrieve({ query = '*', category, include_state = true, include_lineage = null, limit_tokens = 4000 } = {}) {
-    const trimmedQuery = String(query ?? '*').trim();
-    const isWildcard = isWildcardQuery(trimmedQuery);
-    const normalizedCat = category && category !== 'all' ? String(category).trim().toLowerCase() : null;
-    const tokenBudget = Number.isFinite(Number(limit_tokens)) && Number(limit_tokens) > 0
-      ? Number(limit_tokens)
-      : 4000;
+  function retrieve({
+    query = '*',
+    category,
+    include_state = true,
+    include_lineage = null,
+    limit_tokens = 4000,
+    condense = null,
+    include_markdown = false,
+    _embedding = null
+  } = {}) {
+    const rawQuery = String(query ?? '*').trim();
+    const isWildcard = isWildcardQuery(rawQuery);
+    const cleanQuery = isWildcard ? '*' : prunePreRetrieval(rawQuery);
+    const lowerQuery = cleanQuery.toLowerCase();
+    const normalizedCat =
+      category && category !== 'all' ? String(category).trim().toLowerCase() : null;
+    const tokenBudget =
+      Number.isFinite(Number(limit_tokens)) && Number(limit_tokens) > 0
+        ? Math.min(Number(limit_tokens), 32000)
+        : 4000;
 
-    let allRows;
+    const queryVec = !isWildcard && _embedding ? parseEmbeddingVector(_embedding) : null;
+    const hasRealQueryEmbedding = Boolean(queryVec && !isSyntheticConstantVector(queryVec));
+
+    const { queryTerms, domainTerms, distinctiveTerms } = !isWildcard
+      ? extractQueryTokens(lowerQuery)
+      : { queryTerms: [], domainTerms: [], distinctiveTerms: [] };
+
+    const evalTerms = domainTerms.length > 0 ? domainTerms : queryTerms;
+    const evalStems = [...new Set(evalTerms.map(stemToken))];
+    const distinctiveStems = [...new Set(distinctiveTerms.map(stemToken))];
+    const temporalMode =
+      include_lineage === true ||
+      (include_lineage !== false && !isWildcard && isTemporalOrLineageQuery(rawQuery));
+
+    const catCounts = {
+      invariant: 0,
+      decision: 0,
+      blocker: 0,
+      bug: 0,
+      lesson: 0
+    };
+    let totalActive = 0;
+    const rowMap = new Map();
+    const parentByChildId = new Map();
+    const candidateRowMap = new Map();
+
     try {
-      allRows = isWildcard
-        ? selectActiveStmt.all()
-        : selectAllActiveAndSupersededStmt.all(maxScanLimit);
+      for (const cRow of selectActiveCountsByCatStmt.all()) {
+        const cnt = Number(cRow.cnt) || 0;
+        totalActive += cnt;
+        if (cRow.category in catCounts) {
+          catCounts[cRow.category] = cnt;
+        }
+      }
+
+      if (isWildcard) {
+        const activeRows = selectActiveStmt.all();
+        for (const r of activeRows) {
+          if (!normalizedCat || r.category === normalizedCat) {
+            candidateRowMap.set(Number(r.id), r);
+            rowMap.set(Number(r.id), r);
+          }
+        }
+      } else {
+        const activePool = normalizedCat
+          ? selectActivePoolByCatStmt.all(normalizedCat, maxScanLimit)
+          : selectActivePoolStmt.all(maxScanLimit);
+
+        let minVecId = Infinity;
+        for (const row of activePool) {
+          const numId = Number(row.id);
+          if (numId < minVecId) minVecId = numId;
+          rowMap.set(numId, row);
+          candidateRowMap.set(numId, row);
+        }
+
+        const hasSuperseded = Boolean(hasSupersededStmt.get());
+        if (hasSuperseded) {
+          for (const sRow of selectAllSupersededStmt.all()) {
+            const sId = Number(sRow.id);
+            rowMap.set(sId, sRow);
+            if (sRow.superseded_by) {
+              const childId = Number(sRow.superseded_by);
+              if (
+                !parentByChildId.has(childId) ||
+                sId < Number(parentByChildId.get(childId).id)
+              ) {
+                parentByChildId.set(childId, sRow);
+              }
+            }
+          }
+        }
+
+        if (evalTerms.length > 0 && (hasSuperseded || activePool.length === maxScanLimit)) {
+          const matchExprs = [];
+          const matchParams = [];
+          const likeClauses = [];
+          const whereParams = [];
+          for (const term of evalTerms.slice(0, 12)) {
+            const rootTerm = stemToken(term);
+            const escaped = rootTerm.replace(/[\\%_]/g, '\\$&');
+            const pat = `%${escaped}%`;
+            const clause = `(LOWER(content) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(provenance_file, '')) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(quoted_sentence, '')) LIKE ? ESCAPE '\\')`;
+            matchExprs.push(`(CASE WHEN ${clause} THEN 1 ELSE 0 END)`);
+            matchParams.push(pat, pat, pat);
+            likeClauses.push(clause);
+            whereParams.push(pat, pat, pat);
+          }
+          const scopeClause =
+            activePool.length === maxScanLimit
+              ? `(status = 'superseded' OR (status = 'active' AND id < ${Number.isFinite(minVecId) ? minVecId : 0}))`
+              : `status = 'superseded'`;
+          let lexSql = `
+            SELECT
+              id, category, content, status, superseded_by, revocation_reason,
+              provenance_file, provenance_locator, quoted_sentence, anchor_hash,
+              embedding, created_at, updated_at,
+              (${matchExprs.join(' + ')}) AS _lex_hits
+            FROM context_memories
+            WHERE ${scopeClause}
+          `;
+          const sqlParams = [...matchParams];
+          if (normalizedCat) {
+            lexSql += ` AND category = ?`;
+            sqlParams.push(normalizedCat);
+          }
+          sqlParams.push(...whereParams);
+          lexSql += ` AND (${likeClauses.join(' OR ')}) ORDER BY _lex_hits DESC, id DESC LIMIT 300`;
+
+          for (const row of db.prepare(lexSql).all(...sqlParams)) {
+            const numId = Number(row.id);
+            rowMap.set(numId, row);
+            if (row.status === 'active') {
+              if (!candidateRowMap.has(numId)) {
+                candidateRowMap.set(numId, row);
+              }
+            } else if (row.status === 'superseded') {
+              const { chain, terminalActive } = buildStackLineageChain(
+                row,
+                rowMap,
+                parentByChildId,
+                (id) => selectByIdStmt.get(id) || null,
+                (childId) => selectParentBySupersededByStmt.get(childId) || null
+              );
+              if (terminalActive && (!normalizedCat || terminalActive.category === normalizedCat)) {
+                const termId = Number(terminalActive.id);
+                const mergedTarget = candidateRowMap.get(termId) || terminalActive;
+                mergedTarget._lineageChain = chain;
+                rowMap.set(termId, mergedTarget);
+                candidateRowMap.set(termId, mergedTarget);
+              } else if (temporalMode) {
+                row._lineageChain = chain;
+                candidateRowMap.set(numId, row);
+              }
+            }
+          }
+        }
+      }
     } catch (storageErr) {
       return okEnvelope(
         'krusch_context_retrieve',
@@ -426,200 +952,502 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       );
     }
 
-    const allActiveRows = allRows.filter((r) => r.status === 'active');
-    const totalActive = allActiveRows.length;
-    const queryLower = trimmedQuery.toLowerCase();
+    const allCandidateRows = isWildcard
+      ? [...candidateRowMap.values()].sort((a, b) => Number(b.id) - Number(a.id))
+      : [...candidateRowMap.values()].sort((a, b) => Number(a.id) - Number(b.id));
 
-    const { queryTerms, domainTerms, distinctiveTerms } = !isWildcard
-      ? extractQueryTokens(queryLower)
-      : { queryTerms: [], domainTerms: [], distinctiveTerms: [] };
+    const nowMs = Date.now();
+    const isBroadQuery =
+      !isWildcard &&
+      /\b(order|sequence|chronological|timeline|summary|summarize|comprehensive|throughout|across|progressed|progress)\b/i.test(
+        rawQuery
+      );
+    const isEpisodicStore = !isWildcard && allCandidateRows.length >= 20;
 
-    const evalTerms = domainTerms.length > 0 ? domainTerms : queryTerms;
-    const evalStems = [...new Set(evalTerms.map(stemToken))];
-    const distinctiveStems = [...new Set(distinctiveTerms.map(stemToken))];
-    const temporalMode =
-      include_lineage === true ||
-      (include_lineage !== false && !isWildcard && isTemporalOrLineageQuery(trimmedQuery));
-
-    const rowMap = new Map();
-    const parentByChildId = new Map();
-    for (const r of allRows) {
-      rowMap.set(Number(r.id), r);
-      if (r.superseded_by) {
-        const childId = Number(r.superseded_by);
-        if (!parentByChildId.has(childId) || Number(r.id) < Number(parentByChildId.get(childId).id)) {
-          parentByChildId.set(childId, r);
+    // Extract contiguous 2-word and 3-word content phrases (and stemmed equivalents)
+    const queryPhrases = [];
+    const queryStemPhrases = [];
+    if (!isWildcard && evalTerms.length >= 2) {
+      const rawWords = lowerQuery
+        .split(/[^a-z0-9_.-]+/)
+        .filter((w) => w.length >= 3 && !STOP_WORDS.has(w) && !META_QUERY_WORDS.has(w));
+      const rawStemWords = rawWords.map(stemToken);
+      for (let k = 0; k + 1 < rawWords.length; k++) {
+        queryPhrases.push(`${rawWords[k]} ${rawWords[k + 1]}`);
+        queryStemPhrases.push(`${rawStemWords[k]} ${rawStemWords[k + 1]}`);
+        if (k + 2 < rawWords.length) {
+          queryPhrases.push(`${rawWords[k]} ${rawWords[k + 1]} ${rawWords[k + 2]}`);
+          queryStemPhrases.push(`${rawStemWords[k]} ${rawStemWords[k + 1]} ${rawStemWords[k + 2]}`);
         }
       }
     }
 
-    const candidateMap = new Map();
-    const candidateStemSets = [];
+    let featCache = dbRowFeatureCache.get(db);
+    if (!featCache) {
+      featCache = new Map();
+      dbRowFeatureCache.set(db, featCache);
+    }
 
-    if (isWildcard) {
-      for (const row of allActiveRows) {
-        if (!normalizedCat || row.category === normalizedCat) {
-          candidateMap.set(Number(row.id), { row, score: 0.85, lineage: null, lineageText: '', rowStems: null });
-        }
+    const sessionCounters = new Map();
+    const dfMap = new Map();
+
+    for (const r of allCandidateRows) {
+      let lineage = r._lineageChain || null;
+      if (
+        !lineage &&
+        !isWildcard &&
+        (r.superseded_by || r.status === 'superseded' || parentByChildId.has(Number(r.id)))
+      ) {
+        lineage = buildStackLineageChain(
+          r,
+          rowMap,
+          parentByChildId,
+          (id) => selectByIdStmt.get(id) || null,
+          (childId) => selectParentBySupersededByStmt.get(childId) || null
+        ).chain;
+        r._lineageChain = lineage;
       }
-    } else {
-      const resolvedEntries = [];
-      const dfMap = new Map();
+      r._lineageText =
+        lineage && lineage.length > 1 ? lineage.map((step) => step.content).join(' ') : '';
 
-      for (const row of allRows) {
-        if (normalizedCat && row.category !== normalizedCat && row.status === 'active') {
-          continue;
-        }
-        const hasLineageLinks = Boolean(
-          row.superseded_by || row.status === 'superseded' || parentByChildId.has(Number(row.id))
-        );
-        const { chain, terminalActive } = hasLineageLinks
-          ? buildStackLineageChain(
-              row,
-              rowMap,
-              parentByChildId,
-              (id) => selectByIdStmt.get(id) || null,
-              (childId) => selectParentBySupersededByStmt.get(childId) || null
-            )
-          : { chain: [], terminalActive: row };
-
-        const targetRow = row.status === 'superseded' && terminalActive ? terminalActive : row;
-        if (targetRow.status !== 'active' && !temporalMode) continue;
-        if (normalizedCat && targetRow.category !== normalizedCat) continue;
-
-        const lineageText = chain.length > 1 ? chain.map((c) => c.content).join(' ') : '';
-        const haystack = [
-          targetRow.content,
-          targetRow.category,
-          targetRow.provenance_file || '',
-          targetRow.quoted_sentence || '',
-          lineageText
-        ]
-          .join(' ')
-          .toLowerCase();
-
+      const provMeta = `${r.provenance_file || ''} ${r.quoted_sentence || ''}`.trim();
+      const cacheKey = `${r.id}:${r.category || ''}:${r.updated_at || ''}:${fnv1a32(`${r.content || ''}|${provMeta}|${r._lineageText || ''}`)}`;
+      let cachedFeat = featCache.get(cacheKey);
+      if (!cachedFeat) {
+        const lowerContent = String(r.content || '').toLowerCase();
+        const lowerProv = provMeta.toLowerCase();
+        const lowerLineage = r._lineageText.toLowerCase();
+        const combinedText = `${lowerContent} ${lowerProv} ${lowerLineage}`;
         const rowStems = new Set(
-          haystack
+          combinedText
             .split(/[^a-z0-9_]+/)
             .filter((w) => w.length >= 2)
             .map(stemToken)
         );
-        const lowerContent = String(targetRow.content || '').toLowerCase();
         const userMatch = lowerContent.match(/\buser:\s*([\s\S]*?)(?:\|\s*assistant:|$)/i);
+        const hasDialogueTurn = Boolean(userMatch);
         const userRaw = userMatch ? userMatch[1] : lowerContent;
+        const userStemsArr = userRaw
+          .split(/[^a-z0-9_]+/)
+          .filter((w) => w.length >= 2)
+          .map(stemToken);
+        const userStems = new Set(userStemsArr);
+        const userStemSeq = userStemsArr.join(' ');
         const isStandingDirective =
-          targetRow.category === 'invariant' || DIRECTIVE_REGEX.test(userRaw);
+          r.category === 'invariant' ||
+          (hasDialogueTurn ? DIRECTIVE_REGEX.test(userRaw) : DIRECTIVE_REGEX.test(lowerContent));
+        const sessMatch = lowerContent.match(/\[[^\]]*\bsession[\s_-]+(\d+)\b/i);
+        const sessionId = sessMatch ? Number(sessMatch[1]) : null;
+        cachedFeat = {
+          lowerContent,
+          lowerProv,
+          lowerLineage,
+          combinedText,
+          rowStems,
+          userStems,
+          userStemSeq,
+          userRaw,
+          hasDialogueTurn,
+          isStandingDirective,
+          sessionId
+        };
+        if (featCache.size >= MAX_FEAT_CACHE_ENTRIES) {
+          const oldestKey = featCache.keys().next().value;
+          if (oldestKey !== undefined) featCache.delete(oldestKey);
+        }
+        featCache.set(cacheKey, cachedFeat);
+      }
 
-        candidateStemSets.push(rowStems);
+      r._stems = cachedFeat.rowStems;
+      r._userStems = cachedFeat.userStems;
+      r._userStemSeq = cachedFeat.userStemSeq;
+      r._userRaw = cachedFeat.userRaw;
+      r._hasDialogueTurn = cachedFeat.hasDialogueTurn;
+      r._lowerContent = cachedFeat.lowerContent;
+      r._lowerProv = cachedFeat.lowerProv;
+      r._combinedText = cachedFeat.combinedText;
+      r._isStandingDirective = cachedFeat.isStandingDirective;
+      r._sessionId = cachedFeat.sessionId;
+      if (r._sessionId !== null) {
+        const sPos = sessionCounters.get(r._sessionId) || 0;
+        r._sessionPos = sPos;
+        sessionCounters.set(r._sessionId, sPos + 1);
+      } else {
+        r._sessionPos = 999;
+      }
+
+      if (!isWildcard) {
         for (const s of evalStems) {
-          if (rowStems.has(s) || haystack.includes(s)) {
+          if (cachedFeat.rowStems.has(s) || cachedFeat.combinedText.includes(s)) {
             dfMap.set(s, (dfMap.get(s) || 0) + 1);
           }
         }
-
-        resolvedEntries.push({
-          targetRow,
-          chain,
-          lineageText,
-          haystack,
-          rowStems,
-          isStandingDirective
-        });
       }
+    }
 
-      const corpusN = Math.max(1, resolvedEntries.length);
-      let totalQueryIdf = 0;
-      const idfWeights = new Map();
-      for (const s of evalStems) {
-        const w = Math.log(1 + corpusN / (1 + (dfMap.get(s) || 0)));
-        idfWeights.set(s, w);
-        totalQueryIdf += w;
-      }
+    const corpusN = Math.max(1, allCandidateRows.length);
+    let totalQueryIdf = 0;
+    const idfWeights = new Map();
+    for (const s of evalStems) {
+      const w = Math.log(1 + corpusN / (1 + (dfMap.get(s) || 0)));
+      idfWeights.set(s, w);
+      totalQueryIdf += w;
+    }
 
-      for (const entry of resolvedEntries) {
-        const { targetRow, chain, lineageText, haystack, rowStems, isStandingDirective } = entry;
-        const matchesTerm = (term, stem) => rowStems.has(stem) || haystack.includes(term);
+    const rawScoredItems = [];
+    for (const r of allCandidateRows) {
+      const lineage = r._lineageChain || null;
+      const lineageText = r._lineageText || '';
 
-        const matchesFull = haystack.includes(queryLower);
-        const matchedTokens = evalTerms.filter((t, idx) => matchesTerm(t, evalStems[idx]));
-        const matchedDistinctive = distinctiveTerms.filter((t, idx) =>
+      let score = 0;
+      let semanticScore = 0;
+      let idfOverlap = 0;
+      let userOverlap = 0;
+
+      if (isWildcard) {
+        score = 0.85;
+      } else {
+        if (hasRealQueryEmbedding) {
+          const rowsToScore = [r];
+          if (lineage && lineage.length > 1) {
+            for (const step of lineage) {
+              const cachedStepRow = rowMap.get(Number(step.id));
+              if (cachedStepRow && cachedStepRow !== r) rowsToScore.push(cachedStepRow);
+            }
+          }
+          for (const scoreRow of rowsToScore) {
+            if (scoreRow.embedding) {
+              const vec = parseEmbeddingVector(scoreRow.embedding);
+              if (vec && !isSyntheticConstantVector(vec)) {
+                const sim = cosineSimilarity(queryVec, vec);
+                if (sim > semanticScore) semanticScore = sim;
+              }
+            }
+          }
+        }
+
+        const lowerContent = r._lowerContent;
+        const lowerProv = r._lowerProv;
+        const combinedHaystack = r._combinedText;
+        const rowStems = r._stems;
+        const userStems = r._userStems;
+
+        const matchesTerm = (term, stem) =>
+          rowStems.has(stem) || combinedHaystack.includes(term);
+
+        let directMatches = evalTerms.filter(
+          (t, idx) =>
+            rowStems.has(evalStems[idx]) || lowerContent.includes(t) || lowerProv.includes(t)
+        ).length;
+        if (lineage && lineage.length > 1) {
+          for (const step of lineage) {
+            const stepLower = String(step.content || '').toLowerCase();
+            const stepMatches = evalTerms.filter(
+              (t, idx) => stepLower.includes(t) || stepLower.includes(evalStems[idx])
+            ).length;
+            if (stepMatches > directMatches) directMatches = stepMatches;
+          }
+        }
+        const totalMatches = evalTerms.filter((t, idx) => matchesTerm(t, evalStems[idx])).length;
+        const distinctiveMatches = distinctiveTerms.filter((t, idx) =>
           matchesTerm(t, distinctiveStems[idx])
-        );
-        if (!matchesFull && matchedTokens.length === 0) continue;
-
-        // Guard against single-word or generic-only coincidences on unrecorded topics
-        if (!matchesFull && distinctiveTerms.length > 0 && matchedDistinctive.length === 0) {
-          continue;
-        }
-        if (!matchesFull && distinctiveTerms.length >= 4 && matchedDistinctive.length === 1) {
-          continue;
-        }
-
-        const directOverlap = evalTerms.length > 0 ? matchedTokens.length / evalTerms.length : 0;
-        if (!matchesFull && evalTerms.length >= 4 && matchedTokens.length === 1 && directOverlap < 0.25) {
-          continue;
-        }
+        ).length;
 
         let matchedIdf = 0;
+        let matchedUserIdf = 0;
         for (const s of evalStems) {
-          if (rowStems.has(s) || haystack.includes(s)) {
-            matchedIdf += idfWeights.get(s) || 0;
+          const w = idfWeights.get(s) || 0;
+          if (rowStems.has(s) || combinedHaystack.includes(s)) {
+            matchedIdf += w;
+          }
+          if (userStems && userStems.has(s)) {
+            matchedUserIdf += w;
           }
         }
-        const idfOverlap = totalQueryIdf > 0 ? matchedIdf / totalQueryIdf : directOverlap;
-        const blendedOverlap = Math.max(directOverlap, idfOverlap);
+        const fullOverlap = totalQueryIdf > 0 ? matchedIdf / totalQueryIdf : 0;
+        userOverlap = totalQueryIdf > 0 ? matchedUserIdf / totalQueryIdf : 0;
+        idfOverlap =
+          isEpisodicStore && r._hasDialogueTurn
+            ? 0.68 * userOverlap + 0.32 * fullOverlap
+            : fullOverlap;
 
-        let score = matchesFull ? 0.95 : 0.5 + blendedOverlap * 0.44;
-        if (!temporalMode && isStandingDirective && score >= 0.5) {
+        if (lowerContent.includes(lowerQuery)) {
+          score = Math.max(semanticScore, 0.92);
+        } else if (totalMatches > 0 && evalTerms.length > 0) {
+          const directOverlap = directMatches / evalTerms.length;
+          const totalOverlap = totalMatches / evalTerms.length;
+          const blendedOverlap = Math.max(
+            0.65 * directOverlap + 0.35 * totalOverlap,
+            idfOverlap
+          );
+
+          if (distinctiveTerms.length > 0 && distinctiveMatches === 0 && semanticScore < 0.68) {
+            score = Math.min(0.35, semanticScore * 0.5);
+          } else if (
+            distinctiveTerms.length >= 4 &&
+            distinctiveMatches === 1 &&
+            semanticScore < 0.66
+          ) {
+            score = Math.min(0.38, semanticScore * 0.55);
+          } else if (
+            evalTerms.length >= 4 &&
+            totalMatches === 1 &&
+            totalOverlap < 0.25 &&
+            semanticScore < 0.66
+          ) {
+            score = Math.min(0.38, semanticScore * 0.55);
+          } else {
+            const lexicalScore = 0.50 + blendedOverlap * 0.42;
+            const hybridScore =
+              semanticScore > 0
+                ? semanticScore * 0.48 +
+                  idfOverlap * 0.52 +
+                  0.16 * Math.min(semanticScore, idfOverlap)
+                : lexicalScore;
+            score = Math.min(0.99, Math.max(semanticScore, lexicalScore, hybridScore));
+          }
+        } else {
+          score = r._hasDialogueTurn
+            ? semanticScore
+            : semanticScore >= 0.68
+              ? semanticScore
+              : semanticScore * 0.45;
+        }
+
+        if (r._hasDialogueTurn && semanticScore > score) {
+          score = semanticScore;
+        }
+
+        if (queryPhrases.length > 0 && score > 0.42) {
+          const phraseHits = queryPhrases.filter((p) => lowerContent.includes(p)).length;
+          const stemPhraseHits = r._userStemSeq
+            ? queryStemPhrases.filter((sp) => r._userStemSeq.includes(sp)).length
+            : 0;
+          const bestPhraseHits = Math.max(phraseHits, stemPhraseHits);
+          if (bestPhraseHits > 0) {
+            score = Math.min(0.99, score + Math.min(0.12, bestPhraseHits * 0.05));
+          }
+        }
+
+        if (hasRealQueryEmbedding && !isBroadQuery && !temporalMode && r._isStandingDirective) {
+          if ((r.category === 'invariant' || r._isStandingDirective) && score > 0.42) {
+            const invBoost =
+              allCandidateRows.length < 30 || idfOverlap >= 0.25 || semanticScore >= 0.66
+                ? 0.14
+                : 0.06;
+            score = Math.min(0.98, score + invBoost);
+          }
+          if (isEpisodicStore && r._hasDialogueTurn && semanticScore >= 0.38) {
+            score = Math.max(score, semanticScore + 0.22, 0.66);
+          }
+        } else if (!hasRealQueryEmbedding && !temporalMode && r._isStandingDirective && score >= 0.5) {
           score = Math.min(0.98, score + 0.08);
         }
-        if (temporalMode && chain.length > 1 && score >= 0.5) {
-          score = Math.min(0.99, score + 0.05);
+
+        if (r._hasDialogueTurn && r._sessionPos <= 2 && score > 0.30) {
+          const openerBoost = isBroadQuery ? (r._sessionPos === 0 ? 0.14 : 0.11) : 0.06;
+          score = Math.min(0.99, score + openerBoost);
         }
 
-        const existing = candidateMap.get(Number(targetRow.id));
-        if (!existing || score > existing.score) {
-          candidateMap.set(Number(targetRow.id), {
-            row: targetRow,
-            score,
-            lineage: chain.length > 1 ? chain : null,
-            lineageText,
-            rowStems
-          });
+        if (temporalMode && lineage && lineage.length > 1 && score > 0.45) {
+          score = Math.min(0.99, score + 0.06);
         }
-      }
-    }
 
-    // Submodular stemmed facet-coverage ordering for multi-term queries
-    let orderedCandidates = [...candidateMap.values()].sort((a, b) => b.score - a.score);
-    if (!isWildcard && evalStems.length >= 2 && orderedCandidates.length > 1) {
-      const uncovered = new Set(evalStems);
-      const remaining = [...orderedCandidates];
-      const reordered = [];
-      while (remaining.length > 0 && uncovered.size > 0) {
-        let bestIdx = -1;
-        let bestEff = -Infinity;
-        let bestCov = [];
-        for (let i = 0; i < remaining.length; i++) {
-          const c = remaining[i];
-          if (c.score < 0.5) continue;
-          const text = `${c.row.content} ${c.lineageText || ''}`.toLowerCase();
-          const cov = [...uncovered].filter((st) => (c.rowStems && c.rowStems.has(st)) || text.includes(st));
-          if (cov.length === 0) continue;
-          const eff = c.score + (cov.length / evalStems.length) * 0.35;
-          if (eff > bestEff) {
-            bestEff = eff;
-            bestIdx = i;
-            bestCov = cov;
+        if (score > 0.4 && r.created_at) {
+          const ageDays = Math.max(
+            0,
+            (nowMs - new Date(r.created_at).getTime()) / 86_400_000
+          );
+          if (Number.isFinite(ageDays)) {
+            const recencyBoost = 0.02 * Math.exp(-DECAY_RATE * ageDays);
+            score = Math.min(1.0, score + recencyBoost);
           }
         }
-        if (bestIdx === -1) break;
-        const [picked] = remaining.splice(bestIdx, 1);
-        reordered.push(picked);
-        for (const st of bestCov) uncovered.delete(st);
       }
-      orderedCandidates = [...reordered, ...remaining];
+
+      rawScoredItems.push({
+        row: r,
+        id: Number(r.id),
+        category: r.category,
+        status: r.status || 'active',
+        content: r.content,
+        lineage: lineage && lineage.length > 1 ? lineage : null,
+        lineageText,
+        created_at: r.created_at || null,
+        updated_at: r.updated_at || null,
+        rawScore: score,
+        score,
+        semanticScore,
+        idfOverlap,
+        userOverlap,
+        _stems: r._stems,
+        _userStems: r._userStems,
+        _userRaw: r._userRaw,
+        _hasDialogueTurn: r._hasDialogueTurn,
+        _isStandingDirective: r._isStandingDirective,
+        _sessionId: r._sessionId,
+        _sessionPos: r._sessionPos,
+        _isBroad: isBroadQuery
+      });
     }
+
+    // RM3 / Rocchio Pseudo-Relevance Feedback (PRF) over top first-pass episodic turns
+    if (isEpisodicStore && rawScoredItems.length >= 20 && evalStems.length > 0) {
+      const evalStemSet = new Set(evalStems);
+      const topSeeds = [...rawScoredItems]
+        .sort((a, b) => b.rawScore - a.rawScore)
+        .slice(0, 8)
+        .filter((x) => x.rawScore >= 0.52);
+
+      if (topSeeds.length >= 2) {
+        const seedFreq = new Map();
+        for (const seed of topSeeds) {
+          const stems = seed._userStems || seed._stems;
+          if (!stems) continue;
+          for (const st of stems) {
+            if (
+              st.length < 3 ||
+              evalStemSet.has(st) ||
+              STOP_WORDS.has(st) ||
+              TEMPORAL_CUE_WORDS.has(st) ||
+              GENERIC_INFRA_WORDS.has(st) ||
+              META_QUERY_WORDS.has(st)
+            ) {
+              continue;
+            }
+            seedFreq.set(st, (seedFreq.get(st) || 0) + 1);
+          }
+        }
+
+        const prfCandidates = [];
+        for (const [st, sCount] of seedFreq.entries()) {
+          if (sCount < 2) continue;
+          let docFreq = 0;
+          for (const r of allCandidateRows) {
+            if (r._stems && r._stems.has(st)) docFreq++;
+          }
+          if (docFreq > corpusN * 0.50) continue;
+          const idf = Math.log(1 + corpusN / (1 + docFreq));
+          prfCandidates.push({ stem: st, weight: sCount * idf });
+        }
+
+        prfCandidates.sort((a, b) => b.weight - a.weight);
+        const topPrf = prfCandidates.slice(0, 6);
+        const totalPrfWeight = topPrf.reduce((acc, x) => acc + x.weight, 0);
+
+        if (totalPrfWeight > 0) {
+          for (const item of rawScoredItems) {
+            let matchedPrf = 0;
+            for (const { stem, weight } of topPrf) {
+              if (
+                (item._userStems && item._userStems.has(stem)) ||
+                (item._stems && item._stems.has(stem))
+              ) {
+                matchedPrf += weight;
+              }
+            }
+            if (matchedPrf > 0) {
+              const prfOverlap = matchedPrf / totalPrfWeight;
+              item.rawScore = Math.min(0.99, item.rawScore + 0.14 * prfOverlap);
+              item.score = item.rawScore;
+            }
+          }
+        }
+      }
+    }
+
+    // In-session Episode Kernel Smoothing for multi-turn episodic stores with explicit session tags
+    if (isEpisodicStore && rawScoredItems.length >= 20) {
+      const radius = isBroadQuery ? 8 : 2;
+      const CONTINUATION_CUE =
+        /^(?:thanks|thank\s+you|sounds\s+good|got\s+it|yeah|yes|no,\s*i\s*think|sure|hmm|that\s+(?:plan|sounds|makes)|these\s+exercises|okay|ok\b|great|perfect|i\s+see|makes\s+sense|no\s+further)/i;
+      for (let i = 0; i < rawScoredItems.length; i++) {
+        const curr = rawScoredItems[i];
+        if (curr._sessionId === null) continue;
+        const isContinuationTurn = Boolean(
+          curr._userRaw && CONTINUATION_CUE.test(curr._userRaw.trim())
+        );
+        let neighborMax = 0;
+        let forwardAnchorMax = 0;
+        let neighborSum = 0;
+        let neighborCount = 0;
+        for (let d = -radius; d <= radius; d++) {
+          if (d === 0) continue;
+          const j = i + d;
+          if (
+            j >= 0 &&
+            j < rawScoredItems.length &&
+            rawScoredItems[j]._sessionId === curr._sessionId
+          ) {
+            const dist = Math.abs(d);
+            const decay = Math.max(0.68, 0.94 - dist * 0.035);
+            const candRaw = rawScoredItems[j].rawScore;
+            if (candRaw * decay > neighborMax) neighborMax = candRaw * decay;
+            if (d < 0 && dist <= 2 && candRaw >= 0.62 && isContinuationTurn) {
+              const contScore = candRaw * (dist === 1 ? 0.91 : 0.87);
+              if (contScore > forwardAnchorMax) forwardAnchorMax = contScore;
+            }
+            neighborSum += candRaw;
+            neighborCount++;
+          }
+        }
+        const localAvg = neighborCount > 0 ? neighborSum / neighborCount : 0;
+        curr.score = Math.max(
+          curr.rawScore,
+          forwardAnchorMax,
+          0.50 * curr.rawScore + 0.50 * neighborMax,
+          0.58 * curr.rawScore + 0.42 * localAvg
+        );
+      }
+    }
+
+    const filteredCandidates = [];
+    for (const mItem of rawScoredItems) {
+      const minKeep = hasRealQueryEmbedding && mItem._hasDialogueTurn ? 0.25 : 0.4;
+      if (isWildcard || mItem.score > minKeep) {
+        filteredCandidates.push(mItem);
+      }
+    }
+
+    // Budget reservation for state header & temporal macro progression on large episodic stores
+    const isPureDialogueTranscript =
+      !isWildcard &&
+      allCandidateRows.length >= 30 &&
+      allCandidateRows.every((r) => r._hasDialogueTurn);
+
+    let stateHeader = '';
+    if (include_state && !isWildcard && tokenBudget >= 400) {
+      if (isPureDialogueTranscript) {
+        stateHeader = `# 🧠 Compiled Project State: krusch-stack (Active Invariants & Preferences inline below)\n`;
+      } else {
+        stateHeader = `# 🧠 Compiled Project State: krusch-stack (Invariants: ${catCounts.invariant}, Decisions: ${catCounts.decision}, Bugs: ${catCounts.bug}, Blockers: ${catCounts.blocker}, Lessons: ${catCounts.lesson})\n\n---\n\n`;
+      }
+    }
+
+    const stateDeduction = estimateTokens(stateHeader);
+    let headerAndTimelineReserve = 0;
+    const isLargeEpisodicStore =
+      condense === true ||
+      (condense !== false && !isWildcard && allCandidateRows.length >= 30 && tokenBudget >= 2000);
+
+    if (!isWildcard && tokenBudget >= 2000 && allCandidateRows.length >= 30) {
+      headerAndTimelineReserve = Math.max(0, (temporalMode ? 1550 : 220) - stateDeduction);
+    } else if (!isWildcard && tokenBudget >= 400 && tokenBudget < 2000 && isLargeEpisodicStore) {
+      const targetReserve = temporalMode
+        ? Math.min(450, Math.floor(tokenBudget * 0.28))
+        : Math.min(120, Math.floor(tokenBudget * 0.12));
+      headerAndTimelineReserve = Math.max(0, targetReserve - stateDeduction);
+    }
+
+    const availableTokens = isLargeEpisodicStore
+      ? Math.max(100, tokenBudget - stateDeduction - headerAndTimelineReserve)
+      : tokenBudget;
+
+    const packed = packStackTokenBudget(filteredCandidates, availableTokens, evalTerms, {
+      condense,
+      markdownAccounting: isLargeEpisodicStore || Boolean(include_markdown && tokenBudget >= 400),
+      preserveOrder: isWildcard
+    });
 
     const driftSummary = {
       valid: 0,
@@ -628,24 +1456,8 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
     };
 
     const items = [];
-    let usedTokens = 0;
-
-    for (const cand of orderedCandidates) {
-      const { row, score, lineage } = cand;
-      const lineageChars = lineage
-        ? lineage.reduce((acc, s) => acc + String(s.content || '').length + 16, 0)
-        : 0;
-      const estimatedItemTokens = Math.max(
-        1,
-        estimateTokens(row.content) + Math.ceil(lineageChars / 4)
-      );
-      if (usedTokens + estimatedItemTokens > tokenBudget) {
-        if (items.length > 0) break;
-        // Even on tiny budgets, never exceed tokenBudget if item alone overflows and cannot fit
-        if (estimatedItemTokens > tokenBudget) continue;
-      }
-      usedTokens += estimatedItemTokens;
-
+    for (const cand of packed.packedItems) {
+      const { row, score, lineage, condensedContent } = cand;
       const drift = evaluateSpanDrift(row, root);
       if (drift.status === 'VALID') driftSummary.valid += 1;
       else if (drift.status === 'HEALED_LINE_SHIFT') driftSummary.healed_line_shift += 1;
@@ -654,7 +1466,7 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       items.push({
         id: Number(row.id),
         category: row.category,
-        content: row.content,
+        content: packed.isLargeEpisodic ? condensedContent : row.content,
         status: row.status,
         score: Number(score.toFixed(3)),
         drift_status: drift.status,
@@ -670,10 +1482,18 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       });
     }
 
-    const conflicts = !isWildcard ? detectStackConflicts(items, evalTerms) : [];
-    const unattestedTerms = !isWildcard
-      ? computeUnattestedQueryTerms(distinctiveTerms, items, candidateStemSets)
+    const packedIdSet = new Set(items.map((it) => Number(it.id)));
+    const conflicts = !isWildcard
+      ? (packed.conflicts || []).filter((c) =>
+          c.memory_ids.every((id) => packedIdSet.has(Number(id)))
+        )
       : [];
+
+    const userStemSets = allCandidateRows.map((r) => r._userStems || r._stems);
+    const unattestedTerms = !isWildcard
+      ? computeUnattestedQueryTerms(distinctiveTerms, items, userStemSets)
+      : [];
+
     const maxScore = items.length > 0 ? Math.max(...items.map((it) => it.score)) : 0;
     let epistemicStatus = 'SUPPORTED';
     if (!isWildcard && (items.length === 0 || maxScore < 0.5)) {
@@ -682,62 +1502,232 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
       epistemicStatus = 'CONFLICTED';
     }
 
-    const chronologicalIds = [];
+    const chronologicalEvents = [];
     const seenChrono = new Set();
-    for (const it of items) {
-      if (it.lineage) {
-        for (const step of it.lineage) {
+    for (const cand of packed.packedItems) {
+      if (cand.lineage && cand.lineage.length > 1) {
+        for (const step of cand.lineage) {
           if (!seenChrono.has(step.id)) {
             seenChrono.add(step.id);
-            chronologicalIds.push(step.id);
+            chronologicalEvents.push({
+              id: Number(step.id),
+              status: String(step.status || 'active').toUpperCase(),
+              category: step.category,
+              created_at: step.created_at,
+              content: step.content,
+              score: cand.score || 0,
+              sessionId: cand._sessionId || 1,
+              sessionPos: cand._sessionPos ?? 999
+            });
           }
         }
-      } else if (!seenChrono.has(it.id)) {
-        seenChrono.add(it.id);
-        chronologicalIds.push(it.id);
+      } else if (!seenChrono.has(Number(cand.id))) {
+        seenChrono.add(Number(cand.id));
+        chronologicalEvents.push({
+          id: Number(cand.id),
+          status: String(cand.status || 'active').toUpperCase(),
+          category: cand.category,
+          created_at: cand.created_at || null,
+          content: cand.content,
+          score: cand.score || 0,
+          sessionId: cand._sessionId || 1,
+          sessionPos: cand._sessionPos ?? 999
+        });
       }
     }
-    chronologicalIds.sort((a, b) => a - b);
+    chronologicalEvents.sort((a, b) => a.id - b.id);
+    const chronologicalIds = chronologicalEvents.map((e) => e.id);
+
+    let statusSection = '';
+    if (epistemicStatus === 'NO_KNOWN_SUPPORT' && !isWildcard) {
+      statusSection += `> 🛑 **ABSTENTION (NO_KNOWN_SUPPORT)**: No grounded memory supports this query. Do not guess or fabricate unrecorded facts.\n\n`;
+    } else if (epistemicStatus === 'CONFLICTED') {
+      const conflictLines = conflicts
+        .slice(0, 5)
+        .map(
+          (c) =>
+            `- **Conflict between Memory #${c.older_id} and Memory #${c.newer_id}** (subject: \`${c.shared_subject.join(', ')}\`): ${c.resolution_hint}`
+        )
+        .join('\n');
+      statusSection += `### ⚠️ Contradiction Resolution Alert (\`CONFLICTED\`)\n${conflictLines}\n\n`;
+    }
+
+    const unattestedBadge =
+      unattestedTerms.length > 0
+        ? ` | **Unattested Query Terms**: \`${unattestedTerms.join(', ')}\``
+        : '';
+    const stateBadge = include_state ? ' (State Included)' : '';
+    const fixedHeaderSample =
+      `# 🔍 Unified Context Retrieval: "${rawQuery}"${stateBadge}\n` +
+      `**Epistemic Status**: ${epistemicStatus} | **Tokens**: ~9999 / Budget: ${tokenBudget} | ` +
+      `**Items Packed**: ${packed.packedCount} / ${filteredCandidates.length} candidates${unattestedBadge}\n\n`;
+
+    const remainingTimelineTokens =
+      tokenBudget -
+      (packed.totalTokens +
+        estimateTokens(stateHeader) +
+        estimateTokens(statusSection) +
+        estimateTokens(fixedHeaderSample) +
+        3);
+
+    let timelineSection = '';
+    if (temporalMode && chronologicalEvents.length > 1 && remainingTimelineTokens >= 45) {
+      const bySess = new Map();
+      for (const ev of chronologicalEvents) {
+        const sKey = ev.sessionId || 1;
+        if (!bySess.has(sKey)) bySess.set(sKey, []);
+        bySess.get(sKey).push(ev);
+      }
+      for (const list of bySess.values()) {
+        list.sort((a, b) => (b.score || 0) - (a.score || 0));
+      }
+      const sortedSessEntries = [...bySess.entries()].sort((a, b) => a[0] - b[0]);
+      const sessLists = sortedSessEntries.map((e) => e[1]);
+      const selectedTimeline = [];
+      for (let r = 0; r < 6 && selectedTimeline.length < 15; r++) {
+        for (const list of sessLists) {
+          if (r < list.length && selectedTimeline.length < 15) {
+            selectedTimeline.push(list[r]);
+          }
+        }
+      }
+      selectedTimeline.sort((a, b) => a.id - b.id);
+
+      let macroSessionHeader = '';
+      if (sortedSessEntries.length >= 2 && remainingTimelineTokens >= 320) {
+        const sessionFocusLines = sortedSessEntries
+          .map(([sKey, list]) => {
+            const openers = list.filter(
+              (ev) => ev.sessionPos <= 2 && String(ev.content || '').length >= 320
+            );
+            const pool = openers.length > 0 ? openers : list;
+            const rep = [...pool].sort(
+              (a, b) =>
+                b.score + (b.sessionPos === 0 ? 0.04 : 0) -
+                (a.score + (a.sessionPos === 0 ? 0.04 : 0))
+            )[0];
+            return `- **Session ${sKey} Primary Focus (#${rep.id})**: ${prunePreSynthesis(String(rep.content || ''), { maxChars: 340 })}`;
+          })
+          .join('\n');
+        macroSessionHeader = `#### 🧭 Session-by-Session Macro Progression\n${sessionFocusLines}\n\n`;
+      }
+
+      const lineMaxChars = remainingTimelineTokens < 320 ? 120 : 280;
+      const orderedLines = selectedTimeline.map(
+        (ev, idx) =>
+          `${idx + 1}. **#${ev.id}** [${ev.status}]: ${prunePreSynthesis(String(ev.content || ''), { maxChars: lineMaxChars })}`
+      );
+      const candidateFull = `${macroSessionHeader}### 📅 Chronological Event Sequence (Oldest → Newest)\n${orderedLines.join('\n')}\n\n`;
+      if (estimateTokens(candidateFull) <= remainingTimelineTokens) {
+        timelineSection = candidateFull;
+      } else {
+        const seqHeader = `### 📅 Chronological Event Sequence (Oldest → Newest)\n`;
+        const fittedLines = [];
+        for (const line of orderedLines) {
+          const nextCandidate = `${seqHeader}${[...fittedLines, line].join('\n')}\n\n`;
+          if (estimateTokens(nextCandidate) > remainingTimelineTokens) break;
+          fittedLines.push(line);
+        }
+        if (fittedLines.length > 0) {
+          timelineSection = `${seqHeader}${fittedLines.join('\n')}\n\n`;
+        }
+      }
+    }
+
+    const totalMarkdownTokens =
+      packed.totalTokens +
+      estimateTokens(stateHeader) +
+      estimateTokens(statusSection) +
+      estimateTokens(timelineSection) +
+      estimateTokens(fixedHeaderSample);
+
+    const reportedTokensUsed = packed.isLargeEpisodic
+      ? Math.min(tokenBudget, totalMarkdownTokens)
+      : packed.totalTokens;
+
+    const retrievalBody =
+      `# 🔍 Unified Context Retrieval: "${rawQuery}"${stateBadge}\n` +
+      `**Epistemic Status**: ${epistemicStatus} | **Tokens**: ~${reportedTokensUsed} / Budget: ${tokenBudget} | ` +
+      `**Items Packed**: ${packed.packedCount} / ${filteredCandidates.length} candidates${unattestedBadge}\n\n` +
+      statusSection +
+      packed.contextText +
+      (timelineSection ? `\n---\n${timelineSection}` : '');
+
+    const renderedMarkdown =
+      isPureDialogueTranscript && stateHeader
+        ? `${retrievalBody}\n---\n${stateHeader}`
+        : `${stateHeader}${retrievalBody}`;
 
     const state = include_state
       ? {
-          invariants: allActiveRows.filter((r) => r.category === 'invariant').length,
-          decisions: allActiveRows.filter((r) => r.category === 'decision').length,
-          blockers: allActiveRows.filter((r) => r.category === 'blocker').length,
-          bugs: allActiveRows.filter((r) => r.category === 'bug').length,
-          lessons: allActiveRows.filter((r) => r.category === 'lesson').length,
+          invariants: catCounts.invariant,
+          decisions: catCounts.decision,
+          blockers: catCounts.blocker,
+          bugs: catCounts.bug,
+          lessons: catCounts.lesson,
           token_budget: tokenBudget,
-          tokens_used: usedTokens
+          tokens_used: reportedTokensUsed
         }
       : null;
+
+    const dataPayload = {
+      items,
+      state,
+      drift_summary: driftSummary,
+      total_active: totalActive,
+      epistemic_status: epistemicStatus,
+      conflicts,
+      chronological_order: chronologicalIds,
+      unattested_query_terms: unattestedTerms,
+      ...(timelineSection ? { timeline_markdown: timelineSection.trim() } : {})
+    };
+
+    Object.defineProperty(dataPayload, 'rendered_context', {
+      value: renderedMarkdown,
+      enumerable: Boolean(include_markdown),
+      configurable: true
+    });
 
     return okEnvelope(
       'krusch_context_retrieve',
       `Retrieved ${items.length} active memory item(s) (${driftSummary.stale_drift} drifted, status: ${epistemicStatus}).`,
-      {
-        items,
-        state,
-        drift_summary: driftSummary,
-        total_active: totalActive,
-        epistemic_status: epistemicStatus,
-        conflicts,
-        chronological_order: chronologicalIds,
-        unattested_query_terms: unattestedTerms
-      },
+      dataPayload,
       true
     );
   }
 
   /**
-   * Supersede or invalidate an existing context memory record with full lineage.
+   * Async wrapper for `retrieve` that auto-hydrates an optional query embedding when Ollama is available.
+   * @param {object} [params]
+   */
+  async function retrieveAsync(params = {}) {
+    let emb = params?._embedding || null;
+    const rawQ = String(params?.query ?? '*').trim();
+    if (!emb && !isWildcardQuery(rawQ)) {
+      const cleaned = prunePreRetrieval(rawQ);
+      emb = await fetchOptionalEmbedding(cleaned, embedOptions);
+    }
+    return retrieve({ ...params, _embedding: emb });
+  }
+
+  /**
+   * Supersede or invalidate an existing context memory record with full lineage (synchronous).
    * @param {object} [params]
    * @param {'supersede'|'invalidate'} [params.action='invalidate']
    * @param {number} params.target_id
    * @param {string} [params.new_content]
    * @param {string} [params.reason='Revised']
    * @param {object} [params.provenance]
+   * @param {Array<number>|Float64Array|string|null} [params._embedding=null]
    */
-  function revise({ action = 'invalidate', target_id, new_content, reason = 'Revised', provenance = null } = {}) {
+  function revise({
+    action = 'invalidate',
+    target_id,
+    new_content,
+    reason = 'Revised',
+    provenance = null,
+    _embedding = null
+  } = {}) {
     const normalizedAction = String(action || 'invalidate').trim().toLowerCase();
     if (!VALID_REVISE_ACTIONS.has(normalizedAction)) {
       return okEnvelope(
@@ -781,15 +1771,24 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
         );
       }
 
-      const provFile = provenance && provenance.file !== undefined
-        ? (provenance.file ? String(provenance.file).trim() : null)
-        : existing.provenance_file;
-      const provLocator = provenance && provenance.locator !== undefined
-        ? (provenance.locator ? String(provenance.locator).trim() : null)
-        : existing.provenance_locator;
-      const provQuoted = provenance && provenance.quoted_sentence !== undefined
-        ? (provenance.quoted_sentence ? String(provenance.quoted_sentence).trim() : null)
-        : existing.quoted_sentence;
+      const provFile =
+        provenance && provenance.file !== undefined
+          ? provenance.file
+            ? String(provenance.file).trim()
+            : null
+          : existing.provenance_file;
+      const provLocator =
+        provenance && provenance.locator !== undefined
+          ? provenance.locator
+            ? String(provenance.locator).trim()
+            : null
+          : existing.provenance_locator;
+      const provQuoted =
+        provenance && provenance.quoted_sentence !== undefined
+          ? provenance.quoted_sentence
+            ? String(provenance.quoted_sentence).trim()
+            : null
+          : existing.quoted_sentence;
       const provAnchor = provenance
         ? computeProvenanceAnchorHash(
             {
@@ -801,6 +1800,7 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
             root
           )
         : existing.anchor_hash;
+      const serializedEmbedding = serializeEmbeddingVector(_embedding);
 
       let newId;
       db.exec('BEGIN IMMEDIATE');
@@ -811,7 +1811,8 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
           provFile,
           provLocator,
           provQuoted,
-          provAnchor
+          provAnchor,
+          serializedEmbedding
         );
         newId = Number(insertResult.lastInsertRowid);
         markSupersededStmt.run(newId, revocationReason, numericId);
@@ -832,6 +1833,7 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
           new_id: newId,
           superseded_by: newId,
           status: 'superseded',
+          has_embedding: Boolean(serializedEmbedding),
           reason: revocationReason
         },
         true
@@ -853,6 +1855,23 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
   }
 
   /**
+   * Async wrapper for `revise` that auto-hydrates an optional embedding on `supersede` when Ollama is available.
+   * @param {object} [params]
+   */
+  async function reviseAsync(params = {}) {
+    let emb = params?._embedding || null;
+    if (
+      !emb &&
+      String(params?.action || '').trim().toLowerCase() === 'supersede' &&
+      params?.new_content &&
+      String(params.new_content).trim()
+    ) {
+      emb = await fetchOptionalEmbedding(String(params.new_content), embedOptions);
+    }
+    return revise({ ...params, _embedding: emb });
+  }
+
+  /**
    * Audit staged code or diffs against active invariants and decisions (max 3 findings).
    * @param {object} [params]
    * @param {string} [params.trigger='pre_commit']
@@ -860,9 +1879,9 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
    */
   function nudge({ trigger = 'pre_commit', code = '' } = {}) {
     const codeText = String(code ?? '');
-    const activeRows = selectActiveStmt.all().filter(
-      (row) => row.category === 'invariant' || row.category === 'decision'
-    );
+    const activeRows = selectActivePoolStmt
+      .all(maxScanLimit)
+      .filter((row) => row.category === 'invariant' || row.category === 'decision');
 
     const findings = [];
 
@@ -887,7 +1906,9 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
 
     // Built-in sanitization check if code contains RFC1918 / CGNAT IP literals when invariant rules exist
     if (findings.length < 3 && codeText) {
-      const privateIpRegex = new RegExp('\\b(?:192\\.168\\.\\d{1,3}\\.\\d{1,3}|10\\.10\\.10\\.\\d{1,3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.\\d{1,3}\\.\\d{1,3})\\b');
+      const privateIpRegex = new RegExp(
+        '\\b(?:192\\.168\\.\\d{1,3}\\.\\d{1,3}|10\\.10\\.10\\.\\d{1,3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.\\d{1,3}\\.\\d{1,3})\\b'
+      );
       const ipMatch = codeText.match(privateIpRegex);
       if (ipMatch) {
         findings.push({
@@ -923,11 +1944,13 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
    * Return store health counts and INV-12 drift statistics.
    */
   function health() {
-    const countsRows = db.prepare(`
+    const countsRows = db
+      .prepare(`
       SELECT status, COUNT(*) AS count
       FROM context_memories
       GROUP BY status
-    `).all();
+    `)
+      .all();
 
     const counts = {
       active: 0,
@@ -944,7 +1967,9 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
     const activeRows = selectActiveStmt.all();
     let driftedCount = 0;
     let healedCount = 0;
+    let embeddedCount = 0;
     for (const row of activeRows) {
+      if (row.embedding) embeddedCount += 1;
       const drift = evaluateSpanDrift(row, root);
       if (drift.status === 'STALE_DRIFT') driftedCount += 1;
       else if (drift.status === 'HEALED_LINE_SHIFT') healedCount += 1;
@@ -957,6 +1982,7 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
         active: counts.active,
         superseded: counts.superseded,
         invalidated: counts.invalidated,
+        embedded_count: embeddedCount,
         drifted_count: driftedCount,
         healed_count: healedCount,
         total: counts.active + counts.superseded + counts.invalidated
@@ -967,8 +1993,11 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
 
   return {
     retrieve,
+    retrieveAsync,
     remember,
+    rememberAsync,
     revise,
+    reviseAsync,
     nudge,
     health
   };
