@@ -139,6 +139,8 @@ export function openStackDatabase(options = {}) {
   const ephemeral = Boolean(options.ephemeral || process.env.KRUSCH_EPHEMERAL === '1');
   if (ephemeral || options.dbPath === ':memory:') {
     const memDb = new DatabaseSync(':memory:');
+    memDb.exec('PRAGMA busy_timeout = 5000;');
+    memDb.exec('PRAGMA foreign_keys = ON;');
     memDb.exec(STACK_SCHEMA_SQL);
     return memDb;
   }
@@ -149,8 +151,32 @@ export function openStackDatabase(options = {}) {
     : path.join(workspaceRoot, '.krusch-stack', 'stack.db');
 
   fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-  const db = new DatabaseSync(resolvedPath);
-  db.exec(STACK_SCHEMA_SQL);
+  let db = new DatabaseSync(resolvedPath);
+  try {
+    db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA foreign_keys = ON;');
+    const check = db.prepare('PRAGMA quick_check;').get();
+    if (check && check.quick_check && check.quick_check !== 'ok') {
+      throw new Error(`SQLite quick_check failed: ${check.quick_check}`);
+    }
+    db.exec(STACK_SCHEMA_SQL);
+  } catch (corruptErr) {
+    try {
+      db.close();
+    } catch {}
+    const backupSuffix = `.corrupt.${Date.now()}`;
+    for (const ext of ['', '-wal', '-shm']) {
+      if (fs.existsSync(`${resolvedPath}${ext}`)) {
+        try {
+          fs.renameSync(`${resolvedPath}${ext}`, `${resolvedPath}${ext}${backupSuffix}`);
+        } catch {}
+      }
+    }
+    db = new DatabaseSync(resolvedPath);
+    db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA foreign_keys = ON;');
+    db.exec(STACK_SCHEMA_SQL);
+  }
   return db;
 }
 

@@ -187,6 +187,110 @@ describe('KruschStack Unified Ecosystem Suite (v1.0.0)', () => {
     }
   });
 
+  test('Tier 1 Epistemic & Honesty Suite (Lineage, Stemming, BUG-07 Conflicts, BUG-08 STORAGE_ERROR, Path Guard & Corruption Recovery)', () => {
+    const ws = makeTempWorkspace();
+    try {
+      const stack = createKruschStack({ workspaceRoot: ws, ephemeral: true });
+
+      // 1. Lineage chain forwarding: querying an old superseded term resolves terminal active row + lineage
+      const m1 = stack.context.remember({
+        category: 'decision',
+        content: 'Primary Redis cache pool port is 6379 with TLS disabled.'
+      });
+      const rev1 = stack.context.revise({
+        action: 'supersede',
+        target_id: m1.data.id,
+        new_content: 'Migrated primary Valkey cache pool to port 6380 with mTLS enabled.',
+        reason: 'Valkey mTLS cutover'
+      });
+      assert.equal(rev1.ok, true);
+
+      const lineageRet = stack.context.retrieve({ query: 'Redis cache pool port' });
+      assert.equal(lineageRet.ok, true);
+      assert.equal(lineageRet.data.epistemic_status, 'SUPPORTED');
+      assert.equal(lineageRet.data.items[0].id, rev1.data.new_id);
+      assert.equal(lineageRet.data.items[0].lineage.length, 2);
+      assert.deepEqual(lineageRet.data.chronological_order, [m1.data.id, rev1.data.new_id]);
+
+      // 2. BUG-07: Single-stem coding query ("Could you show me how to implement a login feature?") emits 0 false conflicts
+      const pad = 'Reviewed middleware pagination, structured logging, and cookie serialization across endpoints. '.repeat(3);
+      stack.context.remember({
+        category: 'decision',
+        content: `[Session 1 | Turn #4] USER: Can you help wire the login button to our dashboard router? ${pad} | ASSISTANT: Wired login button.`
+      });
+      stack.context.remember({
+        category: 'decision',
+        content: `[Session 2 | Turn #9] USER: Honestly I have never built a login rate limiter with token buckets before, though dashboard routing works. ${pad} | ASSISTANT: Added token bucket guide.`
+      });
+      const loginRet = stack.context.retrieve({
+        query: 'Could you show me how to implement a login feature?'
+      });
+      assert.equal(loginRet.data.conflicts.length, 0, 'Single-stem coding query must not emit false polarity conflicts');
+
+      // 3. BUG-07: True multi-clause past-participle negation conflict sets epistemic_status = CONFLICTED
+      stack.context.remember({
+        category: 'decision',
+        content: `[Session 1 | Turn #12] USER: I implemented the homepage Flask route and handled HTTP requests cleanly. ${pad} | ASSISTANT: Great Flask route setup.`
+      });
+      stack.context.remember({
+        category: 'decision',
+        content: `[Session 3 | Turn #28] USER: I have never written any Flask routes or handled HTTP requests in this project, so I am starting from scratch. ${pad} | ASSISTANT: Starting Flask routing from basics.`
+      });
+      const flaskRet = stack.context.retrieve({
+        query: 'Have I worked with Flask routes and handled HTTP requests?'
+      });
+      assert.equal(flaskRet.data.epistemic_status, 'CONFLICTED');
+      assert.equal(flaskRet.data.conflicts.length, 1);
+      assert.equal(flaskRet.data.conflicts[0].conflict_type, 'polarity_contradiction');
+
+      // 4. Abstention precision (NO_KNOWN_SUPPORT) & strict limit_tokens ceiling
+      const absRet = stack.context.retrieve({
+        query: 'Kubernetes Istio envoy sidecar mesh mTLS rotation'
+      });
+      assert.equal(absRet.ok, true);
+      assert.equal(absRet.data.epistemic_status, 'NO_KNOWN_SUPPORT');
+      assert.equal(absRet.data.items.length, 0);
+
+      const tightRet = stack.context.retrieve({ query: '*', limit_tokens: 45 });
+      assert.ok(tightRet.data.state.tokens_used <= 45, 'Used tokens must respect tight limit_tokens budget');
+
+      // 5. Path-traversal containment in INV-12 provenance (../../etc/passwd -> STALE_DRIFT, never read outside workspaceRoot)
+      const travMem = stack.context.remember({
+        category: 'invariant',
+        content: 'Path containment verification rule',
+        provenance: {
+          file: '../../etc/passwd',
+          locator: 'L1-L2'
+        }
+      });
+      const travRet = stack.context.retrieve({ query: 'Path containment verification' });
+      const travItem = travRet.data.items.find((it) => it.id === travMem.data.id);
+      assert.ok(travItem);
+      assert.equal(travItem.drift_status, 'STALE_DRIFT');
+
+      // 6. BUG-08: SQLite table failure emits STORAGE_ERROR (ok=false), never NO_KNOWN_SUPPORT
+      stack.db.exec('DROP TABLE context_memories;');
+      const brokenRet = stack.context.retrieve({ query: 'Valkey cache pool' });
+      assert.equal(brokenRet.ok, false);
+      assert.equal(brokenRet.data.epistemic_status, 'STORAGE_ERROR');
+      assert.ok(brokenRet.data.storage_error);
+
+      // 7. Corrupted file-backed SQLite database rotates to .corrupt.* and self-heals on open
+      const corruptDbPath = path.join(ws, '.krusch-stack', 'stack.db');
+      fs.mkdirSync(path.dirname(corruptDbPath), { recursive: true });
+      fs.writeFileSync(corruptDbPath, 'NOT A VALID SQLITE3 HEADER PAYLOAD CORRUPTED BYTES', 'utf-8');
+      const healedStack = createKruschStack({ workspaceRoot: ws, dbPath: corruptDbPath });
+      const postHealHealth = healedStack.context.health();
+      assert.equal(postHealHealth.ok, true);
+      assert.equal(postHealHealth.data.total, 0);
+      const rotatedFiles = fs.readdirSync(path.dirname(corruptDbPath)).filter((f) => f.includes('.corrupt.'));
+      assert.ok(rotatedFiles.length >= 1, 'Corrupted SQLite file must be rotated with .corrupt.<ts> suffix');
+      healedStack.db.close();
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   test('Tier 2A (krusch-git): INV-GIT-01 comment/string masking, AST symbols, and dependency graph', () => {
     const ws = makeTempWorkspace();
     try {

@@ -8,6 +8,18 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { okEnvelope } from '../db/sqlite.js';
+import {
+  DIRECTIVE_REGEX,
+  stemToken,
+  isTemporalOrLineageQuery,
+  extractQueryTokens,
+  estimateTokens
+} from './context-lexical.js';
+import {
+  buildStackLineageChain,
+  detectStackConflicts,
+  computeUnattestedQueryTerms
+} from './context-epistemic.js';
 
 const VALID_CATEGORIES = new Set(['decision', 'invariant', 'bug', 'lesson', 'blocker']);
 const VALID_REVISE_ACTIONS = new Set(['supersede', 'invalidate']);
@@ -50,6 +62,25 @@ function extractLocatorSpan(fileContent, range) {
 }
 
 /**
+ * Safely resolve a relative or absolute provenance file path inside workspaceRoot.
+ * Returns null if the resolved path escapes workspaceRoot.
+ * @param {string} relFile
+ * @param {string} workspaceRoot
+ * @returns {string | null}
+ */
+function resolveSafeWorkspacePath(relFile, workspaceRoot) {
+  if (!relFile || typeof relFile !== 'string') return null;
+  const rootResolved = path.resolve(workspaceRoot);
+  const absPath = path.isAbsolute(relFile)
+    ? path.resolve(relFile)
+    : path.resolve(rootResolved, relFile);
+  if (absPath !== rootResolved && !absPath.startsWith(rootResolved + path.sep)) {
+    return null;
+  }
+  return absPath;
+}
+
+/**
  * Compute initial anchor hash for a memory's provenance.
  * @param {object} provenance
  * @param {string} workspaceRoot
@@ -68,10 +99,8 @@ function computeProvenanceAnchorHash(provenance, workspaceRoot) {
   const locator = typeof provenance.locator === 'string' ? provenance.locator.trim() : '';
 
   if (relFile) {
-    const absPath = path.isAbsolute(relFile)
-      ? path.resolve(relFile)
-      : path.resolve(workspaceRoot, relFile);
-    if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
+    const absPath = resolveSafeWorkspacePath(relFile, workspaceRoot);
+    if (absPath && fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
       const fileContent = fs.readFileSync(absPath, 'utf8');
       if (quoted) {
         return sha256(quoted);
@@ -108,10 +137,8 @@ function evaluateSpanDrift(row, workspaceRoot) {
   }
 
   if (relFile) {
-    const absPath = path.isAbsolute(relFile)
-      ? path.resolve(relFile)
-      : path.resolve(workspaceRoot, relFile);
-    if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+    const absPath = resolveSafeWorkspacePath(relFile, workspaceRoot);
+    if (!absPath || !fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
       return { status: 'STALE_DRIFT' };
     }
 
@@ -327,25 +354,272 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
     );
   }
 
+  const maxScanLimit = Math.max(250, Number(process.env.KRUSCH_MAX_ACTIVE_SCAN) || 5000);
+
+  const selectAllActiveAndSupersededStmt = db.prepare(`
+    SELECT
+      id,
+      category,
+      content,
+      status,
+      superseded_by,
+      revocation_reason,
+      provenance_file,
+      provenance_locator,
+      quoted_sentence,
+      anchor_hash,
+      created_at,
+      updated_at
+    FROM context_memories
+    WHERE status IN ('active', 'superseded')
+    ORDER BY id DESC
+    LIMIT ?
+  `);
+
+  const selectParentBySupersededByStmt = db.prepare(`
+    SELECT * FROM context_memories WHERE superseded_by = ? ORDER BY id ASC LIMIT 1
+  `);
+
+  function isWildcardQuery(q) {
+    const trimmed = String(q ?? '*').trim();
+    return !trimmed || trimmed === '*';
+  }
+
   /**
    * Retrieve active working memories, state briefing, and INV-12 drift telemetry.
    * @param {object} [params]
    * @param {string} [params.query='*']
    * @param {string} [params.category]
    * @param {boolean} [params.include_state=true]
+   * @param {boolean} [params.include_lineage]
    * @param {number} [params.limit_tokens=4000]
    */
-  function retrieve({ query = '*', category, include_state = true, limit_tokens = 4000 } = {}) {
-    const allActiveRows = selectActiveStmt.all();
-    const totalActive = allActiveRows.length;
-
-    const normalizedCat = category && category !== 'all' ? String(category).trim().toLowerCase() : null;
+  function retrieve({ query = '*', category, include_state = true, include_lineage = null, limit_tokens = 4000 } = {}) {
     const trimmedQuery = String(query ?? '*').trim();
-    const isWildcard = !trimmedQuery || trimmedQuery === '*';
+    const isWildcard = isWildcardQuery(trimmedQuery);
+    const normalizedCat = category && category !== 'all' ? String(category).trim().toLowerCase() : null;
+    const tokenBudget = Number.isFinite(Number(limit_tokens)) && Number(limit_tokens) > 0
+      ? Number(limit_tokens)
+      : 4000;
+
+    let allRows;
+    try {
+      allRows = isWildcard
+        ? selectActiveStmt.all()
+        : selectAllActiveAndSupersededStmt.all(maxScanLimit);
+    } catch (storageErr) {
+      return okEnvelope(
+        'krusch_context_retrieve',
+        `Context storage error: ${storageErr.message}`,
+        {
+          items: [],
+          state: null,
+          drift_summary: { valid: 0, healed_line_shift: 0, stale_drift: 0 },
+          total_active: 0,
+          epistemic_status: 'STORAGE_ERROR',
+          storage_error: storageErr.message,
+          conflicts: [],
+          chronological_order: [],
+          unattested_query_terms: []
+        },
+        false
+      );
+    }
+
+    const allActiveRows = allRows.filter((r) => r.status === 'active');
+    const totalActive = allActiveRows.length;
     const queryLower = trimmedQuery.toLowerCase();
-    const queryTokens = isWildcard
-      ? []
-      : queryLower.split(/\s+/).filter((tok) => tok.length > 0);
+
+    const { queryTerms, domainTerms, distinctiveTerms } = !isWildcard
+      ? extractQueryTokens(queryLower)
+      : { queryTerms: [], domainTerms: [], distinctiveTerms: [] };
+
+    const evalTerms = domainTerms.length > 0 ? domainTerms : queryTerms;
+    const evalStems = [...new Set(evalTerms.map(stemToken))];
+    const distinctiveStems = [...new Set(distinctiveTerms.map(stemToken))];
+    const temporalMode =
+      include_lineage === true ||
+      (include_lineage !== false && !isWildcard && isTemporalOrLineageQuery(trimmedQuery));
+
+    const rowMap = new Map();
+    const parentByChildId = new Map();
+    for (const r of allRows) {
+      rowMap.set(Number(r.id), r);
+      if (r.superseded_by) {
+        const childId = Number(r.superseded_by);
+        if (!parentByChildId.has(childId) || Number(r.id) < Number(parentByChildId.get(childId).id)) {
+          parentByChildId.set(childId, r);
+        }
+      }
+    }
+
+    const candidateMap = new Map();
+    const candidateStemSets = [];
+
+    if (isWildcard) {
+      for (const row of allActiveRows) {
+        if (!normalizedCat || row.category === normalizedCat) {
+          candidateMap.set(Number(row.id), { row, score: 0.85, lineage: null, lineageText: '', rowStems: null });
+        }
+      }
+    } else {
+      const resolvedEntries = [];
+      const dfMap = new Map();
+
+      for (const row of allRows) {
+        if (normalizedCat && row.category !== normalizedCat && row.status === 'active') {
+          continue;
+        }
+        const hasLineageLinks = Boolean(
+          row.superseded_by || row.status === 'superseded' || parentByChildId.has(Number(row.id))
+        );
+        const { chain, terminalActive } = hasLineageLinks
+          ? buildStackLineageChain(
+              row,
+              rowMap,
+              parentByChildId,
+              (id) => selectByIdStmt.get(id) || null,
+              (childId) => selectParentBySupersededByStmt.get(childId) || null
+            )
+          : { chain: [], terminalActive: row };
+
+        const targetRow = row.status === 'superseded' && terminalActive ? terminalActive : row;
+        if (targetRow.status !== 'active' && !temporalMode) continue;
+        if (normalizedCat && targetRow.category !== normalizedCat) continue;
+
+        const lineageText = chain.length > 1 ? chain.map((c) => c.content).join(' ') : '';
+        const haystack = [
+          targetRow.content,
+          targetRow.category,
+          targetRow.provenance_file || '',
+          targetRow.quoted_sentence || '',
+          lineageText
+        ]
+          .join(' ')
+          .toLowerCase();
+
+        const rowStems = new Set(
+          haystack
+            .split(/[^a-z0-9_]+/)
+            .filter((w) => w.length >= 2)
+            .map(stemToken)
+        );
+        const lowerContent = String(targetRow.content || '').toLowerCase();
+        const userMatch = lowerContent.match(/\buser:\s*([\s\S]*?)(?:\|\s*assistant:|$)/i);
+        const userRaw = userMatch ? userMatch[1] : lowerContent;
+        const isStandingDirective =
+          targetRow.category === 'invariant' || DIRECTIVE_REGEX.test(userRaw);
+
+        candidateStemSets.push(rowStems);
+        for (const s of evalStems) {
+          if (rowStems.has(s) || haystack.includes(s)) {
+            dfMap.set(s, (dfMap.get(s) || 0) + 1);
+          }
+        }
+
+        resolvedEntries.push({
+          targetRow,
+          chain,
+          lineageText,
+          haystack,
+          rowStems,
+          isStandingDirective
+        });
+      }
+
+      const corpusN = Math.max(1, resolvedEntries.length);
+      let totalQueryIdf = 0;
+      const idfWeights = new Map();
+      for (const s of evalStems) {
+        const w = Math.log(1 + corpusN / (1 + (dfMap.get(s) || 0)));
+        idfWeights.set(s, w);
+        totalQueryIdf += w;
+      }
+
+      for (const entry of resolvedEntries) {
+        const { targetRow, chain, lineageText, haystack, rowStems, isStandingDirective } = entry;
+        const matchesTerm = (term, stem) => rowStems.has(stem) || haystack.includes(term);
+
+        const matchesFull = haystack.includes(queryLower);
+        const matchedTokens = evalTerms.filter((t, idx) => matchesTerm(t, evalStems[idx]));
+        const matchedDistinctive = distinctiveTerms.filter((t, idx) =>
+          matchesTerm(t, distinctiveStems[idx])
+        );
+        if (!matchesFull && matchedTokens.length === 0) continue;
+
+        // Guard against single-word or generic-only coincidences on unrecorded topics
+        if (!matchesFull && distinctiveTerms.length > 0 && matchedDistinctive.length === 0) {
+          continue;
+        }
+        if (!matchesFull && distinctiveTerms.length >= 4 && matchedDistinctive.length === 1) {
+          continue;
+        }
+
+        const directOverlap = evalTerms.length > 0 ? matchedTokens.length / evalTerms.length : 0;
+        if (!matchesFull && evalTerms.length >= 4 && matchedTokens.length === 1 && directOverlap < 0.25) {
+          continue;
+        }
+
+        let matchedIdf = 0;
+        for (const s of evalStems) {
+          if (rowStems.has(s) || haystack.includes(s)) {
+            matchedIdf += idfWeights.get(s) || 0;
+          }
+        }
+        const idfOverlap = totalQueryIdf > 0 ? matchedIdf / totalQueryIdf : directOverlap;
+        const blendedOverlap = Math.max(directOverlap, idfOverlap);
+
+        let score = matchesFull ? 0.95 : 0.5 + blendedOverlap * 0.44;
+        if (!temporalMode && isStandingDirective && score >= 0.5) {
+          score = Math.min(0.98, score + 0.08);
+        }
+        if (temporalMode && chain.length > 1 && score >= 0.5) {
+          score = Math.min(0.99, score + 0.05);
+        }
+
+        const existing = candidateMap.get(Number(targetRow.id));
+        if (!existing || score > existing.score) {
+          candidateMap.set(Number(targetRow.id), {
+            row: targetRow,
+            score,
+            lineage: chain.length > 1 ? chain : null,
+            lineageText,
+            rowStems
+          });
+        }
+      }
+    }
+
+    // Submodular stemmed facet-coverage ordering for multi-term queries
+    let orderedCandidates = [...candidateMap.values()].sort((a, b) => b.score - a.score);
+    if (!isWildcard && evalStems.length >= 2 && orderedCandidates.length > 1) {
+      const uncovered = new Set(evalStems);
+      const remaining = [...orderedCandidates];
+      const reordered = [];
+      while (remaining.length > 0 && uncovered.size > 0) {
+        let bestIdx = -1;
+        let bestEff = -Infinity;
+        let bestCov = [];
+        for (let i = 0; i < remaining.length; i++) {
+          const c = remaining[i];
+          if (c.score < 0.5) continue;
+          const text = `${c.row.content} ${c.lineageText || ''}`.toLowerCase();
+          const cov = [...uncovered].filter((st) => (c.rowStems && c.rowStems.has(st)) || text.includes(st));
+          if (cov.length === 0) continue;
+          const eff = c.score + (cov.length / evalStems.length) * 0.35;
+          if (eff > bestEff) {
+            bestEff = eff;
+            bestIdx = i;
+            bestCov = cov;
+          }
+        }
+        if (bestIdx === -1) break;
+        const [picked] = remaining.splice(bestIdx, 1);
+        reordered.push(picked);
+        for (const st of bestCov) uncovered.delete(st);
+      }
+      orderedCandidates = [...reordered, ...remaining];
+    }
 
     const driftSummary = {
       valid: 0,
@@ -355,36 +629,22 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
 
     const items = [];
     let usedTokens = 0;
-    const tokenBudget = Number.isFinite(Number(limit_tokens)) && Number(limit_tokens) > 0
-      ? Number(limit_tokens)
-      : 4000;
 
-    for (const row of allActiveRows) {
-      if (normalizedCat && row.category !== normalizedCat) {
-        continue;
+    for (const cand of orderedCandidates) {
+      const { row, score, lineage } = cand;
+      const lineageChars = lineage
+        ? lineage.reduce((acc, s) => acc + String(s.content || '').length + 16, 0)
+        : 0;
+      const estimatedItemTokens = Math.max(
+        1,
+        estimateTokens(row.content) + Math.ceil(lineageChars / 4)
+      );
+      if (usedTokens + estimatedItemTokens > tokenBudget) {
+        if (items.length > 0) break;
+        // Even on tiny budgets, never exceed tokenBudget if item alone overflows and cannot fit
+        if (estimatedItemTokens > tokenBudget) continue;
       }
-
-      if (!isWildcard) {
-        const haystack = [
-          row.content,
-          row.category,
-          row.provenance_file || '',
-          row.quoted_sentence || ''
-        ].join(' ').toLowerCase();
-
-        const matchesFull = haystack.includes(queryLower);
-        const matchesTokens = queryTokens.length > 0 && queryTokens.every((t) => haystack.includes(t));
-        const matchesAnyToken = queryTokens.length > 1 && queryTokens.some((t) => t.length >= 3 && haystack.includes(t));
-        if (!matchesFull && !matchesTokens && !matchesAnyToken) {
-          continue;
-        }
-      }
-
-      const estimatedTokens = Math.max(1, Math.ceil(row.content.length / 4));
-      if (items.length > 0 && usedTokens + estimatedTokens > tokenBudget) {
-        break;
-      }
-      usedTokens += estimatedTokens;
+      usedTokens += estimatedItemTokens;
 
       const drift = evaluateSpanDrift(row, root);
       if (drift.status === 'VALID') driftSummary.valid += 1;
@@ -396,7 +656,9 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
         category: row.category,
         content: row.content,
         status: row.status,
+        score: Number(score.toFixed(3)),
         drift_status: drift.status,
+        ...(lineage ? { lineage } : {}),
         provenance: {
           file: row.provenance_file || null,
           locator: drift.current_locator || row.provenance_locator || null,
@@ -407,6 +669,35 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
         updated_at: row.updated_at
       });
     }
+
+    const conflicts = !isWildcard ? detectStackConflicts(items, evalTerms) : [];
+    const unattestedTerms = !isWildcard
+      ? computeUnattestedQueryTerms(distinctiveTerms, items, candidateStemSets)
+      : [];
+    const maxScore = items.length > 0 ? Math.max(...items.map((it) => it.score)) : 0;
+    let epistemicStatus = 'SUPPORTED';
+    if (!isWildcard && (items.length === 0 || maxScore < 0.5)) {
+      epistemicStatus = 'NO_KNOWN_SUPPORT';
+    } else if (conflicts.length > 0) {
+      epistemicStatus = 'CONFLICTED';
+    }
+
+    const chronologicalIds = [];
+    const seenChrono = new Set();
+    for (const it of items) {
+      if (it.lineage) {
+        for (const step of it.lineage) {
+          if (!seenChrono.has(step.id)) {
+            seenChrono.add(step.id);
+            chronologicalIds.push(step.id);
+          }
+        }
+      } else if (!seenChrono.has(it.id)) {
+        seenChrono.add(it.id);
+        chronologicalIds.push(it.id);
+      }
+    }
+    chronologicalIds.sort((a, b) => a - b);
 
     const state = include_state
       ? {
@@ -422,12 +713,16 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
 
     return okEnvelope(
       'krusch_context_retrieve',
-      `Retrieved ${items.length} active memory item(s) (${driftSummary.stale_drift} drifted).`,
+      `Retrieved ${items.length} active memory item(s) (${driftSummary.stale_drift} drifted, status: ${epistemicStatus}).`,
       {
         items,
         state,
         drift_summary: driftSummary,
-        total_active: totalActive
+        total_active: totalActive,
+        epistemic_status: epistemicStatus,
+        conflicts,
+        chronological_order: chronologicalIds,
+        unattested_query_terms: unattestedTerms
       },
       true
     );
@@ -440,8 +735,9 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
    * @param {number} params.target_id
    * @param {string} [params.new_content]
    * @param {string} [params.reason='Revised']
+   * @param {object} [params.provenance]
    */
-  function revise({ action = 'invalidate', target_id, new_content, reason = 'Revised' } = {}) {
+  function revise({ action = 'invalidate', target_id, new_content, reason = 'Revised', provenance = null } = {}) {
     const normalizedAction = String(action || 'invalidate').trim().toLowerCase();
     if (!VALID_REVISE_ACTIONS.has(normalizedAction)) {
       return okEnvelope(
@@ -485,16 +781,47 @@ export function createContextEngine({ db, workspaceRoot = process.cwd() }) {
         );
       }
 
-      const insertResult = insertMemoryStmt.run(
-        existing.category,
-        replacementText,
-        existing.provenance_file,
-        existing.provenance_locator,
-        existing.quoted_sentence,
-        existing.anchor_hash
-      );
-      const newId = Number(insertResult.lastInsertRowid);
-      markSupersededStmt.run(newId, revocationReason, numericId);
+      const provFile = provenance && provenance.file !== undefined
+        ? (provenance.file ? String(provenance.file).trim() : null)
+        : existing.provenance_file;
+      const provLocator = provenance && provenance.locator !== undefined
+        ? (provenance.locator ? String(provenance.locator).trim() : null)
+        : existing.provenance_locator;
+      const provQuoted = provenance && provenance.quoted_sentence !== undefined
+        ? (provenance.quoted_sentence ? String(provenance.quoted_sentence).trim() : null)
+        : existing.quoted_sentence;
+      const provAnchor = provenance
+        ? computeProvenanceAnchorHash(
+            {
+              file: provFile,
+              locator: provLocator,
+              quoted_sentence: provQuoted,
+              anchor_hash: provenance.anchor_hash
+            },
+            root
+          )
+        : existing.anchor_hash;
+
+      let newId;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const insertResult = insertMemoryStmt.run(
+          existing.category,
+          replacementText,
+          provFile,
+          provLocator,
+          provQuoted,
+          provAnchor
+        );
+        newId = Number(insertResult.lastInsertRowid);
+        markSupersededStmt.run(newId, revocationReason, numericId);
+        db.exec('COMMIT');
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {}
+        throw err;
+      }
 
       return okEnvelope(
         'krusch_context_revise',
