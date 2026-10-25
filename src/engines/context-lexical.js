@@ -300,7 +300,7 @@ export async function fetchOptionalEmbedding(text, options = {}) {
     process.env.KRUSCH_EMBED_MODEL ||
     process.env.EMBED_MODEL ||
     process.env.EMBEDDING_MODEL ||
-    'bge-large:latest';
+    'snowflake-arctic-embed2:latest';
   const truncated = trimmed.slice(0, 1800);
   const cacheKey = `${endpoint}:${model}:${truncated}`;
 

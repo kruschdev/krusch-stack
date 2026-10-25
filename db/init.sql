@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS context_memories (
 CREATE INDEX IF NOT EXISTS idx_context_memories_status_cat
   ON context_memories(status, category);
 
+CREATE INDEX IF NOT EXISTS idx_context_memories_embedding_hnsw ON context_memories USING hnsw (embedding vector_cosine_ops);
+
 -- Tier 2A: krusch-git AST Symbols & Call Graph
 CREATE TABLE IF NOT EXISTS git_repositories (
   id BIGSERIAL PRIMARY KEY,
@@ -49,6 +51,8 @@ CREATE TABLE IF NOT EXISTS git_symbols (
 
 CREATE INDEX IF NOT EXISTS idx_git_symbols_lookup
   ON git_symbols(repo_name, symbol_name);
+
+CREATE INDEX IF NOT EXISTS idx_git_symbols_embedding_hnsw ON git_symbols USING hnsw (embedding vector_cosine_ops);
 
 CREATE TABLE IF NOT EXISTS git_edges (
   id BIGSERIAL PRIMARY KEY,
@@ -79,6 +83,8 @@ CREATE TABLE IF NOT EXISTS fs_pages (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (file_path, page_number)
 );
+
+CREATE INDEX IF NOT EXISTS idx_fs_pages_embedding_hnsw ON fs_pages USING hnsw (embedding vector_cosine_ops);
 
 CREATE TABLE IF NOT EXISTS fs_page_memories (
   id BIGSERIAL PRIMARY KEY,
@@ -125,3 +131,5 @@ CREATE TABLE IF NOT EXISTS workspace_files (
   embedding vector(1024),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_workspace_files_embedding_hnsw ON workspace_files USING hnsw (embedding vector_cosine_ops);
