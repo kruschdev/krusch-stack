@@ -42,6 +42,9 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     ide: 'all',
     components: undefined,
     server: undefined,
+    deferTools:
+      process.env.KRUSCH_STACK_DEFER_TOOLS === '1' ||
+      process.env.KRUSCH_STACK_DEFER_TOOLS === 'true',
     json: false,
     ephemeral: false,
     port: Number(process.env.KRUSCH_STACK_PORT || 3780),
@@ -66,6 +69,10 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       flags.components = argv[++i];
     } else if (arg === '--server' && argv[i + 1]) {
       flags.server = argv[++i];
+    } else if (arg === '--defer-tools') {
+      flags.deferTools = true;
+    } else if (arg === '--no-defer-tools') {
+      flags.deferTools = false;
     } else if (arg === '--workspace' && argv[i + 1]) {
       flags.workspaceRoot = path.resolve(argv[++i]);
     } else if (arg === '--port' && argv[i + 1]) {
@@ -106,6 +113,7 @@ Commands:
 
 Options:
   --profile <full|core>     Select 'full' (all 7 pillars, 39 tools) or 'core' (Tiers 1-3 + Router, 27 tools)
+  --defer-tools             Collapse wide tool catalog into 6 pinned tools + 3 BM25 bridge tools
   --mode <unified|modular>  Register a single 'krusch-stack' MCP entry or separate per-pillar MCP entries
   --ide <all|claude|cursor|windsurf|antigravity>
   --components <csv>        Comma-separated subset (context,git,fs,harness,frontend,workspace,router)
@@ -122,7 +130,11 @@ Options:
 export function startHttpGateway(options = {}) {
   const port = Number(options.port || process.env.KRUSCH_STACK_PORT || 3780);
   const stack = options.stack || createKruschStack(options);
-  const tools = getStackTools({ profile: stack.profile, components: options.components });
+  const tools = getStackTools({
+    profile: stack.profile,
+    components: options.components,
+    deferTools: Boolean(options.deferTools)
+  });
 
   const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -136,6 +148,7 @@ export function startHttpGateway(options = {}) {
         name: 'krusch-stack',
         version: VERSION,
         profile: stack.profile,
+        defer_tools: Boolean(options.deferTools),
         tools_count: tools.length,
         doctor: report.data
       }, null, 2));
@@ -156,7 +169,12 @@ export function startHttpGateway(options = {}) {
       req.on('end', async () => {
         try {
           const parsed = JSON.parse(body || '{}');
-          const result = await dispatchStackTool(stack, parsed.tool || parsed.name, parsed.arguments || parsed.args || {});
+          const result = await dispatchStackTool(
+            stack,
+            parsed.tool || parsed.name,
+            parsed.arguments || parsed.args || {},
+            { profile: stack.profile, components: options.components }
+          );
           res.writeHead(result.ok ? 200 : 400);
           res.end(JSON.stringify(result, null, 2));
         } catch (err) {
@@ -258,6 +276,7 @@ async function main() {
       workspaceRoot: flags.workspaceRoot,
       profile: flags.profile,
       components: flags.components,
+      deferTools: flags.deferTools,
       ephemeral: flags.ephemeral,
       port: flags.port
     });
@@ -271,6 +290,7 @@ async function main() {
     profile: flags.profile,
     components: flags.components,
     server: flags.server,
+    deferTools: flags.deferTools,
     ephemeral: flags.ephemeral
   });
 }

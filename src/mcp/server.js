@@ -15,6 +15,19 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { createKruschStack, VERSION } from '../index.js';
 import { okEnvelope } from '../db/sqlite.js';
+import {
+  createStackDeferredBridge,
+  DEFERRED_BRIDGE_TOOLS,
+  DEFERRED_BRIDGE_TOOL_NAMES,
+  PINNED_CORE_TOOL_NAMES
+} from './deferred-bridge.js';
+
+export {
+  createStackDeferredBridge,
+  DEFERRED_BRIDGE_TOOLS,
+  DEFERRED_BRIDGE_TOOL_NAMES,
+  PINNED_CORE_TOOL_NAMES
+};
 
 const SERVER_TO_COMPONENT = {
   'krusch-context-mcp': 'context',
@@ -780,33 +793,78 @@ export const ALL_STACK_TOOLS = [
   })
 ];
 
-/**
- * Filter tools by profile ('core' | 'full'), explicit component list, or single modular server name.
- */
-export function getStackTools({ profile = 'full', components, server } = {}) {
-  let allowed;
+function resolveAllowedComponentSet({ profile = 'full', components, server } = {}) {
   if (server && SERVER_TO_COMPONENT[server]) {
-    allowed = new Set([SERVER_TO_COMPONENT[server]]);
-  } else if (Array.isArray(components) && components.length > 0) {
-    allowed = new Set(components.map((c) => String(c).trim().toLowerCase()));
-  } else if (typeof components === 'string' && components.trim()) {
-    allowed = new Set(
+    return new Set([SERVER_TO_COMPONENT[server]]);
+  }
+  if (Array.isArray(components) && components.length > 0) {
+    return new Set(components.map((c) => String(c).trim().toLowerCase()));
+  }
+  if (typeof components === 'string' && components.trim()) {
+    return new Set(
       components
         .split(',')
         .map((c) => c.trim().toLowerCase())
         .filter(Boolean)
     );
-  } else {
-    allowed = profile === 'core' ? CORE_COMPONENTS : FULL_COMPONENTS;
   }
+  return profile === 'core' ? CORE_COMPONENTS : FULL_COMPONENTS;
+}
 
-  return ALL_STACK_TOOLS.filter((t) => allowed.has(t.component)).map(({ component: _c, ...toolDef }) => toolDef);
+/**
+ * Filter tools by profile ('core' | 'full'), explicit component list, or single modular server name.
+ * When `deferTools: true` is set, collapses the filtered catalog into pinned core tools + 3 BM25 bridge meta-tools.
+ */
+export function getStackTools({
+  profile = 'full',
+  components,
+  server,
+  deferTools = false,
+  pinnedToolNames
+} = {}) {
+  const allowed = resolveAllowedComponentSet({ profile, components, server });
+  const rawAllowed = ALL_STACK_TOOLS.filter((t) => allowed.has(t.component));
+  if (deferTools) {
+    const bridge = createStackDeferredBridge(rawAllowed, { pinnedToolNames });
+    return [...bridge.exposedTools];
+  }
+  return rawAllowed.map(({ component: _c, ...toolDef }) => toolDef);
 }
 
 /**
  * Dispatch a tool call by name against a KruschStack instance.
  */
-export async function dispatchStackTool(stack, toolName, args = {}) {
+export async function dispatchStackTool(stack, toolName, args = {}, options = {}) {
+  if (
+    toolName === 'krusch_tool_search' ||
+    toolName === 'krusch_tool_describe' ||
+    toolName === 'krusch_tool_call'
+  ) {
+    const bridge =
+      options.deferredBridge ||
+      createStackDeferredBridge(
+        ALL_STACK_TOOLS.filter((t) =>
+          resolveAllowedComponentSet({
+            profile: options.profile || stack.profile,
+            components: options.components,
+            server: options.server
+          }).has(t.component)
+        ),
+        {
+          pinnedToolNames: options.pinnedToolNames,
+          dispatcher: (innerToolName, innerArgs) => dispatchStackTool(stack, innerToolName, innerArgs)
+        }
+      );
+
+    if (toolName === 'krusch_tool_search') {
+      return bridge.searchTools(args);
+    }
+    if (toolName === 'krusch_tool_describe') {
+      return bridge.describeTool(args);
+    }
+    return bridge.callTool(args);
+  }
+
   const { context, git, fs, harness, frontend, workspace, router } = stack.engines;
   switch (toolName) {
     // Tier 1: Context
@@ -911,11 +969,28 @@ export async function dispatchStackTool(stack, toolName, args = {}) {
  */
 export function createMcpServer(options = {}) {
   const stack = options.stack || createKruschStack(options);
-  const tools = getStackTools({
-    profile: options.profile || stack.profile,
-    components: options.components,
-    server: options.server
-  });
+  const effectiveProfile = options.profile || stack.profile;
+  const deferTools = Boolean(
+    options.deferTools ??
+      (process.env.KRUSCH_STACK_DEFER_TOOLS === '1' ||
+        process.env.KRUSCH_STACK_DEFER_TOOLS === 'true')
+  );
+  const rawAllowed = ALL_STACK_TOOLS.filter((t) =>
+    resolveAllowedComponentSet({
+      profile: effectiveProfile,
+      components: options.components,
+      server: options.server
+    }).has(t.component)
+  );
+  const deferredBridge = deferTools
+    ? createStackDeferredBridge(rawAllowed, {
+        pinnedToolNames: options.pinnedToolNames,
+        dispatcher: (innerToolName, innerArgs) => dispatchStackTool(stack, innerToolName, innerArgs)
+      })
+    : null;
+  const tools = deferTools
+    ? [...deferredBridge.exposedTools]
+    : rawAllowed.map(({ component: _c, ...toolDef }) => toolDef);
   const allowedNames = new Set(tools.map((t) => t.name));
 
   const mcpServer = new Server(
@@ -946,7 +1021,12 @@ export function createMcpServer(options = {}) {
     }
 
     try {
-      const result = await dispatchStackTool(stack, toolName, args);
+      const result = await dispatchStackTool(stack, toolName, args, {
+        deferredBridge,
+        profile: effectiveProfile,
+        components: options.components,
+        server: options.server
+      });
       return {
         content: [
           {
@@ -971,7 +1051,7 @@ export function createMcpServer(options = {}) {
     }
   });
 
-  return { mcpServer, stack, tools };
+  return { mcpServer, stack, tools, deferredBridge };
 }
 
 /**
