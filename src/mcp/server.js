@@ -298,7 +298,8 @@ export const ALL_STACK_TOOLS = [
       properties: {
         repo: { type: 'string' },
         query: { type: 'string' },
-        limit: { type: 'number', default: 10 }
+        limit: { type: 'number', default: 10 },
+        limit_tokens: { type: 'number' }
       },
       required: ['query']
     }
@@ -339,7 +340,8 @@ export const ALL_STACK_TOOLS = [
       properties: {
         query: { type: 'string' },
         category: { type: 'string', default: 'all' },
-        limit: { type: 'number', default: 10 }
+        limit: { type: 'number', default: 10 },
+        limit_tokens: { type: 'number' }
       },
       required: ['query']
     }

@@ -364,3 +364,226 @@ export async function fetchOptionalEmbedding(text, options = {}) {
     return null;
   }
 }
+
+const UPPERCASE_IDENTIFIER_EXCLUDES = new Set([
+  'AND',
+  'OR',
+  'NOT',
+  'THE',
+  'FOR',
+  'ALL',
+  'WITH',
+  'FROM'
+]);
+
+const PROSE_TITLECASE_EXCLUDES = new Set([
+  'in',
+  'on',
+  'at',
+  'to',
+  'of',
+  'by',
+  'is',
+  'be',
+  'do',
+  'if',
+  'as',
+  'or',
+  'no',
+  'not',
+  'all',
+  'any',
+  'some',
+  'check',
+  'search',
+  'read',
+  'write',
+  'create',
+  'update',
+  'delete',
+  'return',
+  'verify',
+  'ensure'
+]);
+
+const PROSE_DOTTED_ABBREVS = new Set(['e.g', 'i.e', 'etc', 'vs', 'cf']);
+const PROSE_SLASH_PAIRS = new Set(['and/or', 'yes/no', 'true/false', 'on/off', 'in/out']);
+
+/**
+ * Splits camelCase, PascalCase, snake_case, and compound identifiers into
+ * deduplicated lowercase alphanumeric tokens and sub-tokens while preserving order.
+ * @param {string} token
+ * @returns {string[]}
+ */
+export function splitIdentifierSubtokens(token) {
+  const raw = String(token ?? '').trim();
+  if (!raw) return [];
+
+  const cleaned = raw.replace(/^[^a-zA-Z0-9_]+|[^a-zA-Z0-9_]+$/g, '');
+  if (!cleaned) return [];
+
+  const seen = new Set();
+  const out = [];
+  const push = (val) => {
+    if (!val || seen.has(val)) return;
+    seen.add(val);
+    out.push(val);
+  };
+
+  const segments = cleaned.match(/[a-zA-Z0-9_]+/g) || [];
+  for (const seg of segments) {
+    const hasUnderscore = seg.includes('_');
+    const hasMixedCase = /[a-z0-9][A-Z]|[A-Z]{2,}[a-z]/.test(seg);
+
+    if ((hasUnderscore || hasMixedCase) && /[a-zA-Z0-9]/.test(seg)) {
+      const joined = seg.toLowerCase();
+      if (joined.length >= 2) {
+        push(joined);
+      }
+    }
+
+    const decamel = seg
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
+
+    for (const part of decamel.split(/[^a-zA-Z0-9]+/)) {
+      const lower = part.toLowerCase();
+      if (lower && (lower.length >= 2 || /^\d+$/.test(lower))) {
+        push(lower);
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Extracts code-shaped identifiers (backtick-quoted tokens, camelCase/PascalCase,
+ * snake_case, hyphenated identifiers, dotted/slash paths, dotfiles, and uppercase constants)
+ * deduplicated case-insensitively while preserving first-seen cleaned form.
+ * @param {string} queryText
+ * @returns {string[]}
+ */
+export function extractCodeShapeIdentifiers(queryText) {
+  const input = String(queryText ?? '');
+  if (!input.trim()) return [];
+
+  const seen = new Set();
+  const out = [];
+
+  const evaluateCandidate = (rawToken, wasBackticked) => {
+    let t = String(rawToken ?? '').trim();
+    if (!t) return;
+
+    t = t
+      .replace(/^[`"'([\]{}<>]+/, '')
+      .replace(/'s$/i, '')
+      .replace(/(?:\(\))?[`"')[\]{}<>,;:?!]+$/g, '');
+
+    if (/^\.{2,}(?!\/)/.test(t)) {
+      t = t.replace(/^\.+/, '');
+    }
+    t = t.replace(/\.+$/, '');
+    t = t.replace(/^[`"'([\]{}<>]+|[`"')[\]{}<>,;:?!]+$/g, '');
+
+    if (t.length < 2 || !/[A-Za-z]/.test(t) || /['"`]/.test(t)) {
+      return;
+    }
+
+    const lower = t.toLowerCase();
+    let matched = false;
+
+    if (wasBackticked) {
+      matched = true;
+    } else if (t.includes('_')) {
+      matched = true;
+    } else if (/^[A-Za-z0-9]{2,}(?:-[A-Za-z0-9_]{2,})+$/.test(t)) {
+      matched = true;
+    } else if (
+      (/[A-Za-z0-9_]\.[A-Za-z0-9_]{1,}/.test(t) && !PROSE_DOTTED_ABBREVS.has(lower)) ||
+      (t.includes('/') && !PROSE_SLASH_PAIRS.has(lower)) ||
+      /^\.[A-Za-z][A-Za-z0-9_.-]*$/.test(t)
+    ) {
+      matched = true;
+    } else if (/^[A-Z][A-Z0-9_]{2,}$/.test(t) && !UPPERCASE_IDENTIFIER_EXCLUDES.has(t)) {
+      matched = true;
+    } else if (/[a-z]/.test(t) && /[A-Z]/.test(t)) {
+      const isPlainTitlecaseProse =
+        /^[A-Z][a-z]+$/.test(t) &&
+        (STOP_WORDS.has(lower) ||
+          TEMPORAL_CUE_WORDS.has(lower) ||
+          META_QUERY_WORDS.has(lower) ||
+          GENERIC_INFRA_WORDS.has(lower) ||
+          PROSE_TITLECASE_EXCLUDES.has(lower));
+      if (!isPlainTitlecaseProse) {
+        matched = true;
+      }
+    }
+
+    if (matched && !seen.has(lower)) {
+      seen.add(lower);
+      out.push(t);
+    }
+  };
+
+  const tokenPattern = /`[^`\r\n]+`|[^\s,;:()[\]{}`]+/g;
+  let match;
+  while ((match = tokenPattern.exec(input)) !== null) {
+    const rawTok = match[0];
+    if (rawTok.length >= 2 && rawTok.startsWith('`') && rawTok.endsWith('`')) {
+      const inner = rawTok.slice(1, -1).trim();
+      if (!inner) continue;
+      if (!/[\s,;:]/.test(inner)) {
+        const callStripped = inner.replace(/\([^()]*\)$/, '');
+        if (!/[\s,;:()[\]{}]/.test(callStripped)) {
+          evaluateCandidate(callStripped, true);
+          continue;
+        }
+      }
+      for (const sub of inner.split(/[\s,;:()[\]{}]+/)) {
+        if (sub) evaluateCandidate(sub, false);
+      }
+    } else {
+      evaluateCandidate(rawTok, false);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Builds a safe SQLite FTS5 boolean OR match query from natural-language or code queries,
+ * expanding compound identifiers via splitIdentifierSubtokens and capping at 16 tokens.
+ * @param {string} queryText
+ * @returns {string|null}
+ */
+export function buildFts5MatchQuery(queryText) {
+  const raw = String(queryText ?? '').trim();
+  if (!raw || raw === '*') return null;
+
+  const seen = new Set();
+  const candidates = [];
+  const pushToken = (tok) => {
+    if (!tok || seen.has(tok)) return;
+    if (/^[a-z0-9_]{2,}$/.test(tok) && /[a-z0-9]/.test(tok)) {
+      seen.add(tok);
+      candidates.push(tok);
+    }
+  };
+
+  const rawChunks = raw.match(/[a-zA-Z0-9_]+/g) || [];
+  for (const chunk of rawChunks) {
+    for (const sub of splitIdentifierSubtokens(chunk)) {
+      pushToken(sub);
+    }
+    pushToken(chunk.toLowerCase());
+  }
+
+  if (candidates.length === 0) return null;
+
+  const nonStop = candidates.filter((t) => !STOP_WORDS.has(t));
+  const finalTokens = (nonStop.length > 0 ? nonStop : candidates).slice(0, 16);
+  if (finalTokens.length === 0) return null;
+
+  return finalTokens.map((t) => `"${t}"`).join(' OR ');
+}

@@ -1,14 +1,24 @@
 /**
  * @module engines/git-engine
  * Tier 2A: Codebase Structure, AST Symbols & Call Graph (krusch-git).
- * Enforces INV-GIT-01 (comment/string-masked AST brace matching) and
- * INV-GIT-02 (atomic per-file symbol/edge replacement on re-index).
+ * Enforces INV-GIT-01 (comment/string-masked AST brace matching),
+ * INV-GIT-02 (atomic per-file symbol/edge replacement on re-index),
+ * INV-STACK-07 (external-content Porter FTS5 + lazy Top-K snippet hydration), and
+ * INV-STACK-09 (gated 2-hop git_edges call-graph bridging, limit_tokens & unattested_query_identifiers).
  */
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { okEnvelope } from '../db/sqlite.js';
+import {
+  stemToken,
+  estimateTokens,
+  splitIdentifierSubtokens,
+  extractCodeShapeIdentifiers,
+  buildFts5MatchQuery,
+  STOP_WORDS
+} from './context-lexical.js';
 
 const IGNORED_DIRS = new Set([
   '.git',
@@ -62,6 +72,131 @@ const CALL_STOPWORDS = new Set([
   'isNaN',
   'isFinite'
 ]);
+
+const SHORT_QUERY_FILLERS = new Set([
+  'a', 'an', 'as', 'at', 'be', 'by', 'do', 'if', 'in',
+  'is', 'it', 'no', 'of', 'on', 'or', 'so', 'to', 'up'
+]);
+
+function isQueryStopword(tok) {
+  return STOP_WORDS.has(tok) || SHORT_QUERY_FILLERS.has(tok);
+}
+
+/**
+ * Expand a lowercase token into its primary morphological stem plus safe derivational roots (>= 5 chars)
+ * so inflections like `validators` <-> `validate`/`validation` and `rollups` <-> `rollup` align cleanly.
+ * @param {string} token
+ * @returns {string[]}
+ */
+function expandTokenStems(token) {
+  const w = String(token ?? '').toLowerCase();
+  if (!w) return [];
+  const primary = stemToken(w);
+  const out = new Set([w, primary]);
+
+  if (w.includes('_')) {
+    const collapsed = w.replace(/_/g, '');
+    if (collapsed.length >= 2) {
+      out.add(collapsed);
+      out.add(stemToken(collapsed));
+    }
+  }
+
+  if (primary.endsWith('ation') && primary.length - 5 >= 5) {
+    out.add(primary.slice(0, -5));
+  }
+  if (primary.endsWith('ion') && primary.length - 3 >= 5) {
+    out.add(primary.slice(0, -3));
+  }
+  if (primary.endsWith('ator') && primary.length - 4 >= 5) {
+    out.add(primary.slice(0, -4));
+    out.add(primary.slice(0, -2));
+  } else if ((primary.endsWith('or') || primary.endsWith('er')) && primary.length - 2 >= 5) {
+    out.add(primary.slice(0, -2));
+  }
+
+  return [...out];
+}
+
+/**
+ * Collect deduplicated lowercase identifier sub-tokens across any text or identifier string.
+ * @param {string} text
+ * @returns {string[]}
+ */
+function collectSubtokens(text) {
+  const raw = String(text ?? '');
+  if (!raw) return [];
+  const seen = new Set();
+  const out = [];
+
+  for (const chunk of raw.split(/[^A-Za-z0-9_$]+/)) {
+    if (!chunk) continue;
+    const subtokens = splitIdentifierSubtokens(chunk);
+    if (Array.isArray(subtokens)) {
+      for (const sub of subtokens) {
+        const lower = String(sub ?? '').toLowerCase();
+        if (lower && !seen.has(lower)) {
+          seen.add(lower);
+          out.push(lower);
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Build a Set of sub-tokens and morphological stems for fast O(1) lexical matching.
+ * @param {string} text
+ * @returns {Set<string>}
+ */
+function buildStemSet(text) {
+  const stems = new Set();
+  for (const sub of collectSubtokens(text)) {
+    for (const s of expandTokenStems(sub)) {
+      stems.add(s);
+    }
+  }
+  return stems;
+}
+
+/**
+ * Estimate token usage for a hydrated symbol search result row.
+ * @param {object} row
+ * @returns {number}
+ */
+function estimateSymbolRowTokens(row) {
+  const header = `${row.file_path || ''}:${row.symbol_name || ''} ${row.signature || ''}`;
+  const full = row.snippet ? `${header}\n${row.snippet}` : header;
+  return Math.max(1, estimateTokens(full));
+}
+
+/**
+ * Format a winning symbol candidate into the canonical semanticSearch row shape.
+ * @param {object} row
+ * @param {string} snippet
+ * @returns {object}
+ */
+function formatSymbolResultRow(row, snippet) {
+  const formatted = {
+    repo_name: row.repo_name,
+    file_path: row.file_path,
+    symbol_name: row.symbol_name,
+    symbol_type: row.symbol_type,
+    signature: row.signature,
+    start_line: row.start_line,
+    end_line: row.end_line,
+    symbol_hash: row.symbol_hash,
+    snippet: String(snippet ?? ''),
+    score: row.score
+  };
+  if (row.bridge_hop) {
+    formatted.bridge_hop = true;
+    formatted.bridge_via = row.bridge_via;
+  }
+  return formatted;
+}
 
 /**
  * Compute SHA-256 hex digest.
@@ -1075,21 +1210,28 @@ export function createGitEngine({ db, workspaceRoot = process.cwd() }) {
   }
 
   /**
-   * Hybrid lexical/BM25-weighted code search across indexed symbols and snippets.
+   * Hybrid lexical/BM25-weighted code search across indexed symbols and snippets,
+   * with Porter FTS5, sub-token/stemmed matching, gated 2-hop call-graph bridging,
+   * lazy Top-K snippet hydration, token budgeting, and unattested identifier telemetry.
    * @param {object} [params]
    * @param {string} [params.repo]
    * @param {string} [params.query='']
    * @param {number} [params.limit=10]
+   * @param {number} [params.limit_tokens]
    */
-  function semanticSearch({ repo, query = '', limit = 10 } = {}) {
+  function semanticSearch({ repo, query = '', limit = 10, limit_tokens } = {}) {
     const repoRecord = resolveRepoRecord(repo);
     const trimmedQuery = String(query ?? '').trim();
     const maxResults = Number.isFinite(Number(limit)) && Number(limit) > 0
-      ? Math.min(50, Number(limit))
+      ? Math.max(1, Math.min(50, Math.floor(Number(limit))))
       : 10;
+    const hasTokenLimit = Number.isFinite(Number(limit_tokens)) && Number(limit_tokens) > 0;
+    const tokenBudget = hasTokenLimit ? Math.max(1, Math.floor(Number(limit_tokens))) : null;
 
+    // INV-STACK-07: Metadata-only candidate scan (do NOT select snippet for full table)
     const allSymbols = db.prepare(`
       SELECT
+        id,
         repo_name,
         file_path,
         symbol_name,
@@ -1097,45 +1239,380 @@ export function createGitEngine({ db, workspaceRoot = process.cwd() }) {
         signature,
         start_line,
         end_line,
-        symbol_hash,
-        snippet
+        symbol_hash
       FROM git_symbols
       WHERE repo_name = ?
     `).all(repoRecord.name);
 
-    const terms = trimmedQuery
-      .toLowerCase()
-      .split(/[^a-z0-9_$]+/)
-      .filter((t) => t.length > 0);
+    const symbolById = new Map(allSymbols.map((s) => [Number(s.id), s]));
 
-    const scored = [];
-    for (const row of allSymbols) {
-      if (terms.length === 0) {
-        scored.push({ ...row, score: 1.0 });
-        continue;
+    /**
+     * Lazily hydrate `snippet` ONLY for winning rows and enforce optional `limit_tokens`.
+     * @param {Array<object>} winningRows
+     * @returns {{ results: Array<object>, tokens_used: number }}
+     */
+    function hydrateAndBudgetWinners(winningRows) {
+      const selectSnippetStmt = db.prepare('SELECT snippet FROM git_symbols WHERE id = ?');
+      const results = [];
+      let tokensUsed = 0;
+
+      for (const row of winningRows) {
+        const rawSnippet = selectSnippetStmt.get(row.id)?.snippet || '';
+        const candidate = formatSymbolResultRow(row, rawSnippet);
+        const candidateTokens = estimateSymbolRowTokens(candidate);
+
+        if (!hasTokenLimit) {
+          results.push(candidate);
+          tokensUsed += candidateTokens;
+          continue;
+        }
+
+        if (tokensUsed + candidateTokens <= tokenBudget) {
+          results.push(candidate);
+          tokensUsed += candidateTokens;
+          continue;
+        }
+
+        const remainingTokens = tokenBudget - tokensUsed;
+        const header = `${candidate.file_path || ''}:${candidate.symbol_name || ''} ${candidate.signature || ''}`;
+        const prefixLen = header.length + 1;
+        const maxSnippetChars = Math.max(0, remainingTokens * 4 - prefixLen);
+
+        if (results.length === 0) {
+          const truncatedSnippet = maxSnippetChars === 0
+            ? ''
+            : rawSnippet.length <= maxSnippetChars
+              ? rawSnippet
+              : maxSnippetChars > 3
+                ? `${rawSnippet.slice(0, maxSnippetChars - 3).trimEnd()}...`
+                : rawSnippet.slice(0, maxSnippetChars);
+          const firstBounded = formatSymbolResultRow(row, truncatedSnippet);
+          const usedForFirst = Math.min(tokenBudget, estimateSymbolRowTokens(firstBounded));
+          results.push(firstBounded);
+          tokensUsed += usedForFirst;
+          break;
+        }
+
+        if (maxSnippetChars >= 32 && rawSnippet.length > 0) {
+          const truncatedSnippet = rawSnippet.length <= maxSnippetChars
+            ? rawSnippet
+            : `${rawSnippet.slice(0, maxSnippetChars - 3).trimEnd()}...`;
+          const bounded = formatSymbolResultRow(row, truncatedSnippet);
+          const boundedTokens = estimateSymbolRowTokens(bounded);
+          if (tokensUsed + boundedTokens <= tokenBudget) {
+            results.push(bounded);
+            tokensUsed += boundedTokens;
+          }
+        }
+        break;
       }
 
-      const nameLower = row.symbol_name.toLowerCase();
-      const sigLower = (row.signature || '').toLowerCase();
-      const pathLower = row.file_path.toLowerCase();
-      const snippetLower = (row.snippet || '').toLowerCase();
+      return { results, tokens_used: tokensUsed };
+    }
 
-      let score = 0;
-      for (const term of terms) {
-        if (nameLower === term) score += 10;
-        else if (nameLower.includes(term)) score += 6;
-        if (sigLower.includes(term)) score += 4;
-        if (pathLower.includes(term)) score += 3;
-        if (snippetLower.includes(term)) score += 2;
-      }
+    if (!trimmedQuery || trimmedQuery === '*') {
+      const wildcardRows = allSymbols
+        .map((row) => ({ ...row, score: 1.0 }))
+        .sort((a, b) => a.file_path.localeCompare(b.file_path) || a.start_line - b.start_line)
+        .slice(0, maxResults);
 
-      if (score > 0) {
-        scored.push({ ...row, score });
+      const { results, tokens_used } = hydrateAndBudgetWinners(wildcardRows);
+      return okEnvelope(
+        'krusch_git_semantic_search',
+        `Semantic search for "${trimmedQuery}" returned ${results.length} result(s).`,
+        {
+          repo: repoRecord.name,
+          query: trimmedQuery,
+          results,
+          unattested_query_identifiers: [],
+          tokens_used
+        },
+        true
+      );
+    }
+
+    // INV-STACK-07: Query external-content Porter FTS5 virtual table
+    const ftsMap = new Map();
+    let ftsAvailable = true;
+    const ftsQuery = buildFts5MatchQuery(trimmedQuery);
+    if (ftsQuery && typeof ftsQuery === 'string' && ftsQuery.trim().length > 0) {
+      try {
+        const ftsRows = db.prepare(`
+          SELECT rowid, bm25(git_symbols_fts, 10.0, 5.0, 4.0, 2.0) AS rank
+          FROM git_symbols_fts
+          WHERE git_symbols_fts MATCH ?
+          ORDER BY rank ASC
+        `).all(ftsQuery);
+        for (let idx = 0; idx < ftsRows.length; idx += 1) {
+          const ftsRow = ftsRows[idx];
+          const id = Number(ftsRow.rowid);
+          if (symbolById.has(id) && !ftsMap.has(id)) {
+            const absRank = Math.abs(Number(ftsRow.rank) || 0);
+            const normRank = absRank > 0
+              ? 0.7 * (absRank / (1 + absRank)) + 0.3 * (1 / (1 + idx))
+              : 1 / (1 + idx);
+            const boost = 4 + 6 * normRank;
+            ftsMap.set(id, boost);
+          }
+        }
+      } catch {
+        ftsAvailable = false;
       }
     }
 
-    scored.sort((a, b) => b.score - a.score || a.file_path.localeCompare(b.file_path));
-    const results = scored.slice(0, maxResults);
+    const allRawTerms = [...new Set(trimmedQuery.toLowerCase().split(/[^a-z0-9_$]+/).filter(Boolean))];
+    const nonStopRawTerms = allRawTerms.filter((t) => !isQueryStopword(t));
+    const rawTerms = nonStopRawTerms.length > 0 ? nonStopRawTerms : allRawTerms;
+
+    const subTerms = collectSubtokens(trimmedQuery);
+    const effectiveSubTerms = subTerms.length > 0
+      ? subTerms
+      : rawTerms.filter((t) => t.length >= 2);
+    const filteredDistinctive = effectiveSubTerms.filter((t) => !isQueryStopword(t));
+    const distinctiveTokens = filteredDistinctive.length > 0 ? filteredDistinctive : effectiveSubTerms;
+    const distinctiveTokenStems = distinctiveTokens.map((tok) => ({
+      tok,
+      stems: expandTokenStems(tok)
+    }));
+
+    const symbolMetaCache = new Map();
+    function getSymbolMeta(row) {
+      const id = Number(row.id);
+      let cached = symbolMetaCache.get(id);
+      if (cached) return cached;
+      const nameLower = row.symbol_name.toLowerCase();
+      const sigLower = (row.signature || '').toLowerCase();
+      const pathLower = row.file_path.toLowerCase();
+      const nameStems = buildStemSet(row.symbol_name);
+      const sigStems = buildStemSet(row.signature || '');
+      const pathStems = buildStemSet(row.file_path);
+      const allStems = new Set([...nameStems, ...sigStems, ...pathStems]);
+      const collapsedJoined = `${nameLower.replace(/[^a-z0-9]/g, '')} ${pathLower.replace(/[^a-z0-9]/g, '')}`;
+      cached = {
+        nameLower,
+        sigLower,
+        pathLower,
+        nameStems,
+        sigStems,
+        pathStems,
+        allStems,
+        collapsedJoined
+      };
+      symbolMetaCache.set(id, cached);
+      return cached;
+    }
+
+    const scored = [];
+    for (const row of allSymbols) {
+      const meta = getSymbolMeta(row);
+      let score = 0;
+
+      for (const term of rawTerms) {
+        if (meta.nameLower === term) {
+          score += 10;
+        } else if (term.length >= 3 && meta.nameLower.includes(term)) {
+          score += 6;
+        }
+        if (term.length >= 3 && meta.sigLower.includes(term)) {
+          score += 4;
+        }
+        if (term.length >= 3 && meta.pathLower.includes(term)) {
+          score += 3;
+        }
+      }
+
+      for (const { stems } of distinctiveTokenStems) {
+        if (stems.some((s) => meta.nameStems.has(s))) score += 5;
+        if (stems.some((s) => meta.sigStems.has(s))) score += 3;
+        if (stems.some((s) => meta.pathStems.has(s))) score += 2;
+      }
+
+      const ftsBoost = ftsMap.get(Number(row.id)) || 0;
+      score += ftsBoost;
+
+      if (score > 0) {
+        scored.push({ ...row, score: Number(score.toFixed(4)) });
+      }
+    }
+
+    // Fallback when FTS5 is absent on a custom DB or query only matches punctuation/substrings inside snippet
+    if (scored.length === 0 && rawTerms.length > 0) {
+      const fallbackScores = new Map();
+      const likeSnippetStmt = db.prepare(`
+        SELECT id FROM git_symbols WHERE repo_name = ? AND lower(snippet) LIKE ?
+      `);
+      for (const term of rawTerms) {
+        const rows = likeSnippetStmt.all(repoRecord.name, `%${term}%`);
+        for (const r of rows) {
+          const id = Number(r.id);
+          if (symbolById.has(id)) {
+            fallbackScores.set(id, (fallbackScores.get(id) || 0) + 2);
+          }
+        }
+      }
+      for (const [id, score] of fallbackScores.entries()) {
+        const sym = symbolById.get(id);
+        if (sym) {
+          scored.push({ ...sym, score });
+        }
+      }
+    }
+
+    const compareScoredSymbols = (a, b) =>
+      b.score - a.score ||
+      a.file_path.localeCompare(b.file_path) ||
+      a.start_line - b.start_line;
+
+    scored.sort(compareScoredSymbols);
+    let topWinners = scored.slice(0, maxResults);
+
+    function coversToken(sym, tok, stems) {
+      const meta = getSymbolMeta(sym);
+      if (meta.nameLower === tok) return true;
+      if (tok.length >= 3 && (meta.nameLower.includes(tok) || meta.sigLower.includes(tok) || meta.pathLower.includes(tok))) {
+        return true;
+      }
+      const collapsedTok = tok.replace(/[^a-z0-9]/g, '');
+      if (collapsedTok.length >= 4 && meta.collapsedJoined.includes(collapsedTok)) {
+        return true;
+      }
+      return stems.some((s) => meta.allStems.has(s));
+    }
+
+    // INV-STACK-09: Gated 2-hop git_edges call-graph bridge expansion
+    if (distinctiveTokenStems.length >= 2 && topWinners.length > 0) {
+      const uncoveredEntries = distinctiveTokenStems.filter(
+        ({ tok, stems }) => !topWinners.some((sym) => coversToken(sym, tok, stems))
+      );
+
+      if (uncoveredEntries.length > 0) {
+        const uncoveredFtsByToken = new Map();
+        if (ftsAvailable) {
+          for (const { tok } of uncoveredEntries) {
+            const tokFts = buildFts5MatchQuery(tok);
+            if (!tokFts) continue;
+            try {
+              const rows = db.prepare('SELECT rowid FROM git_symbols_fts WHERE git_symbols_fts MATCH ?').all(tokFts);
+              uncoveredFtsByToken.set(tok, new Set(rows.map((r) => Number(r.rowid))));
+            } catch {
+              // Ignore per-token FTS errors
+            }
+          }
+        }
+
+        const symbolsByName = new Map();
+        for (const sym of allSymbols) {
+          let list = symbolsByName.get(sym.symbol_name);
+          if (!list) {
+            list = [];
+            symbolsByName.set(sym.symbol_name, list);
+          }
+          list.push(sym);
+        }
+
+        const hop1TopIds = new Set(topWinners.map((s) => Number(s.id)));
+        const seeds = topWinners.slice(0, 3);
+        const topHop1Score = Number(topWinners[0].score) || 1;
+        const rawBridgeCap = Math.min(topHop1Score * 0.84, Math.max(0.01, topHop1Score - 0.01));
+        const bridgeCap = rawBridgeCap >= 0.0001
+          ? Math.floor(rawBridgeCap * 10000) / 10000
+          : rawBridgeCap;
+
+        const selectEdgesStmt = db.prepare(`
+          SELECT from_symbol, to_symbol
+          FROM git_edges
+          WHERE repo_name = ? AND (from_symbol = ? OR to_symbol = ?)
+        `);
+        const checkSnippetLikeStmt = !ftsAvailable
+          ? db.prepare('SELECT 1 AS hit FROM git_symbols WHERE id = ? AND lower(snippet) LIKE ?')
+          : null;
+
+        const bridgedById = new Map();
+        for (const seed of seeds) {
+          const edges = selectEdgesStmt.all(repoRecord.name, seed.symbol_name, seed.symbol_name);
+          for (const edge of edges) {
+            const neighborName = edge.from_symbol === seed.symbol_name
+              ? edge.to_symbol
+              : edge.from_symbol;
+            if (!neighborName || neighborName === seed.symbol_name) continue;
+
+            const candidates = symbolsByName.get(neighborName);
+            if (!candidates) continue;
+
+            for (const cand of candidates) {
+              const candId = Number(cand.id);
+              if (hop1TopIds.has(candId)) continue;
+
+              let matchedUncovered = 0;
+              for (const { tok, stems } of uncoveredEntries) {
+                if (
+                  coversToken(cand, tok, stems) ||
+                  uncoveredFtsByToken.get(tok)?.has(candId) ||
+                  (checkSnippetLikeStmt && Boolean(checkSnippetLikeStmt.get(candId, `%${tok}%`)))
+                ) {
+                  matchedUncovered += 1;
+                }
+              }
+
+              if (matchedUncovered === 0 && ftsMap.has(candId) && uncoveredFtsByToken.size === 0) {
+                matchedUncovered = 1;
+              }
+
+              if (matchedUncovered >= 1) {
+                const coverageRatio = matchedUncovered / uncoveredEntries.length;
+                const scaled = bridgeCap * (0.9 + 0.1 * coverageRatio);
+                const candScore = Math.min(
+                  bridgeCap,
+                  scaled >= 0.0001 ? Math.floor(scaled * 10000) / 10000 : scaled
+                );
+                const prev = bridgedById.get(candId);
+                if (!prev || candScore > prev.score) {
+                  bridgedById.set(candId, {
+                    ...cand,
+                    score: candScore,
+                    bridge_hop: true,
+                    bridge_via: seed.symbol_name
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        if (bridgedById.size > 0) {
+          const bridgedList = [...bridgedById.values()].sort(compareScoredSymbols);
+          if (topWinners.length < maxResults) {
+            const needed = maxResults - topWinners.length;
+            topWinners = [...topWinners, ...bridgedList.slice(0, needed)];
+            topWinners.sort(compareScoredSymbols);
+          } else {
+            const reserveForBridge = Math.min(2, bridgedList.length, Math.max(0, maxResults - 1));
+            const keepHop1Count = Math.max(1, maxResults - reserveForBridge);
+            topWinners = [
+              ...topWinners.slice(0, keepHop1Count),
+              ...bridgedList.slice(0, reserveForBridge)
+            ];
+            topWinners.sort(compareScoredSymbols);
+            topWinners = topWinners.slice(0, maxResults);
+          }
+        }
+      }
+    }
+
+    const { results, tokens_used } = hydrateAndBudgetWinners(topWinners);
+
+    const rawCodeIdentifiers = extractCodeShapeIdentifiers(trimmedQuery);
+    let unattested_query_identifiers = [];
+    if (Array.isArray(rawCodeIdentifiers) && rawCodeIdentifiers.length > 0) {
+      const haystack = results
+        .map((r) => `${r.symbol_name || ''}\n${r.signature || ''}\n${r.file_path || ''}\n${r.snippet || ''}`)
+        .join('\n')
+        .toLowerCase();
+      unattested_query_identifiers = rawCodeIdentifiers.filter((ident) => {
+        const normalized = String(ident ?? '').replace(/^`+|`+$/g, '').toLowerCase();
+        return normalized.length > 0 && !haystack.includes(normalized);
+      });
+    }
 
     return okEnvelope(
       'krusch_git_semantic_search',
@@ -1143,7 +1620,9 @@ export function createGitEngine({ db, workspaceRoot = process.cwd() }) {
       {
         repo: repoRecord.name,
         query: trimmedQuery,
-        results
+        results,
+        unattested_query_identifiers,
+        tokens_used
       },
       true
     );

@@ -19,10 +19,18 @@ import {
   cosineSimilarity,
   parseEmbeddingVector,
   serializeEmbeddingVector,
-  fetchOptionalEmbedding
+  fetchOptionalEmbedding,
+  splitIdentifierSubtokens,
+  extractCodeShapeIdentifiers,
+  buildFts5MatchQuery
 } from './engines/context-lexical.js';
 import { createGitEngine, maskCodePreservingNewlines } from './engines/git-engine.js';
-import { createFsEngine } from './engines/fs-engine.js';
+import {
+  createFsEngine,
+  isSensitiveEnvFile,
+  redactEnvSecrets,
+  scanForSecretLeak
+} from './engines/fs-engine.js';
 import { createHarnessEngine } from './engines/harness-engine.js';
 import { createFrontendEngine } from './engines/frontend-engine.js';
 import { createWorkspaceEngine } from './engines/workspace-engine.js';
@@ -49,12 +57,19 @@ export function createKruschStack(options = {}) {
     options.workspaceRoot || process.env.KRUSCH_WORKSPACE_ROOT || process.cwd()
   );
   const profile = (options.profile || process.env.KRUSCH_STACK_PROFILE || 'full') === 'core' ? 'core' : 'full';
-  const ephemeral = Boolean(options.ephemeral || options.dbPath === ':memory:' || process.env.KRUSCH_EPHEMERAL === '1');
+  const hasExplicitFileDb = Boolean(options.dbPath && options.dbPath !== ':memory:');
+  const ephemeral =
+    options.ephemeral === true ||
+    options.dbPath === ':memory:' ||
+    (options.ephemeral !== false && !hasExplicitFileDb && process.env.KRUSCH_EPHEMERAL === '1');
   const db = options.db || openStackDatabase({
     workspaceRoot,
     dbPath: options.dbPath,
     ephemeral
   });
+  if (options.db) {
+    ensureStackSchemaMigrations(db);
+  }
 
   const context = createContextEngine({
     db,
@@ -114,9 +129,15 @@ export {
   parseEmbeddingVector,
   serializeEmbeddingVector,
   fetchOptionalEmbedding,
+  splitIdentifierSubtokens,
+  extractCodeShapeIdentifiers,
+  buildFts5MatchQuery,
   createGitEngine,
   maskCodePreservingNewlines,
   createFsEngine,
+  isSensitiveEnvFile,
+  redactEnvSecrets,
+  scanForSecretLeak,
   createHarnessEngine,
   createFrontendEngine,
   createWorkspaceEngine,

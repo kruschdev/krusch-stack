@@ -130,13 +130,142 @@ export const STACK_SCHEMA_SQL = `
 
 /**
  * Apply idempotent forward schema migrations for existing SQLite stack databases.
- * Ensures legacy .krusch-stack/stack.db files gain the optional `embedding TEXT` column cleanly.
+ * Ensures legacy .krusch-stack/stack.db files gain the optional `embedding TEXT` column cleanly
+ * and provisions INV-STACK-07 external-content Porter FTS5 tables, triggers, and one-time rebuilds.
  * @param {DatabaseSync} db
  */
 export function ensureStackSchemaMigrations(db) {
   const cols = db.prepare('PRAGMA table_info(context_memories);').all();
   if (cols.length > 0 && !cols.some((c) => c.name === 'embedding')) {
     db.exec('ALTER TABLE context_memories ADD COLUMN embedding TEXT;');
+  }
+
+  const hasTable = (name) =>
+    Boolean(
+      db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)
+    );
+
+  try {
+    db.exec('PRAGMA recursive_triggers = ON;');
+
+    if (hasTable('git_symbols')) {
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS git_symbols_fts USING fts5(
+          symbol_name,
+          signature,
+          file_path,
+          snippet,
+          content='git_symbols',
+          content_rowid='id',
+          tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS git_symbols_fts_ai AFTER INSERT ON git_symbols BEGIN
+          INSERT INTO git_symbols_fts(rowid, symbol_name, signature, file_path, snippet)
+          VALUES (new.id, new.symbol_name, new.signature, new.file_path, new.snippet);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS git_symbols_fts_ad AFTER DELETE ON git_symbols BEGIN
+          INSERT INTO git_symbols_fts(git_symbols_fts, rowid, symbol_name, signature, file_path, snippet)
+          VALUES ('delete', old.id, old.symbol_name, old.signature, old.file_path, old.snippet);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS git_symbols_fts_au AFTER UPDATE ON git_symbols BEGIN
+          INSERT INTO git_symbols_fts(git_symbols_fts, rowid, symbol_name, signature, file_path, snippet)
+          VALUES ('delete', old.id, old.symbol_name, old.signature, old.file_path, old.snippet);
+          INSERT INTO git_symbols_fts(rowid, symbol_name, signature, file_path, snippet)
+          VALUES (new.id, new.symbol_name, new.signature, new.file_path, new.snippet);
+        END;
+      `);
+
+      const baseCnt = Number(db.prepare('SELECT COUNT(*) AS cnt FROM git_symbols').get()?.cnt || 0);
+      const ftsCnt = Number(
+        db.prepare('SELECT COUNT(*) AS cnt FROM git_symbols_fts_docsize').get()?.cnt || 0
+      );
+      if (baseCnt > 0 && ftsCnt === 0) {
+        db.exec("INSERT INTO git_symbols_fts(git_symbols_fts) VALUES('rebuild');");
+      }
+    }
+
+    if (hasTable('fs_pages')) {
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS fs_pages_fts USING fts5(
+          section_title,
+          file_path,
+          page_text,
+          content='fs_pages',
+          content_rowid='id',
+          tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS fs_pages_fts_ai AFTER INSERT ON fs_pages BEGIN
+          INSERT INTO fs_pages_fts(rowid, section_title, file_path, page_text)
+          VALUES (new.id, new.section_title, new.file_path, new.page_text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS fs_pages_fts_ad AFTER DELETE ON fs_pages BEGIN
+          INSERT INTO fs_pages_fts(fs_pages_fts, rowid, section_title, file_path, page_text)
+          VALUES ('delete', old.id, old.section_title, old.file_path, old.page_text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS fs_pages_fts_au AFTER UPDATE ON fs_pages BEGIN
+          INSERT INTO fs_pages_fts(fs_pages_fts, rowid, section_title, file_path, page_text)
+          VALUES ('delete', old.id, old.section_title, old.file_path, old.page_text);
+          INSERT INTO fs_pages_fts(rowid, section_title, file_path, page_text)
+          VALUES (new.id, new.section_title, new.file_path, new.page_text);
+        END;
+      `);
+
+      const baseCnt = Number(db.prepare('SELECT COUNT(*) AS cnt FROM fs_pages').get()?.cnt || 0);
+      const ftsCnt = Number(
+        db.prepare('SELECT COUNT(*) AS cnt FROM fs_pages_fts_docsize').get()?.cnt || 0
+      );
+      if (baseCnt > 0 && ftsCnt === 0) {
+        db.exec("INSERT INTO fs_pages_fts(fs_pages_fts) VALUES('rebuild');");
+      }
+    }
+
+    if (hasTable('fs_page_memories')) {
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS fs_page_memories_fts USING fts5(
+          category,
+          note,
+          file_path,
+          content='fs_page_memories',
+          content_rowid='id',
+          tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS fs_page_memories_fts_ai AFTER INSERT ON fs_page_memories BEGIN
+          INSERT INTO fs_page_memories_fts(rowid, category, note, file_path)
+          VALUES (new.id, new.category, new.note, new.file_path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS fs_page_memories_fts_ad AFTER DELETE ON fs_page_memories BEGIN
+          INSERT INTO fs_page_memories_fts(fs_page_memories_fts, rowid, category, note, file_path)
+          VALUES ('delete', old.id, old.category, old.note, old.file_path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS fs_page_memories_fts_au AFTER UPDATE ON fs_page_memories BEGIN
+          INSERT INTO fs_page_memories_fts(fs_page_memories_fts, rowid, category, note, file_path)
+          VALUES ('delete', old.id, old.category, old.note, old.file_path);
+          INSERT INTO fs_page_memories_fts(rowid, category, note, file_path)
+          VALUES (new.id, new.category, new.note, new.file_path);
+        END;
+      `);
+
+      const baseCnt = Number(
+        db.prepare('SELECT COUNT(*) AS cnt FROM fs_page_memories').get()?.cnt || 0
+      );
+      const ftsCnt = Number(
+        db.prepare('SELECT COUNT(*) AS cnt FROM fs_page_memories_fts_docsize').get()?.cnt || 0
+      );
+      if (baseCnt > 0 && ftsCnt === 0) {
+        db.exec("INSERT INTO fs_page_memories_fts(fs_page_memories_fts) VALUES('rebuild');");
+      }
+    }
+  } catch {
+    /* Graceful fallback if custom SQLite build omits FTS5 */
   }
 }
 
@@ -149,8 +278,12 @@ export function ensureStackSchemaMigrations(db) {
  * @returns {DatabaseSync}
  */
 export function openStackDatabase(options = {}) {
-  const ephemeral = Boolean(options.ephemeral || process.env.KRUSCH_EPHEMERAL === '1');
-  if (ephemeral || options.dbPath === ':memory:') {
+  const hasExplicitFileDb = Boolean(options.dbPath && options.dbPath !== ':memory:');
+  const ephemeral =
+    options.ephemeral === true ||
+    options.dbPath === ':memory:' ||
+    (options.ephemeral !== false && !hasExplicitFileDb && process.env.KRUSCH_EPHEMERAL === '1');
+  if (ephemeral) {
     const memDb = new DatabaseSync(':memory:');
     memDb.exec('PRAGMA busy_timeout = 5000;');
     memDb.exec('PRAGMA foreign_keys = ON;');
