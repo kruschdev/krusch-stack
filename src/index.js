@@ -24,7 +24,12 @@ import {
   extractCodeShapeIdentifiers,
   buildFts5MatchQuery
 } from './engines/context-lexical.js';
-import { createGitEngine, maskCodePreservingNewlines } from './engines/git-engine.js';
+import {
+  createGitEngine,
+  maskCodePreservingNewlines,
+  parseJavaSymbols,
+  analyzeImportSymbolActivity
+} from './engines/git-engine.js';
 import {
   createFsEngine,
   isSensitiveEnvFile,
@@ -134,6 +139,8 @@ export {
   buildFts5MatchQuery,
   createGitEngine,
   maskCodePreservingNewlines,
+  parseJavaSymbols,
+  analyzeImportSymbolActivity,
   createFsEngine,
   isSensitiveEnvFile,
   redactEnvSecrets,

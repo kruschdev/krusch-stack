@@ -32,7 +32,7 @@ const IGNORED_DIRS = new Set([
   '__pycache__'
 ]);
 
-const CODE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.md']);
+const CODE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.java', '.md']);
 
 const CALL_STOPWORDS = new Set([
   'if',
@@ -211,9 +211,11 @@ function sha256(text) {
  * INV-GIT-01: Mask comments, regex literals, and string/template literals with spaces
  * while preserving every newline and exact character offset.
  * @param {string} source
+ * @param {{ maskStrings?: boolean, allowHashComment?: boolean }} [options]
  * @returns {string}
  */
-export function maskCodePreservingNewlines(source) {
+export function maskCodePreservingNewlines(source, options = {}) {
+  const { maskStrings = true, allowHashComment = false } = options || {};
   const input = String(source ?? '');
   const out = new Array(input.length);
   let i = 0;
@@ -223,6 +225,17 @@ export function maskCodePreservingNewlines(source) {
   while (i < len) {
     const ch = input[i];
     const next = i + 1 < len ? input[i + 1] : '';
+
+    // Single-line hash comment # (Python / Shell)
+    if (allowHashComment && ch === '#') {
+      out[i] = ' ';
+      i += 1;
+      while (i < len && input[i] !== '\n') {
+        out[i] = input[i] === '\r' ? '\r' : ' ';
+        i += 1;
+      }
+      continue;
+    }
 
     // Single-line comment //
     if (ch === '/' && next === '/') {
@@ -281,7 +294,7 @@ export function maskCodePreservingNewlines(source) {
       }
       if (foundClose) {
         while (i <= j) {
-          out[i] = ' ';
+          out[i] = maskStrings ? ' ' : input[i];
           i += 1;
         }
         prevNonSpace = '/';
@@ -292,14 +305,16 @@ export function maskCodePreservingNewlines(source) {
     // String or template literal: ', ", `
     if (ch === "'" || ch === '"' || ch === '`') {
       const quote = ch;
-      out[i] = ' ';
+      out[i] = maskStrings ? ' ' : ch;
       i += 1;
       while (i < len) {
         const c = input[i];
         if (c === '\\') {
-          out[i] = ' ';
+          out[i] = maskStrings ? ' ' : c;
           if (i + 1 < len) {
-            out[i + 1] = input[i + 1] === '\n' || input[i + 1] === '\r' ? input[i + 1] : ' ';
+            out[i + 1] = maskStrings
+              ? (input[i + 1] === '\n' || input[i + 1] === '\r' ? input[i + 1] : ' ')
+              : input[i + 1];
             i += 2;
           } else {
             i += 1;
@@ -307,11 +322,11 @@ export function maskCodePreservingNewlines(source) {
           continue;
         }
         if (c === quote) {
-          out[i] = ' ';
+          out[i] = maskStrings ? ' ' : c;
           i += 1;
           break;
         }
-        out[i] = c === '\n' || c === '\r' ? c : ' ';
+        out[i] = maskStrings ? (c === '\n' || c === '\r' ? c : ' ') : c;
         i += 1;
       }
       prevNonSpace = quote;
@@ -620,6 +635,496 @@ function parseMarkdownSymbols(source) {
   return { symbols, edges: [] };
 }
 
+const JAVA_KEYWORDS = new Set([
+  'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'try', 'catch', 'finally',
+  'synchronized', 'return', 'new', 'throw', 'throws', 'super', 'this', 'assert'
+]);
+
+/**
+ * Extract Java classes, interfaces, annotations (@interface), enums, records, methods,
+ * constructors, static/standard import edges, and outbound call edges (krusch-git v1.2.3 parity).
+ * @param {string} source
+ * @returns {{ symbols: Array<object>, edges: Array<object> }}
+ */
+export function parseJavaSymbols(source) {
+  const noComments = maskCodePreservingNewlines(source, { maskStrings: false });
+  const masked = maskCodePreservingNewlines(source, { maskStrings: true });
+  const lineOffsets = buildLineOffsets(source);
+  const lines = source.split(/\r?\n/);
+  const symbols = [];
+  const edges = [];
+  const seenSymbolKeys = new Set();
+  const seenEdgeKeys = new Set();
+
+  function addEdge(fromSymbol, toSymbol, edgeType) {
+    if (!fromSymbol || !toSymbol || fromSymbol === toSymbol) return;
+    const key = `${fromSymbol}->${toSymbol}:${edgeType}`;
+    if (seenEdgeKeys.has(key)) return;
+    seenEdgeKeys.add(key);
+    edges.push({
+      from_symbol: fromSymbol,
+      to_symbol: toSymbol,
+      edge_type: edgeType
+    });
+  }
+
+  // 1. Java imports: import a.b.Foo; or import static a.b.Owner.member;
+  const importedSymbols = [];
+  const importRegex = /(?:^|\n)[ \t]*import\s+(static\s+)?([a-zA-Z0-9_.*$]+)\s*;/g;
+  for (const match of noComments.matchAll(importRegex)) {
+    const isStatic = Boolean(match[1]);
+    const targetPath = match[2].trim();
+    const segments = targetPath.split('.').filter((s) => s && s !== '*');
+    if (segments.length > 0) {
+      const leaf = segments[segments.length - 1];
+      importedSymbols.push(leaf);
+      if (isStatic && segments.length >= 2) {
+        const ownerType = segments[segments.length - 2];
+        if (/^[A-Z]/.test(ownerType)) {
+          importedSymbols.push(ownerType);
+          importedSymbols.push(`${ownerType}.${leaf}`);
+        }
+      }
+    }
+  }
+
+  // 2. Java Classes, Interfaces, Annotations (@interface), Enums, and Records
+  const typeScopes = [];
+  const typeRegex = /(?:^|\n)[ \t]*(?:@[a-zA-Z0-9_.]+(?:\([^)]*\))?\s+)*(?:(?:public|protected|private|abstract|final|static|sealed|non-sealed|strictfp)\s+)*(@\s*interface|class|interface|enum|record)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)[^{;]*\{/g;
+  for (const match of masked.matchAll(typeRegex)) {
+    const kind = match[1].replace(/\s+/g, '');
+    const typeName = match[2];
+    const declStartIdx = match.index + (match[0].startsWith('\n') ? 1 : 0);
+    const openBraceIdx = match.index + match[0].length - 1;
+    const closeBraceIdx = findMatchingBrace(masked, openBraceIdx);
+    const startLine = offsetToLine(lineOffsets, declStartIdx);
+    const endLine = offsetToLine(lineOffsets, closeBraceIdx);
+    const symKey = `${typeName}:${startLine}`;
+    if (seenSymbolKeys.has(symKey)) continue;
+    seenSymbolKeys.add(symKey);
+
+    const symType = kind === 'class' ? 'class' : 'type';
+    const signature = source.slice(declStartIdx, openBraceIdx).replace(/\s+/g, ' ').trim();
+    const fullBody = source.slice(declStartIdx, closeBraceIdx + 1);
+    const snippet = lines.slice(startLine - 1, Math.min(endLine, startLine + 24)).join('\n');
+
+    typeScopes.push({ name: typeName, kind, startIdx: openBraceIdx, endIdx: closeBraceIdx });
+    symbols.push({
+      symbol_name: typeName,
+      symbol_type: symType,
+      signature,
+      start_line: startLine,
+      end_line: endLine,
+      symbol_hash: sha256(fullBody),
+      snippet
+    });
+  }
+
+  // Record cross-file import edges from declared top-level types
+  const topLevelTypes = typeScopes.filter(
+    (outer) => !typeScopes.some((other) => other !== outer && outer.startIdx > other.startIdx && outer.endIdx < other.endIdx)
+  );
+  for (const t of topLevelTypes) {
+    for (const impSym of importedSymbols) {
+      addEdge(t.name, impSym, 'imports');
+    }
+  }
+
+  function resolveEnclosingJavaType(idx) {
+    let best = null;
+    for (const scope of typeScopes) {
+      if (idx > scope.startIdx && idx < scope.endIdx) {
+        if (!best || (scope.endIdx - scope.startIdx) < (best.endIdx - best.startIdx)) {
+          best = scope;
+        }
+      }
+    }
+    return best;
+  }
+
+  // 3. Java Concrete Methods & Constructors ({-bodied)
+  const methodScopes = [];
+  const methodRegex = /(?:^|\n)[ \t]*(?:@[a-zA-Z0-9_.]+(?:\([^)]*\))?\s+)*(?:(?:public|protected|private|static|final|synchronized|abstract|default|native|strictfp)\s+)+(?:<[^>]+>\s+)?(?:[a-zA-Z0-9_$<>[\],.? ]+\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\([^;{}]*?\)\s*(?:throws\s+[a-zA-Z0-9_.,\s$]+)?\{/g;
+  for (const match of masked.matchAll(methodRegex)) {
+    const methodName = match[1];
+    if (JAVA_KEYWORDS.has(methodName)) continue;
+
+    const declStartIdx = match.index + (match[0].startsWith('\n') ? 1 : 0);
+    const openBraceIdx = match.index + match[0].length - 1;
+    const closeBraceIdx = findMatchingBrace(masked, openBraceIdx);
+    const startLine = offsetToLine(lineOffsets, declStartIdx);
+    const endLine = offsetToLine(lineOffsets, closeBraceIdx);
+    const owner = resolveEnclosingJavaType(declStartIdx);
+    const qualifiedName = owner ? `${owner.name}.${methodName}` : methodName;
+    const symKey = `${qualifiedName}:${startLine}`;
+    if (seenSymbolKeys.has(symKey)) continue;
+    seenSymbolKeys.add(symKey);
+
+    methodScopes.push({ startIdx: openBraceIdx, endIdx: closeBraceIdx });
+
+    const signature = source.slice(declStartIdx, openBraceIdx).replace(/\s+/g, ' ').trim();
+    const fullBody = source.slice(declStartIdx, closeBraceIdx + 1);
+    const maskedBody = masked.slice(openBraceIdx + 1, closeBraceIdx);
+    const snippet = lines.slice(startLine - 1, Math.min(endLine, startLine + 24)).join('\n');
+
+    symbols.push({
+      symbol_name: qualifiedName,
+      symbol_type: 'method',
+      signature,
+      start_line: startLine,
+      end_line: endLine,
+      symbol_hash: sha256(fullBody),
+      snippet
+    });
+
+    const callees = extractCalledSymbols(maskedBody, methodName);
+    for (const callee of callees) {
+      addEdge(qualifiedName, callee, 'calls');
+      if (owner) {
+        addEdge(owner.name, callee, 'calls');
+      }
+    }
+  }
+
+  // 4. Java Interface / Abstract Method Signatures (;-terminated outside concrete method bodies)
+  const ifaceMethodRegex = /(?:^|\n)[ \t]*(?:@[a-zA-Z0-9_.]+(?:\([^)]*\))?\s+)*(?:(?:public|protected|abstract)\s+)*(?:<[^>]+>\s+)?[a-zA-Z_$][a-zA-Z0-9_$<>[\],.?]*(?:\s*<[^>]+>)?(?:\[\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\([^;{}]*?\)\s*(?:throws\s+[a-zA-Z0-9_.,\s$]+)?;/g;
+  for (const match of masked.matchAll(ifaceMethodRegex)) {
+    const methodName = match[1];
+    if (JAVA_KEYWORDS.has(methodName)) continue;
+    const declStartIdx = match.index + (match[0].startsWith('\n') ? 1 : 0);
+    if (methodScopes.some((ms) => declStartIdx > ms.startIdx && declStartIdx < ms.endIdx)) continue;
+    const owner = resolveEnclosingJavaType(declStartIdx);
+    if (!owner) continue;
+
+    const sigText = source.slice(declStartIdx, match.index + match[0].length).replace(/\s+/g, ' ').trim();
+    if (/^(?:return|throw|new)\b/.test(sigText)) continue;
+    if (owner.kind !== 'interface' && owner.kind !== '@interface' && !/\babstract\b/.test(sigText)) continue;
+
+    const startLine = offsetToLine(lineOffsets, declStartIdx);
+    const qualifiedName = `${owner.name}.${methodName}`;
+    const symKey = `${qualifiedName}:${startLine}`;
+    if (seenSymbolKeys.has(symKey)) continue;
+    seenSymbolKeys.add(symKey);
+
+    const cleanSig = sigText.replace(/;$/, '').trim();
+    symbols.push({
+      symbol_name: qualifiedName,
+      symbol_type: 'method',
+      signature: cleanSig,
+      start_line: startLine,
+      end_line: startLine,
+      symbol_hash: sha256(sigText),
+      snippet: cleanSig
+    });
+  }
+
+  symbols.sort((a, b) => a.start_line - b.start_line);
+  return { symbols, edges };
+}
+
+function escapeIdentifierForWordBoundary(ident) {
+  return String(ident || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function hasWholeIdentifierInText(text, ident) {
+  if (!text || !ident) return false;
+  const escaped = escapeIdentifierForWordBoundary(ident);
+  const re = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
+  return re.test(text);
+}
+
+const RECEIVER_STOPWORDS = new Set([
+  'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'try', 'catch', 'finally',
+  'return', 'new', 'throw', 'throws', 'super', 'this', 'self', 'cls', 'true', 'false',
+  'null', 'none', 'var', 'val', 'let', 'const', 'def', 'class', 'import', 'from'
+]);
+
+/**
+ * Extract 1-hop local/field/parameter variable names typed as or constructed from `localSymbolName`
+ * so `analyzeImportSymbolActivity` recognizes active cursor usage via `receiver.method(...)`.
+ */
+function extractBoundReceiverNames(maskedPrefix, localSymbolName, isPyLike, isJava) {
+  if (!maskedPrefix || !localSymbolName || localSymbolName.length < 2) return [];
+  const esc = escapeIdentifierForWordBoundary(localSymbolName);
+  const receivers = new Set();
+  let m;
+
+  if (isPyLike) {
+    const assignRe = new RegExp(`(?:\\bself\\.)?([A-Za-z_][A-Za-z0-9_]*)\\s*(?::[^=\\n]{1,64})?=\\s*(?:await\\s+)?${esc}\\s*\\(`, 'g');
+    while ((m = assignRe.exec(maskedPrefix)) !== null) {
+      const name = m[1];
+      if (name && name.length >= 2 && !RECEIVER_STOPWORDS.has(name.toLowerCase())) {
+        receivers.add(name);
+      }
+    }
+    const annotRe = new RegExp(`\\b([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*(?:Optional\\[|List\\[|Sequence\\[)?${esc}\\b`, 'g');
+    while ((m = annotRe.exec(maskedPrefix)) !== null) {
+      const name = m[1];
+      if (name && name.length >= 2 && !RECEIVER_STOPWORDS.has(name.toLowerCase())) {
+        receivers.add(name);
+      }
+    }
+  } else if (isJava) {
+    const typedDeclRe = new RegExp(`\\b${esc}(?:\\s*<[^>\\n]{1,80}>)?(?:\\[\\])*\\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\\b`, 'g');
+    while ((m = typedDeclRe.exec(maskedPrefix)) !== null) {
+      const name = m[1];
+      if (name && name.length >= 2 && !RECEIVER_STOPWORDS.has(name.toLowerCase())) {
+        receivers.add(name);
+      }
+    }
+    const newAssignRe = new RegExp(`(?:\\bthis\\.)?([a-zA-Z_$][a-zA-Z0-9_$]*)\\s*=\\s*new\\s+${esc}\\b`, 'g');
+    while ((m = newAssignRe.exec(maskedPrefix)) !== null) {
+      const name = m[1];
+      if (name && name.length >= 2 && !RECEIVER_STOPWORDS.has(name.toLowerCase())) {
+        receivers.add(name);
+      }
+    }
+  } else {
+    const jsNewRe = new RegExp(`(?:\\bthis\\.|\\b(?:const|let|var)\\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\\s*=\\s*(?:await\\s+)?(?:new\\s+)?${esc}\\s*\\(`, 'g');
+    while ((m = jsNewRe.exec(maskedPrefix)) !== null) {
+      const name = m[1];
+      if (name && name.length >= 2 && !RECEIVER_STOPWORDS.has(name.toLowerCase())) {
+        receivers.add(name);
+      }
+    }
+  }
+
+  return [...receivers];
+}
+
+/**
+ * Parse structured import bindings (`{ localName, exportedName, moduleStem, targetPath, isStatic }`)
+ * across Python, Java, JS/TS, Go, and Rust, and classify each imported binding against `codePrefix`
+ * into `immediate_cursor`, `unused_staged`, or `earlier_only` (krusch-git v1.2.3 parity).
+ *
+ * @param {string} codePrefix
+ * @param {string} [importStatement='']
+ * @param {string} [filePath='']
+ * @param {{ immediateLineWindow?: number }} [options={}]
+ */
+export function analyzeImportSymbolActivity(codePrefix, importStatement = '', filePath = '', options = {}) {
+  const ext = path.extname(filePath || '').toLowerCase();
+  const immediateLineWindow = Math.max(1, Number(options.immediateLineWindow ?? 5));
+  const combinedImportsSource = String(importStatement || '').trim()
+    ? String(importStatement)
+    : String(codePrefix || '');
+
+  const bindings = [];
+  const seenBindingKey = new Set();
+  const pushBinding = (localName, exportedName, moduleStem, targetPath, isStatic = false) => {
+    const loc = String(localName || '').trim();
+    const exp = String(exportedName || loc).trim();
+    if (!loc || loc === '*' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(loc)) return;
+    const key = `${loc}::${exp}::${moduleStem || ''}`;
+    if (seenBindingKey.has(key)) return;
+    seenBindingKey.add(key);
+    bindings.push({
+      localName: loc,
+      exportedName: exp,
+      moduleStem: String(moduleStem || '').trim(),
+      targetPath: String(targetPath || '').trim(),
+      isStatic: Boolean(isStatic),
+      receiverNames: [],
+      matchedViaReceiver: false,
+      status: 'unused_staged'
+    });
+  };
+
+  if (ext === '.java') {
+    const cleanImp = maskCodePreservingNewlines(combinedImportsSource, { maskStrings: false });
+    const javaImpRe = /(?:^|\n)[ \t]*import\s+(static\s+)?([A-Za-z0-9_.*$]+)\s*;/g;
+    for (const m of cleanImp.matchAll(javaImpRe)) {
+      const isStatic = Boolean(m[1]);
+      const fullPath = m[2].trim();
+      if (fullPath.endsWith('.*')) continue;
+      const segs = fullPath.split('.').filter(Boolean);
+      if (segs.length === 0) continue;
+      const leaf = segs[segs.length - 1];
+      const ownerStem = isStatic && segs.length >= 2 ? segs[segs.length - 2] : leaf;
+      pushBinding(leaf, leaf, ownerStem, fullPath, isStatic);
+    }
+  } else if (ext === '.py' || (!ext && /\b(?:from\s+\S+\s+import|def\s+\w+)/.test(`${combinedImportsSource}\n${codePrefix}`))) {
+    const commentStripped = String(combinedImportsSource)
+      .split(/\r?\n/)
+      .map((l) => l.replace(/#.*$/, ''))
+      .join('\n');
+    const joined = commentStripped
+      .replace(/\\\r?\n/g, ' ')
+      .replace(/(from\s+[A-Za-z0-9_.]+\s+import\s*)\(\s*([\s\S]*?)\s*\)/g, (_all, prefix, inner) => `${prefix}(${inner.replace(/\r?\n/g, ' ')})`);
+    for (const rawLine of joined.split(/\r?\n/)) {
+      const cleaned = rawLine.trim();
+      if (!cleaned) continue;
+
+      const fromMatch = cleaned.match(/^from\s+([A-Za-z0-9_.]+)\s+import\s+\(?([^)]+)\)?$/);
+      if (fromMatch) {
+        const modPath = fromMatch[1];
+        const modParts = modPath.replace(/^\.+/, '').split('.').filter(Boolean);
+        const moduleStem = modParts.length > 0 ? modParts[modParts.length - 1] : '';
+        for (const item of fromMatch[2].split(',')) {
+          const trimmed = item.trim();
+          if (!trimmed || trimmed === '*') continue;
+          const asParts = trimmed.split(/\s+as\s+/i).map((s) => s.trim()).filter(Boolean);
+          if (asParts.length >= 2) {
+            pushBinding(asParts[1], asParts[0], moduleStem, modPath, false);
+          } else if (asParts.length === 1) {
+            pushBinding(asParts[0], asParts[0], moduleStem, modPath, false);
+          }
+        }
+        continue;
+      }
+
+      const impMatch = cleaned.match(/^import\s+(.+)$/);
+      if (impMatch) {
+        for (const item of impMatch[1].split(',')) {
+          const trimmed = item.trim();
+          if (!trimmed) continue;
+          const asParts = trimmed.split(/\s+as\s+/i).map((s) => s.trim()).filter(Boolean);
+          const modPath = asParts[0] || '';
+          const modSegments = modPath.split('.').filter(Boolean);
+          const moduleStem = modSegments.length > 0 ? modSegments[modSegments.length - 1] : '';
+          if (!moduleStem) continue;
+          const localAlias = asParts.length >= 2 ? asParts[1] : modSegments[0];
+          pushBinding(localAlias, moduleStem, moduleStem, modPath, false);
+        }
+      }
+    }
+  } else if (ext === '.rs') {
+    const cleanRs = maskCodePreservingNewlines(combinedImportsSource, { maskStrings: false });
+    const rsUseRe = /(?:^|\n)[ \t]*(?:pub\s+)?use\s+([A-Za-z0-9_:{}*,\s]+)\s*;/g;
+    for (const m of cleanRs.matchAll(rsUseRe)) {
+      const spec = m[1].trim();
+      const braceMatch = spec.match(/^([A-Za-z0-9_:]+)::\{([^}]+)\}$/);
+      if (braceMatch) {
+        const basePath = braceMatch[1];
+        const baseSegs = basePath.split('::').filter(Boolean);
+        const modStem = baseSegs[baseSegs.length - 1] || '';
+        for (const item of braceMatch[2].split(',')) {
+          const t = item.trim();
+          if (!t || t === 'self' || t === '*') continue;
+          const asParts = t.split(/\s+as\s+/).map((s) => s.trim());
+          pushBinding(asParts[1] || asParts[0], asParts[0], modStem, `${basePath}::${asParts[0]}`, false);
+        }
+      } else {
+        const asParts = spec.split(/\s+as\s+/).map((s) => s.trim());
+        const segs = (asParts[0] || '').split('::').filter(Boolean);
+        const leaf = segs[segs.length - 1] || '';
+        const modStem = segs.length >= 2 ? segs[segs.length - 2] : leaf;
+        if (leaf && leaf !== '*') {
+          pushBinding(asParts[1] || leaf, leaf, modStem, asParts[0], false);
+        }
+      }
+    }
+  } else if (ext === '.go') {
+    const cleanGo = maskCodePreservingNewlines(combinedImportsSource, { maskStrings: false });
+    const goImpRe = /(?:([A-Za-z_][A-Za-z0-9_]*)\s+)?"([^"\n]+)"/g;
+    for (const m of cleanGo.matchAll(goImpRe)) {
+      const alias = m[1] || '';
+      const pkgPath = m[2].trim();
+      const segs = pkgPath.split('/').filter(Boolean);
+      const pkgStem = segs[segs.length - 1] || '';
+      if (pkgStem && alias !== '_') {
+        pushBinding(alias || pkgStem, pkgStem, pkgStem, pkgPath, false);
+      }
+    }
+  } else {
+    const cleanJs = maskCodePreservingNewlines(combinedImportsSource, { maskStrings: false });
+    const esmRe = /(?:^|\n)[ \t]*import\s+(?:type\s+)?([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/g;
+    for (const m of cleanJs.matchAll(esmRe)) {
+      const clause = m[1].trim();
+      const modSpec = m[2].trim();
+      const modStem = path.basename(modSpec, path.extname(modSpec));
+      const namedMatch = clause.match(/\{([\s\S]*?)\}/);
+      if (namedMatch) {
+        for (const item of namedMatch[1].split(',')) {
+          const cleaned = item.replace(/^type\s+/, '').trim();
+          if (!cleaned) continue;
+          const asParts = cleaned.split(/\s+as\s+/).map((s) => s.trim()).filter(Boolean);
+          pushBinding(asParts[1] || asParts[0], asParts[0], modStem, modSpec, false);
+        }
+      }
+      const beforeBrace = clause.replace(/\{[\s\S]*?\}/, '').replace(/,/g, '').trim();
+      if (beforeBrace) {
+        const nsMatch = beforeBrace.match(/^\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)$/);
+        if (nsMatch) {
+          pushBinding(nsMatch[1], modStem, modStem, modSpec, false);
+        } else if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(beforeBrace)) {
+          pushBinding(beforeBrace, beforeBrace, modStem, modSpec, false);
+        }
+      }
+    }
+  }
+
+  let sanitizedPrefix = String(codePrefix || '');
+  const isPyLike = ext === '.py' || (!ext && /\bdef\s+\w+/.test(sanitizedPrefix));
+  const isJava = ext === '.java';
+  if (isPyLike) {
+    sanitizedPrefix = sanitizedPrefix
+      .replace(/"""[\s\S]*?"""/g, (m) => m.replace(/[^\n]/g, ' '))
+      .replace(/'''[\s\S]*?'''/g, (m) => m.replace(/[^\n]/g, ' '));
+  }
+  const maskedPrefix = maskCodePreservingNewlines(sanitizedPrefix, {
+    maskStrings: true,
+    allowHashComment: isPyLike || ext === '.sh'
+  });
+
+  const bodyLines = maskedPrefix
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !/^(?:import\s+|from\s+[A-Za-z0-9_.]+\s+import\s+|package\s+|use\s+)/.test(l));
+
+  const fullBodyText = bodyLines.join('\n');
+  const splitIdx = Math.max(0, bodyLines.length - immediateLineWindow);
+  const earlierText = bodyLines.slice(0, splitIdx).join('\n');
+  const immediateText = bodyLines.slice(splitIdx).join('\n');
+
+  const immediateCursorBindings = [];
+  const unusedStagedBindings = [];
+  const earlierOnlyBindings = [];
+
+  for (const b of bindings) {
+    const directImmediate = hasWholeIdentifierInText(immediateText, b.localName);
+    const directEarlier = hasWholeIdentifierInText(earlierText, b.localName);
+    let viaReceiverImmediate = false;
+
+    if (!directImmediate && directEarlier) {
+      const receivers = extractBoundReceiverNames(fullBodyText, b.localName, isPyLike, isJava);
+      b.receiverNames = receivers;
+      for (const recv of receivers) {
+        if (hasWholeIdentifierInText(immediateText, recv)) {
+          viaReceiverImmediate = true;
+          break;
+        }
+      }
+    }
+
+    if (directImmediate || viaReceiverImmediate) {
+      b.status = 'immediate_cursor';
+      b.matchedViaReceiver = viaReceiverImmediate && !directImmediate;
+      immediateCursorBindings.push(b);
+    } else if (!directEarlier) {
+      b.status = 'unused_staged';
+      unusedStagedBindings.push(b);
+    } else {
+      b.status = 'earlier_only';
+      earlierOnlyBindings.push(b);
+    }
+  }
+
+  const uniqueNames = (arr) => [...new Set(arr.flatMap((b) => [b.exportedName, b.localName]).filter(Boolean))];
+
+  return {
+    bindings,
+    immediateCursorBindings,
+    unusedStagedBindings,
+    earlierOnlyBindings,
+    immediateCursorSymbols: uniqueNames(immediateCursorBindings),
+    unusedStagedSymbols: uniqueNames(unusedStagedBindings),
+    earlierOnlySymbols: uniqueNames(earlierOnlyBindings),
+    hasActiveCursorImport: immediateCursorBindings.length > 0,
+    unusedImportRatio: bindings.length > 0 ? unusedStagedBindings.length / bindings.length : 0
+  };
+}
+
 /**
  * Walk a repository directory and return relative file paths for supported code/doc files.
  * @param {string} rootDir
@@ -777,6 +1282,8 @@ export function createGitEngine({ db, workspaceRoot = process.cwd() }) {
       let parsed = { symbols: [], edges: [] };
       if (ext === '.py') {
         parsed = parsePythonSymbols(content);
+      } else if (ext === '.java') {
+        parsed = parseJavaSymbols(content);
       } else if (ext === '.md') {
         parsed = parseMarkdownSymbols(content);
       } else {
