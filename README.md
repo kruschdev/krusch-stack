@@ -69,6 +69,16 @@ curl http://127.0.0.1:3780/health
 | **Tier 5: Workspace Hub** | [`G-krusch`](https://github.com/kruschdev/G-krusch) | `get_agent_steering`, `search_drive_rag`, `read_drive_file`, `write_drive_file`, `list_drive_workspace`, `get_workspace_status` | `node:sqlite` |
 | **Router & Diagnostics** | [`krusch-cascade-router`](https://github.com/kruschdev/krusch-cascade-router) | `krusch_route_task`, `krusch_stack_status` | In-Memory `<25µs` |
 
+### 📊 Verified Third-Party Benchmarks Across Pillars
+
+| Stack Pillar | Official External Benchmark | Verified Result (Hermetic Open-Weights) |
+| :--- | :--- | :--- |
+| **Tier 1 (`krusch-context-mcp`)** | **ICLR 2026 BEAM (`100K`–`10M` tok, `2,000/2,000` Qs)** | **`78.67%` 8K Recall** (`92.53%` at `100K`); beats cloud `past.dev` on Contradiction Resolution (all 4 splits) & `10M` Multi-Session Reasoning |
+| **Tier 2A (`krusch-git`)** | **RepoBench-R (`47,998` Py & Java Cross-File Qs)** | **`19.12%` Macro `Acc@1`** (`+21.8%` vs. pure dense, `68.58%` `Acc@5`); **`31.33%` Py & `27.45%` Java `cfr` Easy** (beats published `CodeBERT` & `UniXcoder`) |
+| **Tier 2B / Evidentiary (`krusch-nexus`)** | **LegalBench-RAG (`714` Docs, `6,889` Full / `776` Mini Qs)** | **`14.63%` Macro F1 (`47.71%` Recall)** (`+25.0%` Full / `+30.2%` Mini vs. fixed-window dense; `30.04%` `MAUD` R@6 > OpenAI `3-large` R@64 `28.28%`) |
+| **Tier 3 (`krusch` 2PC Harness)** | **Aider Polyglot (`225/225` Exercism Tasks, 6 Langs)** | **`Pass@1 = 19.56%` → `Pass@2 = 51.56%` (`2.64x`, `72` healed)** via `Verify-on-Stop` (ties cloud `Claude 3.5 Sonnet` `51.6%`, beats `GPT-4o` `23.1%`) |
+| **Router (`krusch-cascade-router`)** | **RouteWorks RouterArena (`8,400` Qs + `420` Robustness)** | **`#1` Ranked Candidate** (`80.72%` accuracy at `$0.21/1K`, `<15µs` CPU fast-path) |
+
 ---
 
 ## 🛠️ IDE Configuration Modes (`unified` vs `modular`)
