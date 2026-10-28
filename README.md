@@ -64,20 +64,22 @@ curl http://127.0.0.1:3780/health
 | **Tier 1: Working Memory** | [`krusch-context-mcp`](https://github.com/kruschdev/krusch-context-mcp) | `krusch_context_retrieve`, `krusch_context_remember`, `krusch_context_revise`, `krusch_context_nudge`, `krusch_context_health` | `node:sqlite` + PG |
 | **Tier 2A: Git & AST Graph** | [`krusch-git`](https://github.com/kruschdev/krusch-git) | `krusch_git_list_repos`, `krusch_git_read_tree`, `krusch_git_read_blob`, `krusch_git_search_symbols`, `krusch_git_file_symbols`, `krusch_git_dependency_graph`, `krusch_git_semantic_search` | `node:sqlite` + PG |
 | **Tier 2B: OS Page Memory** | [`krusch-fs-mcp`](https://github.com/kruschdev/krusch-fs-mcp) | `krusch_fs_locate`, `krusch_fs_search`, `krusch_fs_page_tree`, `krusch_fs_read_page`, `krusch_fs_remember_on_page`, `krusch_fs_sync` | `node:sqlite` + PG |
-| **Tier 3: 2PC Staged Harness** | [`krusch`](https://github.com/kruschdev/krusch) | `krusch_run`, `krusch_task_status`, `krusch_diff`, `krusch_apply_diff`, `krusch_explain`, `krusch_reject`, `krusch_abort` | `node:sqlite` + PG |
+| **Tier 3: 2PC Staged Harness** | [`krusch-coding-harness`](https://github.com/kruschdev/krusch-coding-harness) | `krusch_run`, `krusch_task_status`, `krusch_diff`, `krusch_apply_diff`, `krusch_explain`, `krusch_reject`, `krusch_abort` | `node:sqlite` + PG |
 | **Tier 4: Frontend Design** | [`krusch-frontend-mcp`](https://github.com/kruschdev/krusch-frontend-mcp) | `generate_color_palette`, `css_to_tailwind`, `query_design_rules`, `get_canonical_template`, `list_canonical_templates`, `generate_responsive_breakpoints` | `node:sqlite` |
 | **Tier 5: Workspace Hub** | [`G-krusch`](https://github.com/kruschdev/G-krusch) | `get_agent_steering`, `search_drive_rag`, `read_drive_file`, `write_drive_file`, `list_drive_workspace`, `get_workspace_status` | `node:sqlite` |
 | **Router & Diagnostics** | [`krusch-cascade-router`](https://github.com/kruschdev/krusch-cascade-router) | `krusch_route_task`, `krusch_stack_status` | In-Memory `<25µs` |
 
 ### 📊 Verified Third-Party Benchmarks Across Pillars
 
+> 📄 **Full Cross-Stack Comparison, Honest Gaps & Reproduction Gates**: Read **[`BENCHMARKS.md`](./BENCHMARKS.md)** for the complete comparison against open-source wrapper stacks and commercial cloud stacks (`past.dev`, `NotDiamond`, `Martian`, OpenAI + Cohere), our `43/43` SHA-256 clean-room verification gates, open upstream PR disclosures (`RouterArena` PR #169), and where frontier cloud models still lead.
+
 | Stack Pillar | Official External Benchmark | Verified Result (Hermetic Open-Weights) |
 | :--- | :--- | :--- |
-| **Tier 1 (`krusch-context-mcp`)** | **ICLR 2026 BEAM (`100K`–`10M` tok, `2,000/2,000` Qs)** | **`78.67%` 8K Recall** (`92.53%` at `100K`); beats cloud `past.dev` on Contradiction Resolution (all 4 splits) & `10M` Multi-Session Reasoning |
+| **Tier 1 (`krusch-context-mcp`)** | **ICLR 2026 BEAM (`100K`–`10M` tok, `2,000/2,000` Qs)** | **`92.58%` (`100K`) & `93.00%` (`10M` IE) Recall** (`78.67%` 4-split weighted); zero E2E drop `100K`→`1M` (`72.86%`); beats cloud `past.dev` on Contradiction Resolution (`4/4` splits) & `10M` Multi-Session Reasoning |
 | **Tier 2A (`krusch-git`)** | **RepoBench-R (`47,998` Py & Java Cross-File Qs)** | **`19.12%` Macro `Acc@1`** (`+21.8%` vs. pure dense, `68.58%` `Acc@5`); **`31.33%` Py & `27.45%` Java `cfr` Easy** (beats published `CodeBERT` & `UniXcoder`) |
 | **Tier 2B / Evidentiary (`krusch-nexus`)** | **LegalBench-RAG (`714` Docs, `6,889` Full / `776` Mini Qs)** | **`26.74%` Macro F1 (`k=1`) & `25.81%` F1 / `44.72%` Recall (`k=2`)** (`47.71%` R@6; `+128.5%` / `2.29x` F1 vs. fixed dense; `33.95%` `MAUD` R@2 > OpenAI `3-large` + Cohere R@64 `28.28%`) |
-| **Tier 3 (`krusch` 2PC Harness)** | **Aider Polyglot (`225/225` Exercism Tasks, 6 Langs)** | **`Pass@1 = 19.56%` → `Pass@2 = 51.56%` (`2.64x`, `72` healed)** via `Verify-on-Stop` (ties cloud `Claude 3.5 Sonnet` `51.6%`, beats `GPT-4o` `23.1%`) |
-| **Router (`krusch-cascade-router`)** | **ACL 2026 LLMRouterBench (`12,566` Qs) & RouterArena (`8,400` Qs)** | **`#1` LLMRouterBench Pareto (`0.4269`, `-83.95%` cost)** & **`#1` RouterArena CI (`0.7883`, `80.72%`)**; live G4 SSE cascade cuts `120B` TTFT **`-48.0%`** & agentic `Polyglot` routes **`1,442x` faster** than LLM preflight (`51.67%` `Pass@2`, [audit logs](https://huggingface.co/datasets/krush420/sovereign-g4-benchmarks)) |
+| **Tier 3 (`krusch-coding-harness`)** | **Aider Polyglot (`225/225` Exercism Tasks, 6 Langs)** | **`Pass@1 = 19.56%` → `Pass@2 = 51.56%` (`2.64x`, `72` healed)** via `Verify-on-Stop` (ties cloud `Claude 3.5 Sonnet` `51.6%`, beats `GPT-4o` `23.1%`) |
+| **Router (`krusch-cascade-router`)** | **ACL 2026 LLMRouterBench (`12,566` Qs) & RouterArena (`8,400` Qs)** | **`#1` LLMRouterBench Pareto (`0.4269`, `-83.95%` cost)** & **`#1` RouterArena CI (`0.7883`, `80.72%`, PR #169 open)**; live G4 SSE cascade cuts `120B` TTFT **`-48.0%`** & agentic `Polyglot` routes **`1,442x` faster** than LLM preflight (`51.67%` `Pass@2`, [audit logs](https://huggingface.co/datasets/krush420/sovereign-g4-benchmarks)) |
 
 ---
 
