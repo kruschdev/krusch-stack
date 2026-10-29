@@ -161,14 +161,72 @@ export function startHttpGateway(options = {}) {
       return;
     }
 
-    if (req.method === 'POST' && url.pathname === '/call') {
-      let body = '';
-      req.on('data', (chunk) => {
-        body += chunk;
+    const maxBodyBytes = Math.max(
+      1024,
+      Number(options.maxBodyBytes || process.env.KRUSCH_MAX_BODY_BYTES || 2 * 1024 * 1024)
+    );
+
+    const readBoundedJson = () =>
+      new Promise((resolve, reject) => {
+        const declaredLen = Number(req.headers['content-length'] || 0);
+        if (Number.isFinite(declaredLen) && declaredLen > maxBodyBytes) {
+          const err = new Error(`Payload Too Large: exceeds ${maxBodyBytes} byte limit`);
+          err.statusCode = 413;
+          req.resume();
+          reject(err);
+          return;
+        }
+        const chunks = [];
+        let totalBytes = 0;
+        let settled = false;
+        req.on('data', (chunk) => {
+          if (settled) return;
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+          totalBytes += buf.length;
+          if (totalBytes > maxBodyBytes) {
+            settled = true;
+            const err = new Error(`Payload Too Large: exceeds ${maxBodyBytes} byte limit`);
+            err.statusCode = 413;
+            req.pause();
+            reject(err);
+            return;
+          }
+          chunks.push(buf);
+        });
+        req.on('end', () => {
+          if (settled) return;
+          settled = true;
+          const rawBody = Buffer.concat(chunks).toString('utf8');
+          try {
+            const parsed = rawBody.trim() ? JSON.parse(rawBody) : {};
+            resolve({ rawBody, parsed });
+          } catch (_parseErr) {
+            const err = new Error('Invalid JSON request body');
+            err.statusCode = 400;
+            reject(err);
+          }
+        });
+        req.on('error', (err) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        });
       });
-      req.on('end', async () => {
-        try {
-          const parsed = JSON.parse(body || '{}');
+
+    const sendGatewayError = (err) => {
+      const code = Number.isInteger(err?.statusCode) ? err.statusCode : 400;
+      const headers = code === 413 ? { Connection: 'close' } : {};
+      res.writeHead(code, headers);
+      res.end(JSON.stringify({ ok: false, error: err.message }, null, 2), () => {
+        if (code === 413 && !req.complete) {
+          req.destroy();
+        }
+      });
+    };
+
+    if (req.method === 'POST' && url.pathname === '/call') {
+      readBoundedJson()
+        .then(async ({ parsed }) => {
           const result = await dispatchStackTool(
             stack,
             parsed.tool || parsed.name,
@@ -177,11 +235,52 @@ export function startHttpGateway(options = {}) {
           );
           res.writeHead(result.ok ? 200 : 400);
           res.end(JSON.stringify(result, null, 2));
-        } catch (err) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ ok: false, error: err.message }, null, 2));
-        }
-      });
+        })
+        .catch(sendGatewayError);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname.startsWith('/resilience/')) {
+      const action = url.pathname.slice('/resilience/'.length);
+      readBoundedJson()
+        .then(({ rawBody, parsed }) => {
+          const actionMap = {
+            budget: () => stack.resilience.assembleContextBudget(parsed),
+            'cost-evaluate': () => stack.resilience.evaluateCostKillSwitch(parsed),
+            'cost-record': () => stack.resilience.recordCostUsage(parsed),
+            'verify-dag': () => stack.resilience.verifyTrajectoryDag(parsed),
+            shadow: () => stack.resilience.recordShadowComparison(parsed),
+            'hitl-draft': () => stack.resilience.draftHitlGate(parsed),
+            'hitl-resolve': () =>
+              stack.resilience.resolveHitlGate({
+                gateId: parsed.gateId,
+                decision: parsed.decision,
+                reviewer: parsed.reviewer,
+                reason: parsed.reason,
+                nowMs: parsed.nowMs,
+                requireSignature: true,
+                signingSecret: options.slackSigningSecret ?? process.env.SLACK_SIGNING_SECRET ?? '',
+                timestampHeader: req.headers['x-slack-request-timestamp'] || '',
+                signatureHeader: req.headers['x-slack-signature'] || '',
+                rawBody
+              })
+          };
+          const handler = actionMap[action];
+          if (!handler) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ ok: false, error: `Unknown resilience action: ${action}` }));
+            return;
+          }
+          const result = handler();
+          const status = result.ok
+            ? 200
+            : result.data?.status === 'UNAUTHORIZED_SIGNATURE'
+              ? 401
+              : 400;
+          res.writeHead(status);
+          res.end(JSON.stringify(result, null, 2));
+        })
+        .catch(sendGatewayError);
       return;
     }
 
@@ -189,10 +288,11 @@ export function startHttpGateway(options = {}) {
     res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
   });
 
+  const bindHost = options.host || process.env.KRUSCH_STACK_HOST || '127.0.0.1';
   return new Promise((resolve, reject) => {
     server.on('error', reject);
-    server.listen(port, '0.0.0.0', () => {
-      resolve({ server, port, stack });
+    server.listen(port, bindHost, () => {
+      resolve({ server, port, host: bindHost, stack });
     });
   });
 }

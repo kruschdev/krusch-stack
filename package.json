@@ -13,7 +13,8 @@
     "./mcp": "./src/mcp/server.js",
     "./sqlite": "./src/db/sqlite.js",
     "./installer": "./src/installer/ide-config.js",
-    "./doctor": "./src/installer/doctor.js"
+    "./doctor": "./src/installer/doctor.js",
+    "./resilience": "./src/engines/resilience-engine.js"
   },
   "engines": {
     "node": ">=22.0.0"
