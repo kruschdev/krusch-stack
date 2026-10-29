@@ -140,7 +140,23 @@ const staged = stack.harness.run({
 const route = stack.router.routeTask({
   prompt: 'Architect a distributed two-phase commit state machine'
 });
+
+// 4. Production Resilience Engine (krusch-stack/resilience & 127.0.0.1:3780/resilience/*)
+// Strict pre-flight context budgeting, $0.50 cost kill-switch, 100-trajectory Golden DAG gate,
+// 5% non-blocking shadow trajectory diffing, and 72h Slack HMAC-SHA256 HITL leases:
+const budget = stack.resilience.assembleContextBudget({
+  systemPrompt: 'Enforce 2PC invariants.',
+  query: 'Update auth middleware',
+  maxContextTokens: 16384,
+  outputReserveTokens: 2048
+});
+const dagCheck = stack.resilience.verifyTrajectoryDag({
+  steps: [{ tool: 'read_file', ok: true }, { tool: 'run_tests', ok: true }, { tool: 'apply_staged_diff', ok: true }],
+  goldenDag: { requirePassingPrerequisite: [['run_tests', 'apply_staged_diff']] }
+});
 ```
+
+> 📖 **Architecture Deep-Dive**: Read [**Paper #23 — The 15 Production Agentic Systems: Reference Architecture, State-Machine Invariants, and Benchmark Proofs Across a Sovereign Stack**](https://krusch.dev/articles/fifteen-production-agent-systems).
 
 ---
 

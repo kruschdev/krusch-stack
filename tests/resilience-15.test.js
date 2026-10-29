@@ -238,6 +238,12 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
     assert.equal(shadow.data.sequenceSimilarity, 1);
     assert.ok(shadow.data.argKeyJaccard > 0.6 && shadow.data.argKeyJaccard < 1.0);
 
+    let releaseShadow;
+    const shadowGate = new Promise((resolve) => {
+      releaseShadow = resolve;
+    });
+    let shadowCompleted = false;
+
     const t0 = performance.now();
     const scheduled = stack.resilience.scheduleShadowComparison({
       requestId: 'req-shadow-bg-01',
@@ -249,15 +255,19 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
       primaryLatencyMs: 120,
       primaryCostUsd: 0.004,
       shadowRunner: async () => {
-        await new Promise((r) => setTimeout(r, 40));
+        await shadowGate;
+        shadowCompleted = true;
         return { tools: ['read_file'], latencyMs: 42, costUsd: 0 };
       }
     });
     const dispatchElapsedMs = performance.now() - t0;
     assert.equal(scheduled.ok, true);
     assert.equal(scheduled.data.sampled, true);
-    assert.ok(dispatchElapsedMs < 20, 'scheduleShadowComparison must not block primary caller');
+    assert.equal(shadowCompleted, false, 'scheduleShadowComparison must return without awaiting shadowRunner');
+    assert.ok(dispatchElapsedMs < 500, 'scheduleShadowComparison dispatch overhead must remain bounded');
+    releaseShadow();
     const flushed = await stack.resilience.flushPendingShadows();
+    assert.equal(shadowCompleted, true);
     assert.equal(flushed.ok, true);
     assert.equal(flushed.data.flushedCount, 1);
   });
@@ -366,6 +376,7 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
         body: forgedRaw
       });
       assert.equal(forgedResp.status, 401);
+      await forgedResp.json();
 
       // Authentic server-secret signature succeeds with 200
       const validRaw = JSON.stringify({ gateId, decision: 'APPROVED', reviewer: 'sre' });
@@ -381,6 +392,7 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
         body: validRaw
       });
       assert.equal(validResp.status, 200);
+      await validResp.json();
 
       // Oversized payload > 1024 bytes returns HTTP 413
       const oversizedResp = await fetch(`http://127.0.0.1:${addr.port}/resilience/budget`, {
@@ -389,7 +401,9 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
         body: JSON.stringify({ systemPrompt: 'a'.repeat(2048) })
       });
       assert.equal(oversizedResp.status, 413);
+      await oversizedResp.json();
     } finally {
+      server.closeAllConnections?.();
       await new Promise((resolve) => server.close(resolve));
     }
   });

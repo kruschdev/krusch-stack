@@ -168,10 +168,19 @@ export function startHttpGateway(options = {}) {
 
     const readBoundedJson = () =>
       new Promise((resolve, reject) => {
+        const hardDestroyCap = maxBodyBytes + 65536;
         const declaredLen = Number(req.headers['content-length'] || 0);
         if (Number.isFinite(declaredLen) && declaredLen > maxBodyBytes) {
           const err = new Error(`Payload Too Large: exceeds ${maxBodyBytes} byte limit`);
           err.statusCode = 413;
+          err.hardDestroy = declaredLen > hardDestroyCap;
+          let drained = 0;
+          req.on('data', (chunk) => {
+            drained += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+            if (drained > hardDestroyCap && !req.destroyed) {
+              req.destroy();
+            }
+          });
           req.resume();
           reject(err);
           return;
@@ -180,14 +189,20 @@ export function startHttpGateway(options = {}) {
         let totalBytes = 0;
         let settled = false;
         req.on('data', (chunk) => {
-          if (settled) return;
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
           totalBytes += buf.length;
+          if (settled) {
+            if (totalBytes > hardDestroyCap && !req.destroyed) {
+              req.destroy();
+            }
+            return;
+          }
           if (totalBytes > maxBodyBytes) {
             settled = true;
             const err = new Error(`Payload Too Large: exceeds ${maxBodyBytes} byte limit`);
             err.statusCode = 413;
-            req.pause();
+            err.hardDestroy = totalBytes > hardDestroyCap;
+            req.resume();
             reject(err);
             return;
           }
@@ -219,7 +234,14 @@ export function startHttpGateway(options = {}) {
       res.writeHead(code, headers);
       res.end(JSON.stringify({ ok: false, error: err.message }, null, 2), () => {
         if (code === 413 && !req.complete) {
-          req.destroy();
+          if (err?.hardDestroy) {
+            req.destroy();
+          } else {
+            const cleanupTimer = setTimeout(() => {
+              if (!req.complete && !req.destroyed) req.destroy();
+            }, 250);
+            cleanupTimer.unref?.();
+          }
         }
       });
     };
