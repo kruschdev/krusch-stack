@@ -142,18 +142,250 @@ function normalizeStagedEdits(edits = [], files = []) {
   return combined;
 }
 
+const IGNORED_DIR_FSYNC_CODES = new Set(['EINVAL', 'EBADF', 'EISDIR', 'ENOTSUP', 'EPERM']);
+
+/**
+ * Compute SHA-256 hex digest of a UTF-8 string.
+ * @param {string} str
+ * @returns {string}
+ */
+function sha256Text(str) {
+  return crypto.createHash('sha256').update(String(str ?? ''), 'utf8').digest('hex');
+}
+
+/**
+ * Flush parent directory metadata after renameSync or unlinkSync (INV-REC-03).
+ * Tolerates filesystems/platforms that disallow directory fsync while propagating I/O faults.
+ * @param {string} dirPath
+ * @param {typeof fs} [fsImpl=fs]
+ */
+export function fsyncDirectory(dirPath, fsImpl = fs) {
+  let fd = null;
+  try {
+    fd = fsImpl.openSync(dirPath, 'r');
+    fsImpl.fsyncSync(fd);
+  } catch (err) {
+    if (!IGNORED_DIR_FSYNC_CODES.has(err?.code)) {
+      throw err;
+    }
+  } finally {
+    if (fd !== null) {
+      try {
+        fsImpl.closeSync(fd);
+      } catch (closeErr) {
+        /* ignore directory fd close error */
+      }
+    }
+  }
+}
+
+/**
+ * Write full UTF-8 buffer to an open file descriptor, handling partial writes.
+ * @param {number} fd
+ * @param {string} content
+ * @param {typeof fs} fsImpl
+ */
+function writeAllSync(fd, content, fsImpl) {
+  const buf = Buffer.from(String(content ?? ''), 'utf8');
+  if (buf.length === 0) {
+    fsImpl.writeSync(fd, buf, 0, 0);
+    return;
+  }
+  let offset = 0;
+  while (offset < buf.length) {
+    const written = fsImpl.writeSync(fd, buf, offset, buf.length - offset);
+    if (typeof written !== 'number' || written <= 0) {
+      const shortErr = new Error('Short or zero-byte writeSync while staging temporary file');
+      shortErr.code = 'EIO';
+      throw shortErr;
+    }
+    offset += written;
+  }
+}
+
+/**
+ * Atomically stage and fsync a sibling temporary file before renameSync (INV-REC-03).
+ * Closes fd in finally and unlinks partial temp file on write/fsync/close failure.
+ * @param {string} absPath
+ * @param {string} content
+ * @param {typeof fs} [fsImpl=fs]
+ * @returns {string}
+ */
+function atomicWriteTempFile(absPath, content, fsImpl = fs) {
+  const dirPath = path.dirname(absPath);
+  const baseName = path.basename(absPath);
+  fsImpl.mkdirSync(dirPath, { recursive: true });
+  const rand = crypto.randomBytes(6).toString('hex');
+  const tempPath = path.join(dirPath, `.${baseName}.krusch-tmp-${process.pid}-${rand}`);
+
+  let fd = null;
+  let succeeded = false;
+  try {
+    fd = fsImpl.openSync(tempPath, 'w', 0o600);
+    writeAllSync(fd, content, fsImpl);
+    fsImpl.fsyncSync(fd);
+    succeeded = true;
+    return tempPath;
+  } finally {
+    let closeErr = null;
+    if (fd !== null) {
+      try {
+        fsImpl.closeSync(fd);
+      } catch (err) {
+        closeErr = err;
+      }
+    }
+      if (!succeeded || closeErr) {
+        unlinkBestEffort(tempPath, fsImpl);
+      }
+      if (succeeded && closeErr) {
+        throw closeErr;
+      }
+    }
+  }
+
+/**
+ * Read a UTF-8 file without `fs.existsSync` so non-ENOENT OS faults (EIO, EACCES, ENOMEM, EMFILE)
+ * propagate to compound-recovery handlers instead of silently masquerading as missing files.
+ * @param {string} absPath
+ * @param {typeof fs} [fsImpl=fs]
+ * @returns {{ exists: boolean, content: string | null }}
+ */
+function readTextIfExists(absPath, fsImpl = fs) {
+  try {
+    const content = fsImpl.readFileSync(absPath, 'utf8');
+    return { exists: true, content };
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      return { exists: false, content: null };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Best-effort unlink for unrenamed sibling temporary files without `existsSync`.
+ * @param {string} filePath
+ * @param {typeof fs} [fsImpl=fs]
+ */
+function unlinkBestEffort(filePath, fsImpl = fs) {
+  try {
+    fsImpl.unlinkSync(filePath);
+  } catch (unlinkErr) {
+    /* best-effort cleanup of unrenamed temporary file */
+  }
+}
+
+/**
+ * Crash-atomically restore a file's preimage via temp write + fsync + rename + directory fsync.
+ * @param {string} absPath
+ * @param {string} baseContent
+ * @param {typeof fs} [fsImpl=fs]
+ */
+function atomicRestoreFile(absPath, baseContent, fsImpl = fs) {
+  const dirPath = path.dirname(absPath);
+  const tempPath = atomicWriteTempFile(absPath, baseContent, fsImpl);
+  try {
+    fsImpl.renameSync(tempPath, absPath);
+  } catch (renameErr) {
+    unlinkBestEffort(tempPath, fsImpl);
+    throw renameErr;
+  }
+  fsyncDirectory(dirPath, fsImpl);
+}
+
+/**
+ * Remove leftover sibling `.${basename}.krusch-tmp-*` files in parent directory.
+ * @param {string} absPath
+ * @param {typeof fs} [fsImpl=fs]
+ */
+function cleanOrphanedTempFiles(absPath, fsImpl = fs) {
+  const dirPath = path.dirname(absPath);
+  const baseName = path.basename(absPath);
+  const prefix = `.${baseName}.krusch-tmp-`;
+  let entries = [];
+  try {
+    entries = fsImpl.readdirSync(dirPath);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      return;
+    }
+    throw err;
+  }
+  for (const entry of entries) {
+    const entryName = typeof entry === 'string' ? entry : entry?.name;
+    if (entryName && entryName.startsWith(prefix)) {
+      try {
+        fsImpl.unlinkSync(path.join(dirPath, entryName));
+      } catch (unlinkErr) {
+        if (unlinkErr?.code !== 'ENOENT') {
+          throw unlinkErr;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Execute a synchronous callback inside an atomic SQLite `BEGIN IMMEDIATE ... COMMIT` block.
+ * Safely issues `ROLLBACK` if body or `COMMIT` throws so the connection is never left wedged.
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {() => any} fn
+ */
+function runInTransaction(db, fn) {
+  let began = false;
+  db.exec('BEGIN IMMEDIATE;');
+  began = true;
+  try {
+    const result = fn();
+    db.exec('COMMIT;');
+    began = false;
+    return result;
+  } catch (err) {
+    if (began) {
+      try {
+        db.exec('ROLLBACK;');
+      } catch (rollbackErr) {
+        const rbMsg = String(rollbackErr?.message || '');
+        if (!/no transaction is active/i.test(rbMsg) && err && typeof err === 'object') {
+          err.rollbackError = rollbackErr;
+        }
+      }
+    }
+    throw err;
+  }
+}
+
 /**
  * Create the Tier 3 2PC Staged Execution Harness engine.
  * @param {object} options
  * @param {import('node:sqlite').DatabaseSync} options.db
  * @param {string} [options.workspaceRoot]
  * @param {object} [options.contextEngine]
+ * @param {typeof fs} [options.fsOps]
  */
-export function createHarnessEngine({ db, workspaceRoot = process.cwd(), contextEngine } = {}) {
+export function createHarnessEngine({
+  db,
+  workspaceRoot = process.cwd(),
+  contextEngine,
+  fsOps = fs
+} = {}) {
   if (!db) {
     throw new Error('createHarnessEngine requires a SQLite db instance');
   }
+  const fsImpl = fsOps || fs;
   const rootDir = path.resolve(workspaceRoot);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS harness_apply_journal (
+      task_id TEXT PRIMARY KEY,
+      state TEXT NOT NULL CHECK(state IN ('APPLYING', 'APPLIED', 'ROLLED_BACK', 'RECOVERY_PENDING')),
+      entries_json TEXT NOT NULL DEFAULT '[]',
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
 
   /**
    * Stage a task in the 2PC harness without modifying the working tree (INV-STACK-06).
@@ -164,7 +396,7 @@ export function createHarnessEngine({ db, workspaceRoot = process.cwd(), context
    * @param {string} [params.test_command]
    * @param {string} [params.task_id]
    */
-  function run({ goal = '', edits = [], files = [], test_command } = {}) {
+  function run({ goal = '', edits = [], files = [], test_command, task_id } = {}) {
     const cleanGoal = String(goal || '').trim();
     if (!cleanGoal) {
       return okEnvelope('krusch_run', 'Goal is required to stage a harness task', { error: 'Missing goal' }, false);
@@ -178,8 +410,8 @@ export function createHarnessEngine({ db, workspaceRoot = process.cwd(), context
       normalizedEdits = normalizeStagedEdits(edits, files);
       for (const edit of normalizedEdits) {
         const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, edit.file_path);
-        const existed = fs.existsSync(absPath);
-        const beforeText = existed ? fs.readFileSync(absPath, 'utf8') : '';
+        const { exists: existed, content: rawBeforeText } = readTextIfExists(absPath, fsImpl);
+        const beforeText = existed ? rawBeforeText : '';
         const afterText = edit.hasContent ? edit.content : beforeText;
 
         const fileDiff = edit.hasContent
@@ -192,7 +424,10 @@ export function createHarnessEngine({ db, workspaceRoot = process.cwd(), context
         stagedRecords.push({
           file_path: relPath,
           content: afterText,
-          has_content: edit.hasContent
+          has_content: edit.hasContent,
+          existed_before: existed,
+          base_sha256: existed ? sha256Text(beforeText) : null,
+          staged_sha256: edit.hasContent ? sha256Text(afterText) : null
         });
       }
     } catch (err) {
@@ -204,7 +439,10 @@ export function createHarnessEngine({ db, workspaceRoot = process.cwd(), context
       goal: cleanGoal,
       staged: stagedRecords.map((r) => ({ file_path: r.file_path, content: r.content }))
     });
-    const taskId = `task-${crypto.createHash('sha256').update(hashInput).digest('hex').slice(0, 12)}`;
+    const taskId =
+      typeof task_id === 'string' && task_id.trim()
+        ? task_id.trim()
+        : `task-${crypto.createHash('sha256').update(hashInput).digest('hex').slice(0, 12)}`;
 
     let findings = [];
     if (contextEngine && typeof contextEngine.nudge === 'function') {
@@ -337,12 +575,302 @@ export function createHarnessEngine({ db, workspaceRoot = process.cwd(), context
   }
 
   /**
-   * Atomically apply a STAGED task's edits to workspaceRoot (INV-STACK-06).
+   * Recover in-flight or compound-faulted multi-file applies from `harness_apply_journal`
+   * (INV-REC-02 & INV-REC-03). Preserves strict all-or-nothing atomicity even if recovery
+   * itself encounters ENOSPC, EIO, EACCES, SQLITE_FULL, SQLITE_BUSY, or SQLITE_NOMEM.
+   */
+  function recoverInFlight() {
+    let journalRows;
+    try {
+      journalRows = db
+        .prepare(
+          "SELECT * FROM harness_apply_journal WHERE state IN ('APPLYING', 'RECOVERY_PENDING') ORDER BY created_at ASC"
+        )
+        .all();
+    } catch (queryErr) {
+      return okEnvelope(
+        'krusch_recover_harness',
+        `Failed to query apply journal during recovery: ${queryErr.message}`,
+        {
+          recovered_count: 0,
+          outcomes: [],
+          pending_errors: [{ task_id: '*', error: String(queryErr?.message || queryErr) }]
+        },
+        false
+      );
+    }
+
+    const outcomes = [];
+    const pendingErrors = [];
+
+    for (const journalRow of journalRows) {
+      try {
+        const rawEntries = JSON.parse(journalRow.entries_json || '[]');
+        const allFiles = rawEntries.map((e) => e.file_path || e.rel_path).filter(Boolean);
+        const contentEntries = rawEntries.filter((e) => e && e.has_content !== false);
+
+        const inspected = [];
+        for (const entry of contentEntries) {
+          const targetRel = entry.file_path || entry.rel_path;
+          const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, targetRel);
+          cleanOrphanedTempFiles(absPath, fsImpl);
+
+          const { exists: diskExists, content: diskText } = readTextIfExists(absPath, fsImpl);
+          const diskHash = diskExists ? sha256Text(diskText) : null;
+
+          const isRenamed = Boolean(diskExists && diskHash === entry.staged_sha256);
+          const isUntouched = Boolean(
+            (!diskExists && !entry.existed_before) ||
+              (diskExists && entry.existed_before && diskHash === entry.base_sha256)
+          );
+          const isDrift = !isRenamed && !isUntouched;
+
+          inspected.push({
+            ...entry,
+            absPath,
+            relPath,
+            diskExists,
+            diskHash,
+            isRenamed,
+            isUntouched,
+            isDrift
+          });
+        }
+
+        const anyDrift = inspected.some((item) => item.isDrift);
+        const allRenamed = inspected.every((item) => item.isRenamed);
+        const allUntouched = inspected.every((item) => item.isUntouched);
+
+        if (anyDrift) {
+          // Case C: External working-tree drift — never clobber drifted files on disk
+          runInTransaction(db, () => {
+            db.prepare(`
+              UPDATE harness_tasks
+              SET status = 'REJECTED',
+                  explanation = 'Working tree drift detected during crash recovery',
+                  updated_at = datetime('now')
+              WHERE task_id = ?
+            `).run(journalRow.task_id);
+
+            db.prepare(`
+              UPDATE harness_apply_journal
+              SET state = 'ROLLED_BACK',
+                  last_error = 'WORKING_TREE_DRIFT_DETECTED',
+                  updated_at = datetime('now')
+              WHERE task_id = ?
+            `).run(journalRow.task_id);
+          });
+          outcomes.push({
+            task_id: journalRow.task_id,
+            outcome: 'DRIFT_REJECTED',
+            files: allFiles
+          });
+        } else if (allRenamed) {
+          // Case A: All content files match staged_sha256 on disk — promote DB state to APPLIED
+          runInTransaction(db, () => {
+            db.prepare(`
+              UPDATE harness_tasks
+              SET status = 'APPLIED',
+                  explanation = ?,
+                  updated_at = datetime('now')
+              WHERE task_id = ?
+            `).run(
+              `Recovered and finalized ${allFiles.length} applied file(s) atomically to workspace.`,
+              journalRow.task_id
+            );
+
+            db.prepare(`
+              UPDATE harness_apply_journal
+              SET state = 'APPLIED',
+                  last_error = NULL,
+                  updated_at = datetime('now')
+              WHERE task_id = ?
+            `).run(journalRow.task_id);
+          });
+          outcomes.push({
+            task_id: journalRow.task_id,
+            outcome: 'PROMOTED_APPLIED',
+            files: allFiles
+          });
+        } else if (allUntouched) {
+          // Case B: Zero files modified on disk — mark journal ROLLED_BACK while keeping task STAGED
+          db.prepare(`
+            UPDATE harness_apply_journal
+            SET state = 'ROLLED_BACK',
+                last_error = NULL,
+                updated_at = datetime('now')
+            WHERE task_id = ?
+          `).run(journalRow.task_id);
+          outcomes.push({
+            task_id: journalRow.task_id,
+            outcome: 'REVERTED_STAGED',
+            files: allFiles
+          });
+        } else {
+          // Case D: Partial multi-file crash — roll back every renamed file to verified base preimage
+          for (let i = inspected.length - 1; i >= 0; i--) {
+            const item = inspected[i];
+            if (!item.isRenamed || item.isUntouched) {
+              continue;
+            }
+            if (item.existed_before) {
+              if (
+                typeof item.base_content !== 'string' ||
+                sha256Text(item.base_content) !== item.base_sha256
+              ) {
+                const corruptPreimageErr = new Error(
+                  `Corrupt base preimage in apply journal for ${item.relPath} (task ${journalRow.task_id})`
+                );
+                corruptPreimageErr.code = 'CORRUPT_BASE_PREIMAGE';
+                throw corruptPreimageErr;
+              }
+              atomicRestoreFile(item.absPath, item.base_content, fsImpl);
+            } else {
+              try {
+                fsImpl.unlinkSync(item.absPath);
+              } catch (unlinkErr) {
+                if (unlinkErr?.code !== 'ENOENT') {
+                  throw unlinkErr;
+                }
+              }
+              fsyncDirectory(path.dirname(item.absPath), fsImpl);
+            }
+          }
+
+          db.prepare(`
+            UPDATE harness_apply_journal
+            SET state = 'ROLLED_BACK',
+                last_error = NULL,
+                updated_at = datetime('now')
+            WHERE task_id = ?
+          `).run(journalRow.task_id);
+          outcomes.push({
+            task_id: journalRow.task_id,
+            outcome: 'ROLLED_BACK_TO_STAGED',
+            files: allFiles
+          });
+        }
+      } catch (err) {
+        // Compound-Recovery Guard (INV-REC-02): keep journal in active recovery state!
+        const errMsg = String(err?.message || err);
+        try {
+          db.prepare(`
+            UPDATE harness_apply_journal
+            SET state = 'RECOVERY_PENDING',
+                last_error = ?,
+                updated_at = datetime('now')
+            WHERE task_id = ?
+          `).run(errMsg, journalRow.task_id);
+        } catch (journalUpdateErr) {
+          /* SQLite may be SQLITE_FULL / SQLITE_NOMEM; row stays in APPLYING / RECOVERY_PENDING */
+        }
+        pendingErrors.push({
+          task_id: journalRow.task_id,
+          error: errMsg
+        });
+      }
+    }
+
+    const ok = pendingErrors.length === 0;
+    const summary = ok
+      ? `Recovered ${outcomes.length} in-flight harness task(s) cleanly.`
+      : `Recovery deferred for ${pendingErrors.length} task(s) due to compound I/O or storage fault.`;
+
+    return okEnvelope(
+      'krusch_recover_harness',
+      summary,
+      {
+        recovered_count: outcomes.length,
+        outcomes,
+        pending_errors: pendingErrors
+      },
+      ok
+    );
+  }
+
+  /**
+   * Atomically apply a STAGED task's edits to workspaceRoot (INV-STACK-06, INV-REC-02, INV-REC-03).
    * @param {object} params
    * @param {string} params.task_id
    */
   function applyDiff({ task_id } = {}) {
-    const row = db.prepare('SELECT * FROM harness_tasks WHERE task_id = ?').get(String(task_id || ''));
+    const targetTaskId = String(task_id || '');
+
+    // Pre-flight check: resolve any prior in-flight or compound-faulted journal entries first
+    let hasPendingJournal = false;
+    try {
+      hasPendingJournal = Boolean(
+        db
+          .prepare(
+            "SELECT 1 AS pending FROM harness_apply_journal WHERE state IN ('APPLYING', 'RECOVERY_PENDING') LIMIT 1"
+          )
+          .get()
+      );
+    } catch (preflightErr) {
+      return okEnvelope(
+        'krusch_apply_diff',
+        `Failed to inspect apply journal before applying ${targetTaskId}: ${preflightErr.message}`,
+        {
+          task_id: targetTaskId,
+          error: preflightErr.message,
+          recovery_pending: true
+        },
+        false
+      );
+    }
+
+    if (hasPendingJournal) {
+      const rec = recoverInFlight();
+      if (!rec.ok) {
+        return okEnvelope(
+          'krusch_apply_diff',
+          'Cannot apply diff while prior compound recovery is still pending I/O resolution',
+          {
+            task_id: targetTaskId,
+            recovery_pending: true,
+            pending_errors: rec.data.pending_errors
+          },
+          false
+        );
+      }
+
+      const promotedThisTask = rec.data.outcomes.some(
+        (o) => o.task_id === targetTaskId && o.outcome === 'PROMOTED_APPLIED'
+      );
+      if (promotedThisTask) {
+        const promotedRow = db
+          .prepare('SELECT * FROM harness_tasks WHERE task_id = ?')
+          .get(targetTaskId);
+        const promotedRecords = JSON.parse(promotedRow?.files_json || '[]');
+        const promotedFiles = promotedRecords.map((item) =>
+          typeof item === 'string' ? item : item.file_path
+        );
+        return okEnvelope(
+          'krusch_apply_diff',
+          `Recovered and finalized applied task ${targetTaskId}`,
+          {
+            task_id: targetTaskId,
+            status: 'APPLIED',
+            applied_files: promotedFiles,
+            recovered: true
+          },
+          true
+        );
+      }
+    }
+
+    let row;
+    try {
+      row = db.prepare('SELECT * FROM harness_tasks WHERE task_id = ?').get(targetTaskId);
+    } catch (lookupErr) {
+      return okEnvelope(
+        'krusch_apply_diff',
+        `Failed to load task ${targetTaskId}: ${lookupErr.message}`,
+        { task_id: targetTaskId, error: lookupErr.message },
+        false
+      );
+    }
+
     if (!row) {
       return okEnvelope('krusch_apply_diff', `Task ${task_id} not found`, { task_id, found: false }, false);
     }
@@ -362,50 +890,288 @@ export function createHarnessEngine({ db, workspaceRoot = process.cwd(), context
     const stagedRecords = JSON.parse(row.files_json || '[]');
     const resolvedTargets = [];
 
+    // Pre-commit working-tree SHA-256 verification (INV-REC-03.1)
     try {
       for (const item of stagedRecords) {
         const filePath = typeof item === 'string' ? item : item.file_path;
-        const hasContent = typeof item === 'object' && item !== null && item.has_content !== false && typeof item.content === 'string';
+        const hasContent =
+          typeof item === 'object' &&
+          item !== null &&
+          item.has_content !== false &&
+          typeof item.content === 'string';
         const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, filePath);
+
+        if (hasContent) {
+          cleanOrphanedTempFiles(absPath, fsImpl);
+        }
+
+        const { exists: diskExists, content: baseContent } = readTextIfExists(absPath, fsImpl);
+        const diskHash = diskExists ? sha256Text(baseContent) : null;
+
+        if (
+          typeof item === 'object' &&
+          item !== null &&
+          item.base_sha256 !== undefined &&
+          diskHash !== item.base_sha256
+        ) {
+          return okEnvelope(
+            'krusch_apply_diff',
+            `Working tree drift detected for ${relPath} before applying ${row.task_id}`,
+            {
+              task_id: row.task_id,
+              status: row.status,
+              error: 'WORKING_TREE_DRIFT_DETECTED',
+              drifted_file: relPath,
+              applied_files: []
+            },
+            false
+          );
+        }
+
         resolvedTargets.push({
           absPath,
           relPath,
-          content: hasContent ? item.content : null
+          has_content: hasContent,
+          content: hasContent ? item.content : null,
+          existed_before: diskExists,
+          base_content: baseContent,
+          base_sha256: diskHash,
+          staged_sha256: hasContent
+            ? typeof item.staged_sha256 === 'string'
+              ? item.staged_sha256
+              : sha256Text(item.content)
+            : null,
+          tempPath: null
         });
       }
-
-      const appliedFiles = [];
-      for (const target of resolvedTargets) {
-        if (target.content !== null) {
-          fs.mkdirSync(path.dirname(target.absPath), { recursive: true });
-          const tmpPath = `${target.absPath}.krusch-tmp-${process.pid}`;
-          fs.writeFileSync(tmpPath, target.content, 'utf8');
-          fs.renameSync(tmpPath, target.absPath);
-        }
-        appliedFiles.push(target.relPath);
-      }
-
-      db.prepare(`
-        UPDATE harness_tasks
-        SET status = 'APPLIED',
-            explanation = ?,
-            updated_at = datetime('now')
-        WHERE task_id = ?
-      `).run(`Applied ${appliedFiles.length} file(s) atomically to workspace.`, row.task_id);
-
-      return okEnvelope('krusch_apply_diff', `Applied ${appliedFiles.length} file(s) for ${row.task_id}`, {
-        task_id: row.task_id,
-        status: 'APPLIED',
-        applied_files: appliedFiles
-      });
-    } catch (err) {
+    } catch (inspectErr) {
       return okEnvelope(
         'krusch_apply_diff',
-        `Failed to apply diff for ${row.task_id}: ${err.message}`,
-        { task_id: row.task_id, status: row.status, error: err.message },
+        `Failed to inspect workspace for ${row.task_id}: ${inspectErr.message}`,
+        { task_id: row.task_id, status: row.status, error: inspectErr.message, applied_files: [] },
         false
       );
     }
+
+    const contentTargets = resolvedTargets.filter((t) => t.has_content);
+    const createdTempPaths = [];
+
+    // Phase 1: Stage & fsync all sibling temporary files before any renameSync (INV-REC-03.2)
+    try {
+      for (const target of contentTargets) {
+        target.tempPath = atomicWriteTempFile(target.absPath, target.content, fsImpl);
+        createdTempPaths.push(target.tempPath);
+      }
+    } catch (tempErr) {
+      for (const tmp of createdTempPaths) {
+        unlinkBestEffort(tmp, fsImpl);
+      }
+      return okEnvelope(
+        'krusch_apply_diff',
+        `Failed to stage temporary files for ${row.task_id}: ${tempErr.message}`,
+        { task_id: row.task_id, status: row.status, error: tempErr.message, applied_files: [] },
+        false
+      );
+    }
+
+    // Phase 2: Persist durable preimage journal before mutating target paths (INV-REC-03.3)
+    const journalEntries = resolvedTargets.map((t) => ({
+      file_path: t.relPath,
+      has_content: t.has_content,
+      existed_before: t.existed_before,
+      base_content: t.base_content,
+      base_sha256: t.base_sha256,
+      staged_sha256: t.staged_sha256
+    }));
+
+    try {
+      db.prepare(`
+        INSERT INTO harness_apply_journal (
+          task_id, state, entries_json, last_error, created_at, updated_at
+        ) VALUES (?, 'APPLYING', ?, NULL, datetime('now'), datetime('now'))
+        ON CONFLICT(task_id) DO UPDATE SET
+          state = 'APPLYING',
+          entries_json = excluded.entries_json,
+          last_error = NULL,
+          updated_at = datetime('now')
+      `).run(row.task_id, JSON.stringify(journalEntries));
+    } catch (journalErr) {
+      for (const tmp of createdTempPaths) {
+        unlinkBestEffort(tmp, fsImpl);
+      }
+      return okEnvelope(
+        'krusch_apply_diff',
+        `Failed to persist apply journal for ${row.task_id}: ${journalErr.message}`,
+        { task_id: row.task_id, status: row.status, error: journalErr.message, applied_files: [] },
+        false
+      );
+    }
+
+    // Phase 3: Atomic rename + parent-directory fsync across batch with compound-safe rollback
+    const renamedSoFar = [];
+    try {
+      for (const target of contentTargets) {
+        fsImpl.renameSync(target.tempPath, target.absPath);
+        target.tempPath = null;
+        renamedSoFar.push(target);
+        fsyncDirectory(path.dirname(target.absPath), fsImpl);
+      }
+    } catch (renameOrFsyncErr) {
+      for (const target of contentTargets) {
+        if (target.tempPath) {
+          unlinkBestEffort(target.tempPath, fsImpl);
+          target.tempPath = null;
+        }
+      }
+
+      const rollbackErrors = [];
+      for (let r = renamedSoFar.length - 1; r >= 0; r--) {
+        const appliedTarget = renamedSoFar[r];
+        try {
+          if (appliedTarget.existed_before) {
+            atomicRestoreFile(appliedTarget.absPath, appliedTarget.base_content, fsImpl);
+          } else {
+            try {
+              fsImpl.unlinkSync(appliedTarget.absPath);
+            } catch (unlinkErr) {
+              if (unlinkErr?.code !== 'ENOENT') {
+                throw unlinkErr;
+              }
+            }
+            fsyncDirectory(path.dirname(appliedTarget.absPath), fsImpl);
+          }
+        } catch (rbErr) {
+          rollbackErrors.push({
+            file_path: appliedTarget.relPath,
+            error: String(rbErr?.message || rbErr)
+          });
+        }
+      }
+
+      if (rollbackErrors.length === 0) {
+        let journalUpdateError = null;
+        try {
+          db.prepare(`
+            UPDATE harness_apply_journal
+            SET state = 'ROLLED_BACK',
+                last_error = ?,
+                updated_at = datetime('now')
+            WHERE task_id = ?
+          `).run(String(renameOrFsyncErr?.message || renameOrFsyncErr), row.task_id);
+        } catch (dbErr) {
+          journalUpdateError = String(dbErr?.message || dbErr);
+        }
+
+        if (journalUpdateError) {
+          return okEnvelope(
+            'krusch_apply_diff',
+            `Rolled back disk files for ${row.task_id}, but journal update failed: ${journalUpdateError}`,
+            {
+              task_id: row.task_id,
+              status: row.status,
+              error: renameOrFsyncErr.message,
+              journal_error: journalUpdateError,
+              rolled_back: true,
+              recovery_pending: true
+            },
+            false
+          );
+        }
+
+        return okEnvelope(
+          'krusch_apply_diff',
+          `Failed to apply diff for ${row.task_id} (rolled back ${renamedSoFar.length} file(s)): ${renameOrFsyncErr.message}`,
+          {
+            task_id: row.task_id,
+            status: row.status,
+            error: renameOrFsyncErr.message,
+            rolled_back: true
+          },
+          false
+        );
+      }
+
+      const compoundSummary = `Primary error: ${renameOrFsyncErr.message}; Rollback errors: ${rollbackErrors
+        .map((e) => `${e.file_path}: ${e.error}`)
+        .join('; ')}`;
+      try {
+        db.prepare(`
+          UPDATE harness_apply_journal
+          SET state = 'RECOVERY_PENDING',
+              last_error = ?,
+              updated_at = datetime('now')
+          WHERE task_id = ?
+        `).run(compoundSummary, row.task_id);
+      } catch (dbErr) {
+        /* Journal remains in 'APPLYING', which recoverInFlight() also processes */
+      }
+
+      return okEnvelope(
+        'krusch_apply_diff',
+        `Compound failure while rolling back ${row.task_id}; recovery pending`,
+        {
+          task_id: row.task_id,
+          status: row.status,
+          error: renameOrFsyncErr.message,
+          compound_error: true,
+          recovery_pending: true,
+          rollback_errors: rollbackErrors
+        },
+        false
+      );
+    }
+
+    // Phase 4: Commit APPLIED state atomically in SQLite (INV-REC-03.5)
+    const appliedFiles = resolvedTargets.map((t) => t.relPath);
+    try {
+      runInTransaction(db, () => {
+        db.prepare(`
+          UPDATE harness_tasks
+          SET status = 'APPLIED',
+              explanation = ?,
+              updated_at = datetime('now')
+          WHERE task_id = ?
+        `).run(`Applied ${appliedFiles.length} file(s) atomically to workspace.`, row.task_id);
+
+        db.prepare(`
+          UPDATE harness_apply_journal
+          SET state = 'APPLIED',
+              last_error = NULL,
+              updated_at = datetime('now')
+          WHERE task_id = ?
+        `).run(row.task_id);
+      });
+    } catch (dbErr) {
+      try {
+        db.prepare(`
+          UPDATE harness_apply_journal
+          SET state = 'RECOVERY_PENDING',
+              last_error = ?,
+              updated_at = datetime('now')
+          WHERE task_id = ?
+        `).run(String(dbErr?.message || dbErr), row.task_id);
+      } catch (secondaryDbErr) {
+        /* Journal remains in 'APPLYING' with staged_sha256 entries intact */
+      }
+
+      return okEnvelope(
+        'krusch_apply_diff',
+        `Files renamed on disk for ${row.task_id}, but SQLite commit failed (${dbErr.message}); recovery pending`,
+        {
+          task_id: row.task_id,
+          status: row.status,
+          error: dbErr.message,
+          recovery_pending: true
+        },
+        false
+      );
+    }
+
+    return okEnvelope('krusch_apply_diff', `Applied ${appliedFiles.length} file(s) for ${row.task_id}`, {
+      task_id: row.task_id,
+      status: 'APPLIED',
+      applied_files: appliedFiles
+    });
   }
 
   /**
@@ -487,6 +1253,7 @@ export function createHarnessEngine({ db, workspaceRoot = process.cwd(), context
     applyDiff,
     explain,
     reject,
-    abort
+    abort,
+    recoverInFlight
   };
 }

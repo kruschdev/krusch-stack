@@ -108,6 +108,15 @@ export const STACK_SCHEMA_SQL = `
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS harness_apply_journal (
+    task_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK(state IN ('APPLYING', 'APPLIED', 'ROLLED_BACK', 'RECOVERY_PENDING')),
+    entries_json TEXT NOT NULL DEFAULT '[]',
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   -- Tier 4: krusch-frontend-mcp Design Rules
   CREATE TABLE IF NOT EXISTS frontend_design_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,8 +139,8 @@ export const STACK_SCHEMA_SQL = `
 
 /**
  * Apply idempotent forward schema migrations for existing SQLite stack databases.
- * Ensures legacy .krusch-stack/stack.db files gain the optional `embedding TEXT` column cleanly
- * and provisions INV-STACK-07 external-content Porter FTS5 tables, triggers, and one-time rebuilds.
+ * Ensures legacy .krusch-stack/stack.db files gain the optional `embedding TEXT` column,
+ * durable `harness_apply_journal` table, and INV-STACK-07 external-content Porter FTS5 tables.
  * @param {DatabaseSync} db
  */
 export function ensureStackSchemaMigrations(db) {
@@ -139,6 +148,17 @@ export function ensureStackSchemaMigrations(db) {
   if (cols.length > 0 && !cols.some((c) => c.name === 'embedding')) {
     db.exec('ALTER TABLE context_memories ADD COLUMN embedding TEXT;');
   }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS harness_apply_journal (
+      task_id TEXT PRIMARY KEY,
+      state TEXT NOT NULL CHECK(state IN ('APPLYING', 'APPLIED', 'ROLLED_BACK', 'RECOVERY_PENDING')),
+      entries_json TEXT NOT NULL DEFAULT '[]',
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
 
   const hasTable = (name) =>
     Boolean(
@@ -269,27 +289,136 @@ export function ensureStackSchemaMigrations(db) {
   }
 }
 
+const TRANSIENT_ERROR_CODES = new Set([
+  'SQLITE_BUSY',
+  'SQLITE_LOCKED',
+  'SQLITE_NOMEM',
+  'SQLITE_IOERR',
+  'SQLITE_FULL',
+  'SQLITE_CANTOPEN',
+  'SQLITE_PERM',
+  'SQLITE_READONLY',
+  'ENOSPC',
+  'ENOMEM',
+  'EIO',
+  'EACCES',
+  'EPERM',
+  'EBUSY',
+  'EMFILE',
+  'ENFILE',
+  'EROFS'
+]);
+
+const TRANSIENT_SQLITE_ERRCODES = new Set([3, 5, 6, 7, 8, 10, 13, 14]);
+
+const TRANSIENT_MESSAGE_RE =
+  /\b(out of memory|not enough memory|database is locked|database table is locked|disk i\/o error|database or disk is full|no space left on device|permission denied|too many open files|unable to open database file)\b/i;
+
+const CORRUPTION_MESSAGE_RE =
+  /file is not a database|database disk image is malformed|sqlite quick_check failed/i;
+
+function isTransientFaultSignature(code, primaryErrcode, combinedText) {
+  if (code) {
+    if (TRANSIENT_ERROR_CODES.has(code)) return true;
+    if (
+      code.startsWith('SQLITE_BUSY_') ||
+      code.startsWith('SQLITE_LOCKED_') ||
+      code.startsWith('SQLITE_IOERR_') ||
+      code.startsWith('SQLITE_CANTOPEN_') ||
+      code.startsWith('SQLITE_READONLY_')
+    ) {
+      return true;
+    }
+  }
+  if (primaryErrcode !== null && TRANSIENT_SQLITE_ERRCODES.has(primaryErrcode)) {
+    return true;
+  }
+  return TRANSIENT_MESSAGE_RE.test(combinedText);
+}
+
+function extractSqliteErrorFields(err) {
+  const code =
+    typeof err === 'object' && typeof err.code === 'string'
+      ? err.code.trim().toUpperCase()
+      : '';
+  const rawErrcode =
+    typeof err === 'object' && Number.isInteger(err.errcode) ? err.errcode : null;
+  const primaryErrcode = rawErrcode !== null ? rawErrcode & 0xff : null;
+  const errstr = typeof err === 'object' && typeof err.errstr === 'string' ? err.errstr : '';
+  const message =
+    typeof err === 'string' ? err : typeof err.message === 'string' ? err.message : '';
+  return { code, rawErrcode, primaryErrcode, combinedText: `${message} ${errstr}`.trim() };
+}
+
+/**
+ * Determine whether an error represents genuine structural SQLite corruption (INV-REC-01)
+ * as opposed to transient resource, lock, or OS I/O errors.
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isSqliteCorruptionError(err) {
+  if (!err || (typeof err !== 'object' && typeof err !== 'string')) {
+    return false;
+  }
+
+  if (typeof err === 'object' && err.cause) {
+    const cause = extractSqliteErrorFields(err.cause);
+    if (isTransientFaultSignature(cause.code, cause.primaryErrcode, cause.combinedText)) {
+      return false;
+    }
+  }
+
+  const { code, rawErrcode, primaryErrcode, combinedText } = extractSqliteErrorFields(err);
+  if (isTransientFaultSignature(code, primaryErrcode, combinedText)) {
+    return false;
+  }
+
+  if (code === 'SQLITE_CORRUPT' || code.startsWith('SQLITE_CORRUPT_') || code === 'SQLITE_NOTADB') {
+    return true;
+  }
+  if (rawErrcode === 11 || rawErrcode === 26 || primaryErrcode === 11 || primaryErrcode === 26) {
+    return true;
+  }
+  return CORRUPTION_MESSAGE_RE.test(combinedText);
+}
+
 /**
  * Open or initialize a KruschStack SQLite database instance.
  * @param {object} [options]
  * @param {string} [options.workspaceRoot]
  * @param {string} [options.dbPath]
  * @param {boolean} [options.ephemeral]
+ * @param {(filePath: string) => DatabaseSync} [options._sqliteFactory]
  * @returns {DatabaseSync}
  */
 export function openStackDatabase(options = {}) {
+  const sqliteFactory =
+    typeof options._sqliteFactory === 'function'
+      ? options._sqliteFactory
+      : (filePath) => new DatabaseSync(filePath);
+
   const hasExplicitFileDb = Boolean(options.dbPath && options.dbPath !== ':memory:');
   const ephemeral =
     options.ephemeral === true ||
     options.dbPath === ':memory:' ||
     (options.ephemeral !== false && !hasExplicitFileDb && process.env.KRUSCH_EPHEMERAL === '1');
   if (ephemeral) {
-    const memDb = new DatabaseSync(':memory:');
-    memDb.exec('PRAGMA busy_timeout = 5000;');
-    memDb.exec('PRAGMA foreign_keys = ON;');
-    memDb.exec(STACK_SCHEMA_SQL);
-    ensureStackSchemaMigrations(memDb);
-    return memDb;
+    let memDb = null;
+    try {
+      memDb = sqliteFactory(':memory:');
+      memDb.exec('PRAGMA busy_timeout = 5000;');
+      memDb.exec('PRAGMA foreign_keys = ON;');
+      memDb.exec(STACK_SCHEMA_SQL);
+      ensureStackSchemaMigrations(memDb);
+      return memDb;
+    } catch (memErr) {
+      try {
+        memDb?.close?.();
+      } catch (closeErr) {
+        /* ignore close error */
+      }
+      throw memErr;
+    }
   }
 
   const workspaceRoot = path.resolve(options.workspaceRoot || process.cwd());
@@ -298,9 +427,12 @@ export function openStackDatabase(options = {}) {
     : path.join(workspaceRoot, '.krusch-stack', 'stack.db');
 
   fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-  let db = new DatabaseSync(resolvedPath);
+  let db = null;
   try {
+    db = sqliteFactory(resolvedPath);
     db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA journal_mode = WAL;');
+    db.exec('PRAGMA synchronous = NORMAL;');
     db.exec('PRAGMA foreign_keys = ON;');
     const check = db.prepare('PRAGMA quick_check;').get();
     if (check && check.quick_check && check.quick_check !== 'ok') {
@@ -308,23 +440,44 @@ export function openStackDatabase(options = {}) {
     }
     db.exec(STACK_SCHEMA_SQL);
     ensureStackSchemaMigrations(db);
-  } catch (corruptErr) {
+  } catch (openErr) {
     try {
-      db.close();
-    } catch {}
+      db?.close?.();
+    } catch (closeErr) {
+      /* ignore close error */
+    }
+    if (!isSqliteCorruptionError(openErr)) {
+      throw openErr;
+    }
     const backupSuffix = `.corrupt.${Date.now()}`;
     for (const ext of ['', '-wal', '-shm']) {
-      if (fs.existsSync(`${resolvedPath}${ext}`)) {
+      const candidate = `${resolvedPath}${ext}`;
+      if (fs.existsSync(candidate)) {
         try {
-          fs.renameSync(`${resolvedPath}${ext}`, `${resolvedPath}${ext}${backupSuffix}`);
-        } catch {}
+          fs.renameSync(candidate, `${candidate}${backupSuffix}`);
+        } catch (renameErr) {
+          if (renameErr?.code !== 'ENOENT') {
+            throw renameErr;
+          }
+        }
       }
     }
-    db = new DatabaseSync(resolvedPath);
-    db.exec('PRAGMA busy_timeout = 5000;');
-    db.exec('PRAGMA foreign_keys = ON;');
-    db.exec(STACK_SCHEMA_SQL);
-    ensureStackSchemaMigrations(db);
+    db = sqliteFactory(resolvedPath);
+    try {
+      db.exec('PRAGMA busy_timeout = 5000;');
+      db.exec('PRAGMA journal_mode = WAL;');
+      db.exec('PRAGMA synchronous = NORMAL;');
+      db.exec('PRAGMA foreign_keys = ON;');
+      db.exec(STACK_SCHEMA_SQL);
+      ensureStackSchemaMigrations(db);
+    } catch (reinitErr) {
+      try {
+        db?.close?.();
+      } catch (closeErr) {
+        /* ignore close error */
+      }
+      throw reinitErr;
+    }
   }
   return db;
 }

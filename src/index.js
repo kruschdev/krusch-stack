@@ -7,7 +7,13 @@
  */
 
 import path from 'node:path';
-import { openStackDatabase, ensureStackSchemaMigrations, okEnvelope, STACK_SCHEMA_SQL } from './db/sqlite.js';
+import {
+  openStackDatabase,
+  ensureStackSchemaMigrations,
+  isSqliteCorruptionError,
+  okEnvelope,
+  STACK_SCHEMA_SQL
+} from './db/sqlite.js';
 import { createContextEngine, packStackTokenBudget } from './engines/context-engine.js';
 import {
   prunePreRetrieval,
@@ -36,7 +42,7 @@ import {
   redactEnvSecrets,
   scanForSecretLeak
 } from './engines/fs-engine.js';
-import { createHarnessEngine } from './engines/harness-engine.js';
+import { createHarnessEngine, fsyncDirectory } from './engines/harness-engine.js';
 import { createFrontendEngine } from './engines/frontend-engine.js';
 import { createWorkspaceEngine } from './engines/workspace-engine.js';
 import { createRouterEngine } from './engines/router-engine.js';
@@ -130,6 +136,7 @@ export function createKruschStack(options = {}) {
 export {
   openStackDatabase,
   ensureStackSchemaMigrations,
+  isSqliteCorruptionError,
   okEnvelope,
   STACK_SCHEMA_SQL,
   RESILIENCE_SCHEMA_SQL,
@@ -155,6 +162,7 @@ export {
   redactEnvSecrets,
   scanForSecretLeak,
   createHarnessEngine,
+  fsyncDirectory,
   createFrontendEngine,
   createWorkspaceEngine,
   createRouterEngine,
