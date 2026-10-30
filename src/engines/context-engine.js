@@ -142,14 +142,723 @@ function computeProvenanceAnchorHash(provenance, workspaceRoot) {
   return null;
 }
 
+const MAX_RELOC_FILE_BYTES = 524288;
+const MAX_WORKSPACE_SCAN_FILES = 200;
+const MAX_AMBIGUOUS_CANDIDATES = 5;
+
+const RELOC_IGNORED_DIRS = new Set([
+  '.git',
+  'node_modules',
+  '.agent',
+  '.krusch-stack',
+  'dist',
+  'build',
+  'coverage',
+  '__pycache__',
+  '.venv',
+  'venv',
+  '.next',
+  'benchmarks',
+  '.cache'
+]);
+
+const SAFE_ENV_TEMPLATE_SUFFIXES = ['.example', '.sample', '.template', '.schema', '.dist'];
+
+const BINARY_SKIP_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.ico',
+  '.pdf',
+  '.zip',
+  '.tar',
+  '.gz',
+  '.tgz',
+  '.bz2',
+  '.xz',
+  '.7z',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.otf',
+  '.eot',
+  '.mp3',
+  '.mp4',
+  '.wav',
+  '.avi',
+  '.mov',
+  '.wasm',
+  '.pyc',
+  '.pyo',
+  '.class',
+  '.o',
+  '.so',
+  '.dylib',
+  '.dll',
+  '.exe',
+  '.sqlite',
+  '.sqlite3',
+  '.db'
+]);
+
+const TRIVIAL_GENERIC_QUOTE_RE =
+  /^(?:['"]use strict['"]\s*;?|return(?:\s+(?:true|false|null|undefined|this|0|1|-1|''|""|``|\{\}|\[\]))?\s*;?|break\s*;?|continue\s*;?|export\s*\{\s*\}\s*;?|module\.exports\s*=\s*\{\s*\}\s*;?|[{}();]+)$/i;
+
+const DECL_KEYWORD_SYMBOL_RE =
+  /(?:^|[\s;{])(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:public\s+|private\s+|protected\s+|static\s+|final\s+|abstract\s+)*(?:function\s*\*?|class|interface|type|enum|def|fn|struct|record)\s+([A-Za-z_$][A-Za-z0-9_$]{2,})\b/;
+
+const DECL_BINDING_SYMBOL_RE =
+  /(?:^|[\s;{])(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]{2,})\s*=/;
+
+function escapeRegExpLiteral(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractDeclarationSymbol(normalizedQuoted) {
+  if (!normalizedQuoted) return null;
+  const kwMatch = normalizedQuoted.match(DECL_KEYWORD_SYMBOL_RE);
+  if (kwMatch && kwMatch[1]) return kwMatch[1];
+  const bindMatch = normalizedQuoted.match(DECL_BINDING_SYMBOL_RE);
+  if (bindMatch && bindMatch[1]) return bindMatch[1];
+  return null;
+}
+
+function containsIdentifierToken(text, identifier) {
+  if (!text || !identifier) return false;
+  const re = new RegExp(`(?<![A-Za-z0-9_$])${escapeRegExpLiteral(identifier)}(?![A-Za-z0-9_$])`);
+  return re.test(text);
+}
+
+function hasIgnoredRelocationSegment(relPosix) {
+  const parts = String(relPosix ?? '').split('/');
+  for (const part of parts) {
+    if (RELOC_IGNORED_DIRS.has(part)) return true;
+  }
+  return false;
+}
+
+function isSensitiveRelocationFile(filePath) {
+  const base = path.basename(String(filePath ?? '')).toLowerCase();
+  if (!base) return true;
+  if (base === '.env' || base.startsWith('.env.')) {
+    return !SAFE_ENV_TEMPLATE_SUFFIXES.some((sfx) => base.endsWith(sfx));
+  }
+  if (
+    base.endsWith('.pem') ||
+    base.endsWith('.key') ||
+    base.startsWith('id_rsa') ||
+    base.startsWith('id_ed25519') ||
+    base.startsWith('id_ecdsa') ||
+    base.startsWith('id_dsa') ||
+    base === 'credentials.json' ||
+    base === '.npmrc' ||
+    base === '.pypirc' ||
+    base === '.netrc'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isKnownBinaryExtension(filePath) {
+  const ext = path.extname(String(filePath ?? '')).toLowerCase();
+  return ext ? BINARY_SKIP_EXTENSIONS.has(ext) : false;
+}
+
+function countNewlines(str, start, end) {
+  let count = 0;
+  for (let i = start; i < end; i += 1) {
+    if (str.charCodeAt(i) === 10) count += 1;
+  }
+  return count;
+}
+
+function computeExactQuoteLineRange(normalizedText, normalizedQuoted) {
+  const idx = normalizedText.indexOf(normalizedQuoted);
+  if (idx < 0) return null;
+  const startLine = 1 + countNewlines(normalizedText, 0, idx);
+  const endLine = startLine + countNewlines(normalizedQuoted, 0, normalizedQuoted.length);
+  const locator = startLine === endLine ? `L${startLine}` : `L${startLine}-L${endLine}`;
+  return { start_line: startLine, end_line: endLine, locator };
+}
+
+function computePathProximityMetrics(origRel, candRel) {
+  if (!origRel) {
+    return { sameDir: 0, commonPrefixLen: 0, treeDistance: 0 };
+  }
+  const origDirRaw = path.posix.dirname(origRel);
+  const candDirRaw = path.posix.dirname(candRel);
+  const origDir = origDirRaw === '.' ? '' : origDirRaw;
+  const candDir = candDirRaw === '.' ? '' : candDirRaw;
+  const origSegs = origDir ? origDir.split('/') : [];
+  const candSegs = candDir ? candDir.split('/') : [];
+
+  let commonPrefixLen = 0;
+  const minLen = Math.min(origSegs.length, candSegs.length);
+  while (commonPrefixLen < minLen && origSegs[commonPrefixLen] === candSegs[commonPrefixLen]) {
+    commonPrefixLen += 1;
+  }
+  const treeDistance = (origSegs.length - commonPrefixLen) + (candSegs.length - commonPrefixLen);
+  return {
+    sameDir: origDir === candDir ? 1 : 0,
+    commonPrefixLen,
+    treeDistance
+  };
+}
+
+function compareCandidateProximity(origRel, fileA, fileB) {
+  const mA = computePathProximityMetrics(origRel, fileA);
+  const mB = computePathProximityMetrics(origRel, fileB);
+  if (mB.sameDir !== mA.sameDir) return mB.sameDir - mA.sameDir;
+  if (mB.commonPrefixLen !== mA.commonPrefixLen) return mB.commonPrefixLen - mA.commonPrefixLen;
+  if (mA.treeDistance !== mB.treeDistance) return mA.treeDistance - mB.treeDistance;
+  return fileA.localeCompare(fileB);
+}
+
+/**
+ * Resolve a deterministic zero-LLM cross-file relocation hint when INV-12 STALE_DRIFT fires.
+ * Waterfall: Tier 1a/1b (`git_symbols`) -> Tier 2 (`fs_pages`) -> Tier 3 (`workspace_scan`).
+ * Enforces INV-RELOC-01..04 (specificity, <=5 non-ambiguity, realpath containment, secret exclusion).
+ * @param {object} [params]
+ * @param {import('node:sqlite').DatabaseSync | null} [params.db]
+ * @param {string} [params.relFile]
+ * @param {string} [params.quoted]
+ * @param {string} [params.workspaceRoot]
+ * @returns {object | null}
+ */
+export function findCrossFileRelocationCandidate({
+  db = null,
+  relFile = '',
+  quoted = '',
+  workspaceRoot = ''
+} = {}) {
+  if (!workspaceRoot || typeof workspaceRoot !== 'string') return null;
+
+  const normalizedQuoted = String(quoted ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+  if (!normalizedQuoted || TRIVIAL_GENERIC_QUOTE_RE.test(normalizedQuoted)) {
+    return null;
+  }
+
+  const nonWsLen = normalizedQuoted.replace(/\s+/g, '').length;
+  const declSymbol = extractDeclarationSymbol(normalizedQuoted);
+  if (nonWsLen < 10 && !declSymbol) {
+    return null;
+  }
+
+  const rootResolved = path.resolve(workspaceRoot);
+  let canonicalRoot;
+  try {
+    canonicalRoot = fs.realpathSync(rootResolved);
+  } catch {
+    return null;
+  }
+
+  let origRel = '';
+  let origRealRel = '';
+  const rawRel = typeof relFile === 'string' ? relFile.trim() : '';
+  if (rawRel) {
+    const resolvedOrigAbs = resolveSafeWorkspacePath(rawRel, rootResolved);
+    if (!resolvedOrigAbs) {
+      return null;
+    }
+    origRel = path.relative(rootResolved, resolvedOrigAbs).replace(/\\/g, '/');
+    try {
+      const origRealAbs = fs.realpathSync(resolvedOrigAbs);
+      if (origRealAbs !== canonicalRoot && origRealAbs.startsWith(canonicalRoot + path.sep)) {
+        origRealRel = path.relative(canonicalRoot, origRealAbs).replace(/\\/g, '/');
+      } else {
+        origRealRel = origRel;
+      }
+    } catch {
+      origRealRel = origRel;
+    }
+  }
+
+  const diskCache = new Map();
+
+  function readEligibleCandidateFile(candidatePath) {
+    if (!candidatePath || typeof candidatePath !== 'string') return null;
+    const trimmedCand = candidatePath.trim();
+    if (!trimmedCand) return null;
+
+    let absCandidate;
+    if (path.isAbsolute(trimmedCand)) {
+      const resolved = path.resolve(trimmedCand);
+      if (
+        resolved !== rootResolved &&
+        !resolved.startsWith(rootResolved + path.sep) &&
+        resolved !== canonicalRoot &&
+        !resolved.startsWith(canonicalRoot + path.sep)
+      ) {
+        return null;
+      }
+      absCandidate = resolved;
+    } else {
+      const normInput = trimmedCand.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '');
+      if (
+        !normInput ||
+        normInput === '..' ||
+        normInput.startsWith('../') ||
+        normInput.includes('/../') ||
+        normInput.endsWith('/..')
+      ) {
+        return null;
+      }
+      absCandidate = path.resolve(rootResolved, normInput);
+      if (absCandidate === rootResolved || !absCandidate.startsWith(rootResolved + path.sep)) {
+        return null;
+      }
+    }
+
+    const relPosix = (
+      absCandidate.startsWith(rootResolved + path.sep)
+        ? path.relative(rootResolved, absCandidate)
+        : path.relative(canonicalRoot, absCandidate)
+    ).replace(/\\/g, '/');
+
+    if (!relPosix || relPosix.startsWith('..') || relPosix === origRel) {
+      return null;
+    }
+    if (
+      hasIgnoredRelocationSegment(relPosix) ||
+      isSensitiveRelocationFile(relPosix) ||
+      isKnownBinaryExtension(relPosix)
+    ) {
+      return null;
+    }
+
+    if (diskCache.has(relPosix)) {
+      return diskCache.get(relPosix);
+    }
+
+    let realPath;
+    try {
+      realPath = fs.realpathSync(absCandidate);
+    } catch {
+      diskCache.set(relPosix, null);
+      return null;
+    }
+
+    if (realPath === canonicalRoot || !realPath.startsWith(canonicalRoot + path.sep)) {
+      diskCache.set(relPosix, null);
+      return null;
+    }
+
+    const realRelPosix = path.relative(canonicalRoot, realPath).replace(/\\/g, '/');
+    if (
+      !realRelPosix ||
+      realRelPosix.startsWith('..') ||
+      realRelPosix === origRel ||
+      (origRealRel && realRelPosix === origRealRel) ||
+      hasIgnoredRelocationSegment(realRelPosix) ||
+      isSensitiveRelocationFile(realRelPosix) ||
+      isKnownBinaryExtension(realRelPosix)
+    ) {
+      diskCache.set(relPosix, null);
+      return null;
+    }
+
+    let stat;
+    try {
+      stat = fs.statSync(realPath);
+    } catch {
+      diskCache.set(relPosix, null);
+      return null;
+    }
+
+    if (!stat.isFile() || stat.size > MAX_RELOC_FILE_BYTES) {
+      diskCache.set(relPosix, null);
+      return null;
+    }
+
+    let buf;
+    try {
+      buf = fs.readFileSync(realPath);
+    } catch {
+      diskCache.set(relPosix, null);
+      return null;
+    }
+
+    if (buf.indexOf(0) !== -1) {
+      diskCache.set(relPosix, null);
+      return null;
+    }
+
+    const normalizedText = buf.toString('utf8').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const entry = { file: relPosix, realFile: realRelPosix, normalizedText };
+    diskCache.set(relPosix, entry);
+    return entry;
+  }
+
+  // Waterfall Tier 1: git_symbols AST table
+  if (db) {
+    // Step 1a: Exact quote match in git_symbols
+    if (nonWsLen >= 10) {
+      let rows = null;
+      try {
+        const snippetProbe = normalizedQuoted.split('\n').slice(0, 20).join('\n');
+        rows = db
+          .prepare(`
+            SELECT
+              file_path,
+              symbol_name,
+              symbol_type,
+              signature,
+              start_line,
+              end_line
+            FROM git_symbols
+            WHERE file_path != ?
+              AND (
+                INSTR(REPLACE(REPLACE(COALESCE(snippet, ''), CHAR(13) || CHAR(10), CHAR(10)), CHAR(13), CHAR(10)), ?) > 0
+                OR INSTR(REPLACE(REPLACE(COALESCE(signature, ''), CHAR(13) || CHAR(10), CHAR(10)), CHAR(13), CHAR(10)), ?) > 0
+              )
+            ORDER BY (end_line - start_line) ASC, start_line ASC
+            LIMIT 60
+          `)
+          .all(origRel, snippetProbe, normalizedQuoted);
+      } catch {
+        rows = null;
+      }
+
+      if (rows && rows.length > 0) {
+        const byRealFile = new Map();
+        for (const r of rows) {
+          const diskEntry = readEligibleCandidateFile(r.file_path);
+          if (!diskEntry) continue;
+          if (!diskEntry.normalizedText.includes(normalizedQuoted)) continue;
+          if (!byRealFile.has(diskEntry.realFile)) {
+            byRealFile.set(diskEntry.realFile, {
+              file: diskEntry.file,
+              normalizedText: diskEntry.normalizedText,
+              symbol_name: r.symbol_name,
+              symbol_type: r.symbol_type
+            });
+            if (byRealFile.size > MAX_AMBIGUOUS_CANDIDATES) {
+              return null;
+            }
+          }
+        }
+
+        if (byRealFile.size >= 1 && byRealFile.size <= MAX_AMBIGUOUS_CANDIDATES) {
+          const candidates = [...byRealFile.values()].sort((a, b) =>
+            compareCandidateProximity(origRel, a.file, b.file)
+          );
+          const winner = candidates[0];
+          const range = computeExactQuoteLineRange(winner.normalizedText, normalizedQuoted);
+          if (range) {
+            return {
+              file: winner.file,
+              locator: range.locator,
+              start_line: range.start_line,
+              end_line: range.end_line,
+              citation: `${winner.file}#${range.locator}`,
+              symbol_name: winner.symbol_name,
+              symbol_type: winner.symbol_type,
+              source: 'git_symbols',
+              match_kind: 'ast_exact_quote',
+              candidate_count: byRealFile.size
+            };
+          }
+        }
+      }
+    }
+
+    // Step 1b: Declaration symbol name match in git_symbols (handles reformatted signatures)
+    if (declSymbol) {
+      let symRows = null;
+      try {
+        symRows = db
+          .prepare(`
+            SELECT
+              file_path,
+              symbol_name,
+              symbol_type,
+              signature,
+              start_line,
+              end_line
+            FROM git_symbols
+            WHERE symbol_name = ?
+              AND file_path != ?
+            ORDER BY (end_line - start_line) ASC, start_line ASC
+            LIMIT 60
+          `)
+          .all(declSymbol, origRel);
+      } catch {
+        symRows = null;
+      }
+
+      if (symRows && symRows.length > 0) {
+        const byRealFile = new Map();
+        let symAmbiguous = false;
+        for (const r of symRows) {
+          const diskEntry = readEligibleCandidateFile(r.file_path);
+          if (!diskEntry) continue;
+          if (!containsIdentifierToken(diskEntry.normalizedText, declSymbol)) continue;
+          if (!byRealFile.has(diskEntry.realFile)) {
+            byRealFile.set(diskEntry.realFile, {
+              file: diskEntry.file,
+              normalizedText: diskEntry.normalizedText,
+              symbol_name: r.symbol_name,
+              symbol_type: r.symbol_type,
+              start_line: Number(r.start_line) || 1,
+              end_line: Number(r.end_line) || 1
+            });
+            if (byRealFile.size > MAX_AMBIGUOUS_CANDIDATES) {
+              symAmbiguous = true;
+              break;
+            }
+          }
+        }
+
+        if (!symAmbiguous && byRealFile.size >= 1 && byRealFile.size <= MAX_AMBIGUOUS_CANDIDATES) {
+          const candidates = [...byRealFile.values()].sort((a, b) =>
+            compareCandidateProximity(origRel, a.file, b.file)
+          );
+          const winner = candidates[0];
+          const diskLines = winner.normalizedText.split('\n');
+          let startLine = winner.start_line;
+          let endLine = Math.max(startLine, Math.min(winner.end_line, diskLines.length));
+          const indexedSlice =
+            startLine >= 1 && startLine <= diskLines.length
+              ? diskLines.slice(startLine - 1, endLine).join('\n')
+              : '';
+          if (!containsIdentifierToken(indexedSlice, declSymbol)) {
+            const foundIdx = diskLines.findIndex((ln) => containsIdentifierToken(ln, declSymbol));
+            startLine = foundIdx >= 0 ? foundIdx + 1 : 1;
+            endLine = startLine;
+          }
+          const locator = startLine === endLine ? `L${startLine}` : `L${startLine}-L${endLine}`;
+          return {
+            file: winner.file,
+            locator,
+            start_line: startLine,
+            end_line: endLine,
+            citation: `${winner.file}#${locator}`,
+            symbol_name: winner.symbol_name,
+            symbol_type: winner.symbol_type,
+            source: 'git_symbols',
+            match_kind: 'ast_symbol_name',
+            candidate_count: byRealFile.size
+          };
+        }
+      }
+    }
+  }
+
+  if (nonWsLen < 10) {
+    return null;
+  }
+
+  // Waterfall Tier 2: fs_pages table
+  if (db) {
+    let pageRows = null;
+    try {
+      const firstLine = normalizedQuoted.split('\n')[0].trim();
+      const pageProbe =
+        normalizedQuoted.includes('\n') && firstLine.replace(/\s+/g, '').length >= 10
+          ? firstLine
+          : normalizedQuoted;
+      pageRows = db
+        .prepare(`
+          SELECT DISTINCT file_path
+          FROM fs_pages
+          WHERE file_path != ?
+            AND INSTR(REPLACE(REPLACE(COALESCE(page_text, ''), CHAR(13) || CHAR(10), CHAR(10)), CHAR(13), CHAR(10)), ?) > 0
+          ORDER BY file_path ASC
+          LIMIT 30
+        `)
+        .all(origRel, pageProbe);
+    } catch {
+      pageRows = null;
+    }
+
+    if (pageRows && pageRows.length > 0) {
+      const byRealFile = new Map();
+      for (const r of pageRows) {
+        const diskEntry = readEligibleCandidateFile(r.file_path);
+        if (!diskEntry) continue;
+        if (!diskEntry.normalizedText.includes(normalizedQuoted)) continue;
+        if (!byRealFile.has(diskEntry.realFile)) {
+          byRealFile.set(diskEntry.realFile, diskEntry);
+          if (byRealFile.size > MAX_AMBIGUOUS_CANDIDATES) {
+            return null;
+          }
+        }
+      }
+
+      if (byRealFile.size >= 1 && byRealFile.size <= MAX_AMBIGUOUS_CANDIDATES) {
+        const candidates = [...byRealFile.values()].sort((a, b) =>
+          compareCandidateProximity(origRel, a.file, b.file)
+        );
+        const winner = candidates[0];
+        const range = computeExactQuoteLineRange(winner.normalizedText, normalizedQuoted);
+        if (range) {
+          return {
+            file: winner.file,
+            locator: range.locator,
+            start_line: range.start_line,
+            end_line: range.end_line,
+            citation: `${winner.file}#${range.locator}`,
+            source: 'fs_pages',
+            match_kind: 'fs_exact_quote',
+            candidate_count: byRealFile.size
+          };
+        }
+      }
+    }
+  }
+
+  // Waterfall Tier 3: bounded workspace_scan fallback (<= 200 files, sibling-first)
+  let scannedFiles = 0;
+  let ambiguous = false;
+  const visitedRealDirs = new Set();
+  const seenRelPaths = new Set();
+  const matchesByRealFile = new Map();
+
+  function scanDirectory(dirAbs) {
+    if (scannedFiles >= MAX_WORKSPACE_SCAN_FILES || ambiguous) return;
+
+    let realDir;
+    try {
+      realDir = fs.realpathSync(dirAbs);
+    } catch {
+      return;
+    }
+    if (realDir !== canonicalRoot && !realDir.startsWith(canonicalRoot + path.sep)) {
+      return;
+    }
+    if (visitedRealDirs.has(realDir)) {
+      return;
+    }
+    visitedRealDirs.add(realDir);
+
+    let entries;
+    try {
+      entries = fs.readdirSync(dirAbs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    const subdirs = [];
+    for (const entry of entries) {
+      if (scannedFiles >= MAX_WORKSPACE_SCAN_FILES || ambiguous) return;
+      if (RELOC_IGNORED_DIRS.has(entry.name)) continue;
+
+      const fullAbs = path.join(dirAbs, entry.name);
+      if (entry.isDirectory()) {
+        subdirs.push(fullAbs);
+        continue;
+      }
+
+      if (entry.isSymbolicLink()) {
+        let linkReal;
+        try {
+          linkReal = fs.realpathSync(fullAbs);
+        } catch {
+          continue;
+        }
+        if (linkReal === canonicalRoot || !linkReal.startsWith(canonicalRoot + path.sep)) {
+          continue;
+        }
+        const linkRealRel = path.relative(canonicalRoot, linkReal).replace(/\\/g, '/');
+        if (hasIgnoredRelocationSegment(linkRealRel)) {
+          continue;
+        }
+        let linkStat;
+        try {
+          linkStat = fs.statSync(linkReal);
+        } catch {
+          continue;
+        }
+        if (linkStat.isDirectory()) {
+          subdirs.push(fullAbs);
+          continue;
+        }
+        if (!linkStat.isFile()) {
+          continue;
+        }
+      } else if (!entry.isFile()) {
+        continue;
+      }
+
+      const relPosix = path.relative(rootResolved, fullAbs).replace(/\\/g, '/');
+      if (!relPosix || relPosix.startsWith('..') || relPosix === origRel) continue;
+      if (seenRelPaths.has(relPosix)) continue;
+      seenRelPaths.add(relPosix);
+
+      const diskEntry = readEligibleCandidateFile(relPosix);
+      if (!diskEntry) continue;
+
+      scannedFiles += 1;
+      if (diskEntry.normalizedText.includes(normalizedQuoted)) {
+        if (!matchesByRealFile.has(diskEntry.realFile)) {
+          matchesByRealFile.set(diskEntry.realFile, diskEntry);
+          if (matchesByRealFile.size > MAX_AMBIGUOUS_CANDIDATES) {
+            ambiguous = true;
+            return;
+          }
+        }
+      }
+    }
+
+    for (const subdirAbs of subdirs) {
+      if (scannedFiles >= MAX_WORKSPACE_SCAN_FILES || ambiguous) return;
+      scanDirectory(subdirAbs);
+    }
+  }
+
+  if (origRel) {
+    let currDirRel = path.posix.dirname(origRel);
+    while (currDirRel && currDirRel !== '.') {
+      const ancestorAbs = path.resolve(rootResolved, currDirRel);
+      if (ancestorAbs.startsWith(rootResolved + path.sep)) {
+        scanDirectory(ancestorAbs);
+      }
+      const nextDirRel = path.posix.dirname(currDirRel);
+      if (nextDirRel === currDirRel) break;
+      currDirRel = nextDirRel;
+    }
+  }
+  scanDirectory(rootResolved);
+
+  if (ambiguous || matchesByRealFile.size === 0 || matchesByRealFile.size > MAX_AMBIGUOUS_CANDIDATES) {
+    return null;
+  }
+
+  const candidates = [...matchesByRealFile.values()].sort((a, b) =>
+    compareCandidateProximity(origRel, a.file, b.file)
+  );
+  const winner = candidates[0];
+  const range = computeExactQuoteLineRange(winner.normalizedText, normalizedQuoted);
+  if (!range) return null;
+
+  return {
+    file: winner.file,
+    locator: range.locator,
+    start_line: range.start_line,
+    end_line: range.end_line,
+    citation: `${winner.file}#${range.locator}`,
+    source: 'workspace_scan',
+    match_kind: 'workspace_exact_quote',
+    candidate_count: matchesByRealFile.size
+  };
+}
+
 /**
  * Evaluate INV-12 span-grounded drift for a context memory record.
- * Returns 'VALID', 'HEALED_LINE_SHIFT', or 'STALE_DRIFT'.
+ * Returns 'VALID', 'HEALED_LINE_SHIFT', or 'STALE_DRIFT' (with optional cross-file `moved_candidate`).
  * @param {object} row
  * @param {string} workspaceRoot
- * @returns {{ status: 'VALID' | 'HEALED_LINE_SHIFT' | 'STALE_DRIFT', current_locator?: string }}
+ * @param {import('node:sqlite').DatabaseSync | null} [db=null]
+ * @returns {{ status: 'VALID' | 'HEALED_LINE_SHIFT' | 'STALE_DRIFT', current_locator?: string, moved_candidate?: object }}
  */
-function evaluateSpanDrift(row, workspaceRoot) {
+export function evaluateSpanDrift(row, workspaceRoot, db = null) {
   const relFile = row.provenance_file;
   const locator = row.provenance_locator;
   const quoted = row.quoted_sentence ? row.quoted_sentence.trim() : '';
@@ -161,30 +870,73 @@ function evaluateSpanDrift(row, workspaceRoot) {
 
   if (relFile) {
     const absPath = resolveSafeWorkspacePath(relFile, workspaceRoot);
-    if (!absPath || !fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+    if (!absPath) {
       return { status: 'STALE_DRIFT' };
     }
 
-    const fileContent = fs.readFileSync(absPath, 'utf8');
+    let canonicalRoot;
+    try {
+      canonicalRoot = fs.realpathSync(path.resolve(workspaceRoot));
+    } catch {
+      return { status: 'STALE_DRIFT' };
+    }
+
+    let existsAsContainedFile = false;
+    let realAbsPath = null;
+    try {
+      const lstat = fs.lstatSync(absPath);
+      realAbsPath = fs.realpathSync(absPath);
+      if (
+        realAbsPath !== canonicalRoot &&
+        realAbsPath.startsWith(canonicalRoot + path.sep) &&
+        (lstat.isFile() || fs.statSync(realAbsPath).isFile())
+      ) {
+        existsAsContainedFile = true;
+      } else if (lstat.isSymbolicLink()) {
+        return { status: 'STALE_DRIFT' };
+      }
+    } catch {
+      existsAsContainedFile = false;
+    }
+
+    if (!existsAsContainedFile) {
+      const movedCandidate = quoted
+        ? findCrossFileRelocationCandidate({ db, relFile, quoted, workspaceRoot })
+        : null;
+      return movedCandidate
+        ? { status: 'STALE_DRIFT', moved_candidate: movedCandidate }
+        : { status: 'STALE_DRIFT' };
+    }
+
+    const fileContent = fs.readFileSync(realAbsPath, 'utf8');
+    const normalizedFileContent = fileContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const normalizedQuoted = quoted.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const range = parseLineLocator(locator);
 
-    if (quoted) {
+    if (normalizedQuoted) {
       if (range) {
-        const spanText = extractLocatorSpan(fileContent, range);
-        if (spanText.includes(quoted)) {
+        const spanText = extractLocatorSpan(normalizedFileContent, range);
+        if (spanText.includes(normalizedQuoted)) {
           return { status: 'VALID' };
         }
       }
-      if (fileContent.includes(quoted)) {
+      if (normalizedFileContent.includes(normalizedQuoted)) {
         if (range) {
-          const lines = fileContent.split(/\r?\n/);
-          const foundIdx = lines.findIndex((line) => line.includes(quoted));
-          const healedLocator = foundIdx >= 0 ? `L${foundIdx + 1}` : locator;
+          const healedRange = computeExactQuoteLineRange(normalizedFileContent, normalizedQuoted);
+          const healedLocator = healedRange ? healedRange.locator : locator;
           return { status: 'HEALED_LINE_SHIFT', current_locator: healedLocator };
         }
         return { status: 'VALID' };
       }
-      return { status: 'STALE_DRIFT' };
+      const movedCandidate = findCrossFileRelocationCandidate({
+        db,
+        relFile,
+        quoted: normalizedQuoted,
+        workspaceRoot
+      });
+      return movedCandidate
+        ? { status: 'STALE_DRIFT', moved_candidate: movedCandidate }
+        : { status: 'STALE_DRIFT' };
     }
 
     if (anchorHash) {
@@ -1458,7 +2210,7 @@ export function createContextEngine({
     const items = [];
     for (const cand of packed.packedItems) {
       const { row, score, lineage, condensedContent } = cand;
-      const drift = evaluateSpanDrift(row, root);
+      const drift = evaluateSpanDrift(row, root, db);
       if (drift.status === 'VALID') driftSummary.valid += 1;
       else if (drift.status === 'HEALED_LINE_SHIFT') driftSummary.healed_line_shift += 1;
       else driftSummary.stale_drift += 1;
@@ -1470,12 +2222,14 @@ export function createContextEngine({
         status: row.status,
         score: Number(score.toFixed(3)),
         drift_status: drift.status,
+        ...(drift.moved_candidate ? { moved_candidate: drift.moved_candidate } : {}),
         ...(lineage ? { lineage } : {}),
         provenance: {
           file: row.provenance_file || null,
           locator: drift.current_locator || row.provenance_locator || null,
           quoted_sentence: row.quoted_sentence || null,
-          anchor_hash: row.anchor_hash || null
+          anchor_hash: row.anchor_hash || null,
+          ...(drift.moved_candidate ? { moved_candidate: drift.moved_candidate } : {})
         },
         created_at: row.created_at,
         updated_at: row.updated_at
@@ -1761,7 +2515,15 @@ export function createContextEngine({
     const revocationReason = String(reason || 'Revised').trim();
 
     if (normalizedAction === 'supersede') {
-      const replacementText = String(new_content ?? '').trim();
+      const hasProvenanceUpdate =
+        provenance !== null &&
+        typeof provenance === 'object' &&
+        !Array.isArray(provenance) &&
+        Object.keys(provenance).length > 0;
+      const replacementText =
+        new_content === undefined && hasProvenanceUpdate
+          ? String(existing.content ?? '').trim()
+          : String(new_content ?? '').trim();
       if (!replacementText) {
         return okEnvelope(
           'krusch_context_revise',
@@ -1800,7 +2562,12 @@ export function createContextEngine({
             root
           )
         : existing.anchor_hash;
-      const serializedEmbedding = serializeEmbeddingVector(_embedding);
+      const serializedEmbedding =
+        _embedding !== null && _embedding !== undefined
+          ? serializeEmbeddingVector(_embedding)
+          : new_content === undefined && hasProvenanceUpdate
+            ? existing.embedding || null
+            : null;
 
       let newId;
       db.exec('BEGIN IMMEDIATE');
@@ -1966,13 +2733,20 @@ export function createContextEngine({
 
     const activeRows = selectActiveStmt.all();
     let driftedCount = 0;
+    let relocatedCandidatesCount = 0;
     let healedCount = 0;
     let embeddedCount = 0;
     for (const row of activeRows) {
       if (row.embedding) embeddedCount += 1;
-      const drift = evaluateSpanDrift(row, root);
-      if (drift.status === 'STALE_DRIFT') driftedCount += 1;
-      else if (drift.status === 'HEALED_LINE_SHIFT') healedCount += 1;
+      const drift = evaluateSpanDrift(row, root, db);
+      if (drift.status === 'STALE_DRIFT') {
+        driftedCount += 1;
+        if (drift.moved_candidate) {
+          relocatedCandidatesCount += 1;
+        }
+      } else if (drift.status === 'HEALED_LINE_SHIFT') {
+        healedCount += 1;
+      }
     }
 
     return okEnvelope(
@@ -1984,6 +2758,7 @@ export function createContextEngine({
         invalidated: counts.invalidated,
         embedded_count: embeddedCount,
         drifted_count: driftedCount,
+        relocated_candidates_count: relocatedCandidatesCount,
         healed_count: healedCount,
         total: counts.active + counts.superseded + counts.invalidated
       },
