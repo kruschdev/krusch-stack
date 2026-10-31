@@ -68,6 +68,7 @@ curl http://127.0.0.1:3780/health
 | **Tier 4: Frontend Design** | [`krusch-frontend-mcp`](https://github.com/kruschdev/krusch-frontend-mcp) | `generate_color_palette`, `css_to_tailwind`, `query_design_rules`, `get_canonical_template`, `list_canonical_templates`, `generate_responsive_breakpoints` | `node:sqlite` |
 | **Tier 5: Workspace Hub** | [`G-krusch`](https://github.com/kruschdev/G-krusch) | `get_agent_steering`, `search_drive_rag`, `read_drive_file`, `write_drive_file`, `list_drive_workspace`, `get_workspace_status` | `node:sqlite` |
 | **Router & Diagnostics** | [`krusch-cascade-router`](https://github.com/kruschdev/krusch-cascade-router) | `krusch_route_task`, `krusch_stack_status` | In-Memory `<25µs` |
+| **Companion Runtime Bricks** | [`toolkit` (`@krusch/toolkit` & `krusch_toolkit`)](https://github.com/kruschdev/toolkit) | 35 Node/TS/Workers & Python Lego bricks + `krusch-lego` CLI backing `get_canonical_template` (`lego-*`) & `INV-LEGO-01` | App Runtime (ESM / Py 3.11+) |
 
 ### 📊 Verified Third-Party Benchmarks Across Pillars
 
