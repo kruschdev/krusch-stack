@@ -108,6 +108,152 @@ const CANONICAL_TEMPLATES = {
   </a>
 </nav>`,
     css: '.nav-back { backdrop-filter: blur(8px); }'
+  },
+  'lego-node-api': {
+    template_id: 'lego-node-api',
+    title: 'Node 22 API + SQLite WAL Lego Brick',
+    category: 'lego-backend',
+    description: 'Zero-boilerplate HTTP + SQLite WAL server using @krusch/toolkit/http and @krusch/toolkit/db.',
+    html: `import { createApiServer, attachGracefulShutdown, okEnvelope } from '@krusch/toolkit/http';
+import { initDb, query, closeDb } from '@krusch/toolkit/db';
+
+initDb(process.env.DB_PATH || './data/app.db');
+const server = createApiServer({
+  serviceName: 'app-service',
+  version: '1.0.0',
+  routes: {
+    'GET /api/items': () => okEnvelope('items.list', 'Fetched items', { items: query('SELECT 1 AS ok') })
+  }
+});
+attachGracefulShutdown(server, [() => closeDb()]);
+server.listen(Number(process.env.PORT || 3000), '127.0.0.1');`,
+    css: ''
+  },
+  'lego-mcp-server': {
+    template_id: 'lego-mcp-server',
+    title: 'Stdio MCP Server Lego Brick',
+    category: 'lego-mcp',
+    description: 'Compliant Stdio MCP server brick using @krusch/toolkit/mcp with 4-boolean annotations (INV-STACK-03).',
+    html: `import { defineMcpTool, createMcpServer, okMcpResult } from '@krusch/toolkit/mcp';
+
+const TOOLS = [
+  defineMcpTool({
+    name: 'ping_service',
+    title: 'Ping Service',
+    description: 'Deterministic health check tool.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: { type: 'object', properties: {} }
+  })
+];
+
+await createMcpServer('app-mcp', '1.0.0', TOOLS, async (name) => okMcpResult(name, 'Pong', { ready: true }));`,
+    css: ''
+  },
+  'lego-sse-route': {
+    template_id: 'lego-sse-route',
+    title: 'AbortController-Safe SSE Chat Stream Brick',
+    category: 'lego-backend',
+    description: 'Server-Sent Events streaming endpoint using @krusch/toolkit/streaming with automatic disconnect teardown.',
+    html: `import { streamChat } from '@krusch/toolkit/streaming';
+
+export async function handleChatStream(req, res, body, llmConfig) {
+  return streamChat(res, req, {
+    tool: 'chat.stream',
+    systemPrompt: body.systemPrompt || 'You are a concise assistant.',
+    userMessage: body.prompt || '',
+    config: llmConfig
+  });
+}`,
+    css: ''
+  },
+  'lego-react-shell': {
+    template_id: 'lego-react-shell',
+    title: 'React AppShell + AbortController API/SSE Hooks Brick',
+    category: 'lego-frontend',
+    description: 'Drop-in React dashboard shell wired to @krusch/toolkit/react hooks with automatic AbortController cleanup.',
+    html: `import React from 'react';
+import { AppShell, MetricCard, StreamingChatPanel, useApiQuery, useSSEStream } from '@krusch/toolkit/react';
+
+export function DashboardApp() {
+  const { data } = useApiQuery('/health');
+  const stream = useSSEStream('/api/chat/stream');
+  return (
+    <AppShell title="Krusch App" status={data ? 'healthy' : 'degraded'}>
+      <MetricCard title="Service" value={data?.service || 'loading'} status="healthy" />
+      <StreamingChatPanel
+        streamingText={stream.text}
+        status={stream.status}
+        onSend={(prompt) => stream.start({ prompt })}
+        onStop={() => stream.stop()}
+      />
+    </AppShell>
+  );
+}`,
+    css: ''
+  },
+  'lego-fastapi-app': {
+    template_id: 'lego-fastapi-app',
+    title: 'Python 3.12 FastAPI Service Lego Brick',
+    category: 'lego-python',
+    description: 'Zero-boilerplate FastAPI factory with /health, CORS, X-Request-ID, JSON error envelopes, and SSE.',
+    html: `from krusch_toolkit.fastapi_app import create_fastapi_app, ok_envelope
+
+app = create_fastapi_app(title="Krusch Service", version="1.0.0")
+
+@app.get("/api/items")
+async def list_items():
+    return ok_envelope("items.list", "Fetched items", {"items": []})`,
+    css: ''
+  },
+  'lego-cloudflare-worker': {
+    template_id: 'lego-cloudflare-worker',
+    title: 'Cloudflare Worker Edge Router Lego Brick',
+    category: 'lego-edge',
+    description: 'Zero-node:* Web-Standards Cloudflare Worker router with KV store and SSE via @krusch/toolkit/edge.',
+    html: `import { createEdgeRouter, createEdgeKvJsonStore, edgeSseResponse } from '@krusch/toolkit/edge';
+
+export default createEdgeRouter({
+  serviceName: 'edge-portal',
+  version: '1.0.0',
+  routes: {
+    'GET /api/items': async ({ env, ok }) => {
+      const store = createEdgeKvJsonStore(env?.STATE_KV, { prefix: 'items:' });
+      const listed = await store.list({ limit: 50 });
+      return ok('Listed items', { keys: listed.keys });
+    },
+    'GET /api/stream': ({ request, corsHeaders }) =>
+      edgeSseResponse(async (sse) => {
+        sse.sendToken('Edge stream ready');
+        sse.done('Complete');
+      }, { request, corsHeaders })
+  }
+});`,
+    css: ''
+  },
+  'lego-webhook-route': {
+    template_id: 'lego-webhook-route',
+    title: 'Cryptographic Webhook Verification Lego Brick',
+    category: 'lego-security',
+    description: 'Constant-time HMAC webhook verification route (Slack/GitHub/Stripe) via @krusch/toolkit/webhooks.',
+    html: `import { verifyGithubSignature } from '@krusch/toolkit/webhooks';
+import { okEnvelope } from '@krusch/toolkit/http';
+
+export function handleGithubWebhook({ req, rawBody, sendJson }) {
+  const verdict = verifyGithubSignature({
+    rawBody,
+    signatureHeader: req.headers['x-hub-signature-256'],
+    webhookSecret: process.env.GITHUB_WEBHOOK_SECRET
+  });
+  if (!verdict.ok) {
+    sendJson(401, verdict);
+    return;
+  }
+  sendJson(200, okEnvelope('webhooks.github', 'Accepted GitHub event', { verified: true }));
+}`,
+    css: ''
   }
 };
 
@@ -238,6 +384,44 @@ function contrastRatio(rgbA, rgbB) {
   return Number(((brightest + 0.05) / (darkest + 0.05)).toFixed(2));
 }
 
+function ownLookup(obj, key, fallback = null) {
+  return obj && Object.hasOwn(obj, key) ? obj[key] : fallback;
+}
+
+const MAX_CSS_INPUT_CHARS = 100_000;
+const UNSAFE_ARBITRARY_VALUE_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"'<>`\\[\]{};:]/;
+
+function stripCssComments(cssText) {
+  let out = '';
+  let idx = 0;
+  const len = cssText.length;
+  while (idx < len) {
+    const openIdx = cssText.indexOf('/*', idx);
+    if (openIdx === -1) {
+      out += cssText.slice(idx);
+      break;
+    }
+    out += cssText.slice(idx, openIdx);
+    const closeIdx = cssText.indexOf('*/', openIdx + 2);
+    if (closeIdx === -1) {
+      break;
+    }
+    idx = closeIdx + 2;
+  }
+  return out;
+}
+
+function formatTailwindArbitraryValue(val) {
+  if (!val || val.length > 128 || UNSAFE_ARBITRARY_VALUE_RE.test(val)) {
+    return null;
+  }
+  const normalized = val.replace(/[ \t\r\n]+/g, '_');
+  if (!normalized || /\s/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
 const SPACING_PX_MAP = {
   '0': '0',
   '0px': '0',
@@ -269,6 +453,7 @@ const SPACING_PX_MAP = {
 function mapDeclarationToTailwind(prop, val) {
   const p = prop.toLowerCase().trim();
   const v = val.toLowerCase().trim().replace(/!important$/, '').trim();
+  if (!p || !v) return null;
 
   if (p === 'display') {
     const map = {
@@ -281,7 +466,7 @@ function mapDeclarationToTailwind(prop, val) {
       inline: 'inline',
       none: 'hidden'
     };
-    return map[v] || null;
+    return ownLookup(map, v);
   }
 
   if (p === 'flex-direction') {
@@ -291,12 +476,12 @@ function mapDeclarationToTailwind(prop, val) {
       column: 'flex-col',
       'column-reverse': 'flex-col-reverse'
     };
-    return map[v] || null;
+    return ownLookup(map, v);
   }
 
   if (p === 'flex-wrap') {
     const map = { wrap: 'flex-wrap', nowrap: 'flex-nowrap', 'wrap-reverse': 'flex-wrap-reverse' };
-    return map[v] || null;
+    return ownLookup(map, v);
   }
 
   if (p === 'align-items') {
@@ -309,7 +494,7 @@ function mapDeclarationToTailwind(prop, val) {
       stretch: 'items-stretch',
       baseline: 'items-baseline'
     };
-    return map[v] || null;
+    return ownLookup(map, v);
   }
 
   if (p === 'justify-content') {
@@ -323,14 +508,16 @@ function mapDeclarationToTailwind(prop, val) {
       'flex-end': 'justify-end',
       end: 'justify-end'
     };
-    return map[v] || null;
+    return ownLookup(map, v);
   }
 
   if (p === 'padding' || p === 'margin' || p === 'gap') {
     const prefix = p === 'padding' ? 'p' : p === 'margin' ? 'm' : 'gap';
     if (v === 'auto' && prefix === 'm') return 'm-auto';
-    if (SPACING_PX_MAP[v]) return `${prefix}-${SPACING_PX_MAP[v]}`;
-    return `${prefix}-[${v.replace(/\s+/g, '_')}]`;
+    const spacingToken = ownLookup(SPACING_PX_MAP, v);
+    if (spacingToken !== null) return `${prefix}-${spacingToken}`;
+    const safeArb = formatTailwindArbitraryValue(v);
+    return safeArb ? `${prefix}-[${safeArb}]` : null;
   }
 
   if (p === 'border-radius') {
@@ -351,7 +538,10 @@ function mapDeclarationToTailwind(prop, val) {
       '9999px': 'rounded-full',
       '50%': 'rounded-full'
     };
-    return map[v] || `rounded-[${v}]`;
+    const mapped = ownLookup(map, v);
+    if (mapped) return mapped;
+    const safeArb = formatTailwindArbitraryValue(v);
+    return safeArb ? `rounded-[${safeArb}]` : null;
   }
 
   if (p === 'font-weight') {
@@ -368,12 +558,12 @@ function mapDeclarationToTailwind(prop, val) {
       bold: 'font-bold',
       '800': 'font-extrabold'
     };
-    return map[v] || null;
+    return ownLookup(map, v);
   }
 
   if (p === 'text-align') {
     const map = { left: 'text-left', center: 'text-center', right: 'text-right', justify: 'text-justify' };
-    return map[v] || null;
+    return ownLookup(map, v);
   }
 
   if (p === 'position') {
@@ -384,14 +574,16 @@ function mapDeclarationToTailwind(prop, val) {
     if (v === '100%') return 'w-full';
     if (v === '100vw') return 'w-screen';
     if (v === 'auto') return 'w-auto';
-    return `w-[${v}]`;
+    const safeArb = formatTailwindArbitraryValue(v);
+    return safeArb ? `w-[${safeArb}]` : null;
   }
 
   if (p === 'height') {
     if (v === '100%') return 'h-full';
     if (v === '100vh') return 'h-screen';
     if (v === 'auto') return 'h-auto';
-    return `h-[${v}]`;
+    const safeArb = formatTailwindArbitraryValue(v);
+    return safeArb ? `h-[${safeArb}]` : null;
   }
 
   if (p === 'overflow') {
@@ -434,13 +626,14 @@ export function createFrontendEngine({ db } = {}) {
   function generateColorPalette({ base_hex = '#00e5ff', harmony = 'complementary' } = {}) {
     const baseRgb = parseHexColor(base_hex);
     const baseHsl = rgbToHsl(baseRgb.r, baseRgb.g, baseRgb.b);
+    const baseLightness = Number.isFinite(baseHsl.l) ? baseHsl.l : 50;
     const darkRef = parseHexColor('#0a0e17');
     const lightRef = parseHexColor('#ffffff');
 
     const lightnessStops = [
       { stop: 50, l: 92 },
       { stop: 200, l: 75 },
-      { stop: 500, l: baseHsl.l || 50 },
+      { stop: 500, l: baseLightness },
       { stop: 700, l: 34 },
       { stop: 900, l: 16 }
     ];
@@ -466,11 +659,14 @@ export function createFrontendEngine({ db } = {}) {
       complementary: [0, 180],
       analogous: [0, 30, 330],
       triadic: [0, 120, 240],
-      'split-complementary': [0, 150, 210]
+      'split-complementary': [0, 150, 210],
+      monochromatic: [0]
     };
-    const offsets = harmonyOffsets[harmony] || harmonyOffsets.complementary;
+    const harmonyKey = String(harmony || 'complementary').toLowerCase().trim();
+    const resolvedHarmony = Object.hasOwn(harmonyOffsets, harmonyKey) ? harmonyKey : 'complementary';
+    const offsets = harmonyOffsets[resolvedHarmony];
     const harmonySwatches = offsets.map((offset) => {
-      const rgb = hslToRgb((baseHsl.h + offset) % 360, baseHsl.s, baseHsl.l || 50);
+      const rgb = hslToRgb((baseHsl.h + offset) % 360, baseHsl.s, baseLightness);
       return {
         hue_offset: offset,
         hex: rgb.hex,
@@ -485,10 +681,10 @@ export function createFrontendEngine({ db } = {}) {
 
     return okEnvelope(
       'generate_color_palette',
-      `Generated 5-stop ${harmony} palette for ${baseRgb.hex} (WCAG dark ${againstDark}:1, light ${againstLight}:1)`,
+      `Generated 5-stop ${resolvedHarmony} palette for ${baseRgb.hex} (WCAG dark ${againstDark}:1, light ${againstLight}:1)`,
       {
         base_hex: baseRgb.hex,
-        harmony,
+        harmony: resolvedHarmony,
         rgb: { r: baseRgb.r, g: baseRgb.g, b: baseRgb.b },
         hsl: baseHsl,
         luminance: baseLum,
@@ -514,11 +710,14 @@ export function createFrontendEngine({ db } = {}) {
    * @param {string} [params.css='']
    */
   function cssToTailwind({ css = '' } = {}) {
-    const rawCss = String(css || '');
-    const stripped = rawCss
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/^[^{]*\{/, '')
-      .replace(/\}\s*$/, '');
+    const fullCss = String(css || '');
+    const rawCss = fullCss.length > MAX_CSS_INPUT_CHARS ? fullCss.slice(0, MAX_CSS_INPUT_CHARS) : fullCss;
+    const commentFree = stripCssComments(rawCss);
+    const openBraceIdx = commentFree.indexOf('{');
+    const closeBraceIdx = openBraceIdx !== -1 ? commentFree.lastIndexOf('}') : -1;
+    const stripped = openBraceIdx !== -1
+      ? commentFree.slice(openBraceIdx + 1, closeBraceIdx > openBraceIdx ? closeBraceIdx : commentFree.length)
+      : commentFree;
 
     const declarations = stripped
       .split(';')
@@ -619,7 +818,7 @@ export function createFrontendEngine({ db } = {}) {
    */
   function getCanonicalTemplate({ template_id } = {}) {
     const id = String(template_id || '').trim();
-    const tpl = CANONICAL_TEMPLATES[id];
+    const tpl = Object.hasOwn(CANONICAL_TEMPLATES, id) ? CANONICAL_TEMPLATES[id] : null;
     if (!tpl) {
       return okEnvelope(
         'get_canonical_template',
@@ -679,7 +878,8 @@ export function createFrontendEngine({ db } = {}) {
       }
     };
 
-    const preset = layoutClassesByType[type] || layoutClassesByType.grid;
+    const preset = ownLookup(layoutClassesByType, type, layoutClassesByType.grid);
+    const isGridPreset = preset === layoutClassesByType.grid;
     const breakpoints = [
       {
         name: 'mobile',
@@ -694,7 +894,7 @@ export function createFrontendEngine({ db } = {}) {
         label: '768px',
         width: 768,
         width_px: '768px',
-        columns: type === 'grid' ? 2 : 1,
+        columns: isGridPreset ? 2 : 1,
         classes: preset.tablet
       },
       {
@@ -702,7 +902,7 @@ export function createFrontendEngine({ db } = {}) {
         label: '1440px',
         width: 1440,
         width_px: '1440px',
-        columns: type === 'grid' ? 3 : 2,
+        columns: isGridPreset ? 3 : 2,
         classes: preset.desktop
       }
     ];

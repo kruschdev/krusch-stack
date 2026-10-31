@@ -569,7 +569,11 @@ export const ALL_STACK_TOOLS = [
       type: 'object',
       properties: {
         base_hex: { type: 'string', default: '#00e5ff' },
-        harmony: { type: 'string', enum: ['complementary', 'analogous', 'triadic', 'monochromatic'], default: 'complementary' }
+        harmony: {
+          type: 'string',
+          enum: ['complementary', 'analogous', 'triadic', 'split-complementary', 'monochromatic'],
+          default: 'complementary'
+        }
       }
     }
   }),
@@ -610,8 +614,8 @@ export const ALL_STACK_TOOLS = [
   defineTool({
     name: 'get_canonical_template',
     component: 'frontend',
-    title: 'Get Canonical HTML/SVG Component Template',
-    description: 'Retrieve a canonical HTML/SVG template (article-shell, footer-deadbolt, cyber-grid, deadbolt-svg, nav-back).',
+    title: 'Get Canonical HTML/SVG or Lego Starter Template',
+    description: 'Retrieve a canonical HTML/SVG or @krusch/toolkit & krusch_toolkit Lego starter template (article-shell, footer-deadbolt, cyber-grid, deadbolt-svg, nav-back, lego-node-api, lego-mcp-server, lego-sse-route, lego-react-shell, lego-fastapi-app, lego-cloudflare-worker, lego-webhook-route).',
     readOnlyHint: true,
     destructiveHint: false,
     idempotentHint: true,
@@ -619,7 +623,23 @@ export const ALL_STACK_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        template_id: { type: 'string', enum: ['article-shell', 'footer-deadbolt', 'cyber-grid', 'deadbolt-svg', 'nav-back'] }
+        template_id: {
+          type: 'string',
+          enum: [
+            'article-shell',
+            'footer-deadbolt',
+            'cyber-grid',
+            'deadbolt-svg',
+            'nav-back',
+            'lego-node-api',
+            'lego-mcp-server',
+            'lego-sse-route',
+            'lego-react-shell',
+            'lego-fastapi-app',
+            'lego-cloudflare-worker',
+            'lego-webhook-route'
+          ]
+        }
       },
       required: ['template_id']
     }
@@ -627,8 +647,8 @@ export const ALL_STACK_TOOLS = [
   defineTool({
     name: 'list_canonical_templates',
     component: 'frontend',
-    title: 'List Canonical Frontend Templates',
-    description: 'List all available canonical HTML/SVG component templates.',
+    title: 'List Canonical Frontend & Lego Templates',
+    description: 'List all available canonical HTML/SVG component templates and @krusch/toolkit & krusch_toolkit Lego starter bricks.',
     readOnlyHint: true,
     destructiveHint: false,
     idempotentHint: true,
@@ -796,7 +816,7 @@ export const ALL_STACK_TOOLS = [
 ];
 
 function resolveAllowedComponentSet({ profile = 'full', components, server } = {}) {
-  if (server && SERVER_TO_COMPONENT[server]) {
+  if (server && Object.hasOwn(SERVER_TO_COMPONENT, server)) {
     return new Set([SERVER_TO_COMPONENT[server]]);
   }
   if (Array.isArray(components) && components.length > 0) {
