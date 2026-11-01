@@ -72,12 +72,13 @@ curl http://127.0.0.1:3780/health
 
 ### 📊 Verified Third-Party Benchmarks Across Pillars
 
-> 📄 **Full Cross-Stack Comparison, Honest Gaps & Reproduction Gates**: Read **[`BENCHMARKS.md`](./BENCHMARKS.md)** for the complete comparison against open-source wrapper stacks and commercial cloud stacks (`past.dev`, `NotDiamond`, `Martian`, OpenAI + Cohere) across **`317,000+` queries**, our **`68/68` SHA-256 clean-room verification gates**, open/staged upstream PR disclosures (`RouterArena` PR #169, `withmartian/routerbench`, `AgentDojo`), and where frontier cloud models still lead.
+> 📄 **Full Cross-Stack Comparison, Honest Gaps & Reproduction Gates**: Read **[`BENCHMARKS.md`](./BENCHMARKS.md)** for the complete comparison against open-source wrapper stacks and commercial cloud stacks (`past.dev`, `Mem0`, `Honcho`, `NotDiamond`, `Martian`, OpenAI + Cohere) across **`317,500+` queries and multi-turn episodes**, our **`73/73` SHA-256 clean-room verification gates** across `11` external suites, open/queued upstream submissions (`DolphinBench`, `RouterArena` PR #169, `withmartian/routerbench`), and where frontier cloud models still lead.
 
 | Stack Pillar | Official External Benchmark | Verified Result (Hermetic Open-Weights) |
 | :--- | :--- | :--- |
 | **Security & Policy Floor** | **ETH SpyLab AgentDojo v1.2.2 (`1,046` Eps, `949` Attacks)** | **`0.00%` Targeted ASR (`0/949`, `100%` Defense)** vs. `19.28%` raw ASR (`57.14%` `slack`, `52.78%` `banking`) · **`69.07%` Benign** (Spotlighting) & **`83` hardline floor blocks** |
 | **Tier 1 (`krusch-context-mcp`)** | **ICLR 2026 BEAM (`100K`–`10M` tok, `2,000/2,000` Qs)** | **`92.58%` (`100K`) & `93.00%` (`10M` IE) Recall** (`78.67%` 4-split weighted); zero E2E drop `100K`→`1M` (`72.86%`); beats cloud `past.dev` on Contradiction Resolution (`4/4` splits) & `10M` Multi-Session Reasoning |
+| **Agentic Memory & Execution** | **Official DolphinBench (`600` Tasks, `13,539` Sessions / `1.5M` Tok)** | **`42.67%` (`256/600`, `85.73%` Mech) `30B` Wave-4 @ `$0.00`** (`gpt-5.6-sol` Judge, `5/5` queued on `dolphinbench.ai`): beats `MiniMax M3 + Hindsight` (`41.00%` @ `$158.33`) & `Claude Sonnet 5 + Honcho` (`35.83%` @ `$1,565.82`); **`+7.33 pp`** over raw turns; **`15.7x`** `8B` lift (`18.33%`) |
 | **Tier 2A (`krusch-git`)** | **ACL 2025 CoIR (`2.39M` Docs, `162,216` Qs) & RepoBench-R (`47,998` Qs)** | **`56.40%` `#1` CoIR 10-Task `NDCG@10` (`73.88%` `R@10` > `Voyage-Code-002` `56.26%`)** · **RepoBench-R `19.12%` Macro `Acc@1` / `68.58%` `Acc@5`** (beats `CodeBERT` & `UniXcoder`) |
 | **Tier 2B / Evidentiary (`krusch-nexus`)** | **LegalBench-RAG (`714` Docs, `6,889` Full / `776` Mini Qs)** | **`26.74%` Macro F1 (`k=1`) & `25.81%` F1 / `44.72%` Recall (`k=2`)** (`47.71%` R@6; `+128.5%` / `2.29x` F1 vs. fixed dense; `33.95%` `MAUD` R@2 > OpenAI `3-large` + Cohere R@64 `28.28%`) |
 | **Tier 3 (`krusch-coding-harness`)** | **Aider Polyglot (`225/225`) & BIRD-SQL Mini-Dev (`500/500`)** | **Polyglot `19.56%` → `51.56%` `Pass@2` (`2.64x`, ties `Claude 3.5 Sonnet`)** · **BIRD-SQL `26.00%` → `40.20%` EX (`1.55x`, `100%` valid SQL, `0.09` retries/q)** |
@@ -161,16 +162,18 @@ const dagCheck = stack.resilience.verifyTrajectoryDag({
 
 ---
 
-## 🤗 Open-Weights Models & SFT Dataset (Trained Through `krusch-stack`)
+## 🤗 Open-Weights Models, SFT+DPO Dataset & Benchmarks (Trained Through `krusch-stack`)
 
-We use `krusch-stack` to generate AST-grounded 11-phase code audit trajectories and unit-test-verified (`npm test` / `pytest`, exit `0`) bug remediations, then distill them back into open-weights QLoRA adapters for the `L2` and `L2.5` Cascade Router tiers:
+We use `krusch-stack` to generate AST-grounded 11-phase code audit trajectories, unit-test-verified (`npm test` / `pytest`, exit `0`) bug remediations, `@krusch/toolkit` Lego-First idioms, and multi-turn MCP/workspace tool-calling + DPO calibration pairs, then distill them back into open-weights Wave-4 adapters across `L1.5`, `L2`, and `L2.5`:
 
 | Resource | Hugging Face / GitHub | Cascade Role / Base Model |
 |----------|-----------------------|---------------------------|
 | **Jean SRE Daemon (`jean-sre`)** | [`kruschdev/Jean-SRE-by-kruschdev`](https://github.com/kruschdev/Jean-SRE-by-kruschdev) | Autonomous 24/7 11-Phase Code Auditor, Test-Gated Remediator & Distillation Harness |
-| **SFT Dataset (`17,899` rows)** | [`krush420/sovereign-code-audit-sft`](https://huggingface.co/datasets/krush420/sovereign-code-audit-sft) | 3 Splits: `argon_golden_remediations` (`401`), `elitist_120b_teacher` (`2,208`), `code_audit_11phase_sft` (`15,290`) |
-| **30B Student QLoRA (`L2`)** | [`krush420/qwen3-coder-30b-sre-lora`](https://huggingface.co/krush420/qwen3-coder-30b-sre-lora) | [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) (`30.5B` total / `3.3B` active MoE) |
-| **120B Teacher QLoRA (`L2.5`)** | [`krush420/gpt-oss-120b-sre-lora`](https://huggingface.co/krush420/gpt-oss-120b-sre-lora) | [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) (`116.8B` total / `5.1B` active MXFP4 MoE) |
+| **SFT + DPO Dataset (`18,131` rows)** | [`krush420/sovereign-code-audit-sft`](https://huggingface.co/datasets/krush420/sovereign-code-audit-sft) | 7 Zero-Leak Splits: `code_audit_11phase_sft` (`15,290`), `elitist_120b_teacher` (`2,308`), `argon_golden_remediations` (`401`), `agentic_tool_calling_sft` (`64`), `lego_and_referee_calibration_sft` (`38`), `agentic_tool_calling_dpo` (`18`), `referee_calibration_dpo` (`12`) |
+| **8B Edge Agent & Referee LoRA (`L1.5`)** | [`krush420/llama3-hermes3-8b-sre-lora`](https://huggingface.co/krush420/llama3-hermes3-8b-sre-lora) | [`NousResearch/Hermes-3-Llama-3.1-8B`](https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B) (Built with Meta Llama 3 · BF16 LoRA + DPO, `15.7x` DolphinBench lift) |
+| **30B Student QLoRA (`L2`)** | [`krush420/qwen3-coder-30b-sre-lora`](https://huggingface.co/krush420/qwen3-coder-30b-sre-lora) | [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) (`30.5B` total / `3.3B` active MoE · `42.67%` [`256/600`] DolphinBench @ `$0.00`) |
+| **120B Teacher QLoRA (`L2.5`)** | [`krush420/gpt-oss-120b-sre-lora`](https://huggingface.co/krush420/gpt-oss-120b-sre-lora) | [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) (`116.8B` total / `5.1B` active MXFP4 MoE · `39.50%` [`237/600`] DolphinBench) |
+| **Hermetic Benchmarks (`73/73` Gates)** | [`krush420/sovereign-g4-benchmarks`](https://huggingface.co/datasets/krush420/sovereign-g4-benchmarks) · [`Arena`](https://huggingface.co/spaces/krush420/sovereign-router-arena) | `317,581+` queries/episodes across `11` suites, `26` SHA-256 raw audit logs, and `14` viewer splits |
 
 ---
 
