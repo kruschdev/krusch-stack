@@ -3,12 +3,16 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
 [![Node.js >= 22](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org)
 [![MCP Compatible](https://img.shields.io/badge/MCP-39%20Tools-blueviolet.svg)](https://modelcontextprotocol.io)
+[![DolphinBench #1 Overall](https://img.shields.io/badge/DolphinBench-%231%20Overall%2089.17%25%20(%2424.57)-00e5ff.svg)](https://krusch.dev/articles/return-on-memory-dolphinbench.html)
+[![Zero-Cloud Floor](https://img.shields.io/badge/Local%2030B%20DolphinBench-42.67%25%20(%240.00)-brightgreen.svg)](https://krusch.dev/articles/what-dolphinbench-taught-us-about-local-ai.html)
 
 **The Unified Sovereign AI & Coding Agent Stack.**
 
 `krusch-stack` combines all 7 pillars of the Krusch developer ecosystem into a **single zero-setup `npx` command** (backed by Node 22 native `node:sqlite`) and a **one-command `docker compose up -d` stack** (backed by `pgvector/pgvector:pg16`).
 
 Instead of installing, configuring, and wiring 7 separate repositories across Claude Code, Cursor, Windsurf, or Antigravity, one command installs the entire stack.
+
+> 🏆 **Official `DolphinBench` (`600/600` Multi-App Tasks, `13,539` Sessions)**: Pairing `Gemini 4 Argon` with our byte-identical `0o444` frozen `$0.00` `SovereignMemoryStore` (`node:sqlite` Zero-LLM Raw-RAG + 4-Way RRF) achieves **`#1 Overall` at `89.17%` (`535/600` @ `$24.57`)**—**`+18.50 pp` (`+111` tasks)** above Official `#1` `Hermes + GPT 5.6 Luna + Mem0` (`70.67%` @ `$96.21`) at **`~4x` lower cost** (`92.33%` `Oracle@7`, `3.88x` `LBF=4+` multiplier; Argon Submission UUID `29389157-b01b-42b5-8193-17d9a496f580`), while local `Qwen3-Coder-30B-A3B` Wave-4 QLoRA+DPO establishes a **`$0.00` zero-cloud floor at `42.67%` (`256/600`, `85.73%` mechanical checks)**, outperforming cloud stacks up to `$1,830.57` (`6/6` verified archives `status: "queued"` on `dolphinbench.ai`). Read [**Paper #27 — Return on Memory**](https://krusch.dev/articles/return-on-memory-dolphinbench.html) ([**PDF**](https://krusch.dev/papers/return-on-memory-dolphinbench.pdf)) and [**Paper #26 — What DolphinBench Taught Us About Local AI**](https://krusch.dev/articles/what-dolphinbench-taught-us-about-local-ai.html).
 
 ---
 
@@ -72,13 +76,13 @@ curl http://127.0.0.1:3780/health
 
 ### 📊 Verified Third-Party Benchmarks Across Pillars
 
-> 📄 **Full Cross-Stack Comparison, Honest Gaps & Reproduction Gates**: Read **[`BENCHMARKS.md`](./BENCHMARKS.md)** for the complete comparison against open-source wrapper stacks and commercial cloud stacks (`past.dev`, `Mem0`, `Honcho`, `NotDiamond`, `Martian`, OpenAI + Cohere) across **`317,500+` queries and multi-turn episodes**, our **`73/73` SHA-256 clean-room verification gates** across `11` external suites, open/queued upstream submissions (`DolphinBench`, `RouterArena` PR #169, `withmartian/routerbench`), and where frontier cloud models still lead.
+> 📄 **Full Cross-Stack Comparison, Honest Gaps & Reproduction Gates**: Read **[`BENCHMARKS.md`](./BENCHMARKS.md)** for the complete comparison against open-source wrapper stacks and commercial cloud stacks (`past.dev`, `Mem0`, `Honcho`, `NotDiamond`, `Martian`, OpenAI + Cohere) across **`317,500+` queries and multi-turn episodes**, our **`73/73` SHA-256 clean-room verification gates** across `11` external suites (`29` raw JSON audit logs), open/queued upstream submissions (`DolphinBench` `6/6` queued, `RouterArena` PR #169, `withmartian/routerbench`), and where frontier cloud models still lead.
 
-| Stack Pillar | Official External Benchmark | Verified Result (Hermetic Open-Weights) |
+| Stack Pillar | Official External Benchmark | Verified Result (Sovereign Hybrid & Hermetic Open-Weights) |
 | :--- | :--- | :--- |
 | **Security & Policy Floor** | **ETH SpyLab AgentDojo v1.2.2 (`1,046` Eps, `949` Attacks)** | **`0.00%` Targeted ASR (`0/949`, `100%` Defense)** vs. `19.28%` raw ASR (`57.14%` `slack`, `52.78%` `banking`) · **`69.07%` Benign** (Spotlighting) & **`83` hardline floor blocks** |
 | **Tier 1 (`krusch-context-mcp`)** | **ICLR 2026 BEAM (`100K`–`10M` tok, `2,000/2,000` Qs)** | **`92.58%` (`100K`) & `93.00%` (`10M` IE) Recall** (`78.67%` 4-split weighted); zero E2E drop `100K`→`1M` (`72.86%`); beats cloud `past.dev` on Contradiction Resolution (`4/4` splits) & `10M` Multi-Session Reasoning |
-| **Agentic Memory & Execution** | **Official DolphinBench (`600` Tasks, `13,539` Sessions / `1.5M` Tok)** | **`42.67%` (`256/600`, `85.73%` Mech) `30B` Wave-4 @ `$0.00`** (`gpt-5.6-sol` Judge, `5/5` queued on `dolphinbench.ai`): beats `MiniMax M3 + Hindsight` (`41.00%` @ `$158.33`) & `Claude Sonnet 5 + Honcho` (`35.83%` @ `$1,565.82`); **`+7.33 pp`** over raw turns; **`15.7x`** `8B` lift (`18.33%`) |
+| **Agentic Memory & Execution** | **Official DolphinBench (`600/600`, `13,539` Sessions / `1.5M` Tok)** | **`#1 Overall` `89.17%` (`535/600` @ `$24.57`)** with `Gemini 4 Argon` over byte-identical `0o444` frozen `$0.00` `SovereignMemoryStore` (**`+18.50 pp` / `+111` tasks** > `#1` `Hermes + GPT 5.6 Luna + Mem0` `70.67%` @ `$96.21`, **`~4x` lower cost**, `92.33%` `Oracle@7`, `3.88x` `LBF=4+`; UUID `29389157-b01b-42b5-8193-17d9a496f580`) · **`42.67%` (`256/600`, `85.73%` Mech @ `$0.00`)** local `Qwen3-Coder-30B-A3B` Wave-4 (`39.50%` `120B` Wave-4; `38.50%` `80B` Stock; `18.33%` `8B` Wave-4 = `15.7x` lift), beating cloud stacks up to `$1,830.57` (`6/6` queued on `dolphinbench.ai`; [Paper #27](https://krusch.dev/articles/return-on-memory-dolphinbench.html) · [PDF](https://krusch.dev/papers/return-on-memory-dolphinbench.pdf) · [Paper #26](https://krusch.dev/articles/what-dolphinbench-taught-us-about-local-ai.html)) |
 | **Tier 2A (`krusch-git`)** | **ACL 2025 CoIR (`2.39M` Docs, `162,216` Qs) & RepoBench-R (`47,998` Qs)** | **`56.40%` `#1` CoIR 10-Task `NDCG@10` (`73.88%` `R@10` > `Voyage-Code-002` `56.26%`)** · **RepoBench-R `19.12%` Macro `Acc@1` / `68.58%` `Acc@5`** (beats `CodeBERT` & `UniXcoder`) |
 | **Tier 2B / Evidentiary (`krusch-nexus`)** | **LegalBench-RAG (`714` Docs, `6,889` Full / `776` Mini Qs)** | **`26.74%` Macro F1 (`k=1`) & `25.81%` F1 / `44.72%` Recall (`k=2`)** (`47.71%` R@6; `+128.5%` / `2.29x` F1 vs. fixed dense; `33.95%` `MAUD` R@2 > OpenAI `3-large` + Cohere R@64 `28.28%`) |
 | **Tier 3 (`krusch-coding-harness`)** | **Aider Polyglot (`225/225`) & BIRD-SQL Mini-Dev (`500/500`)** | **Polyglot `19.56%` → `51.56%` `Pass@2` (`2.64x`, ties `Claude 3.5 Sonnet`)** · **BIRD-SQL `26.00%` → `40.20%` EX (`1.55x`, `100%` valid SQL, `0.09` retries/q)** |
@@ -158,7 +162,7 @@ const dagCheck = stack.resilience.verifyTrajectoryDag({
 });
 ```
 
-> 📖 **Architecture Deep-Dive**: Read [**Paper #23 — The 15 Production Agentic Systems: Reference Architecture, State-Machine Invariants, and Benchmark Proofs Across a Sovereign Stack**](https://krusch.dev/articles/fifteen-production-agent-systems).
+> 📖 **Architecture & Benchmark Whitepapers**: Read [**Paper #27 — Return on Memory (`#1` Official DolphinBench `89.17%`)**](https://krusch.dev/articles/return-on-memory-dolphinbench.html) ([**PDF**](https://krusch.dev/papers/return-on-memory-dolphinbench.pdf)), [**Paper #26 — What DolphinBench Taught Us About Local AI**](https://krusch.dev/articles/what-dolphinbench-taught-us-about-local-ai.html), and [**Paper #23 — The 15 Production Agentic Systems**](https://krusch.dev/articles/fifteen-production-agent-systems).
 
 ---
 
@@ -170,10 +174,10 @@ We use `krusch-stack` to generate AST-grounded 11-phase code audit trajectories,
 |----------|-----------------------|---------------------------|
 | **Jean SRE Daemon (`jean-sre`)** | [`kruschdev/Jean-SRE-by-kruschdev`](https://github.com/kruschdev/Jean-SRE-by-kruschdev) | Autonomous 24/7 11-Phase Code Auditor, Test-Gated Remediator & Distillation Harness |
 | **SFT + DPO Dataset (`18,131` rows)** | [`krush420/sovereign-code-audit-sft`](https://huggingface.co/datasets/krush420/sovereign-code-audit-sft) | 7 Zero-Leak Splits: `code_audit_11phase_sft` (`15,290`), `elitist_120b_teacher` (`2,308`), `argon_golden_remediations` (`401`), `agentic_tool_calling_sft` (`64`), `lego_and_referee_calibration_sft` (`38`), `agentic_tool_calling_dpo` (`18`), `referee_calibration_dpo` (`12`) |
-| **8B Edge Agent & Referee LoRA (`L1.5`)** | [`krush420/llama3-hermes3-8b-sre-lora`](https://huggingface.co/krush420/llama3-hermes3-8b-sre-lora) | [`NousResearch/Hermes-3-Llama-3.1-8B`](https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B) (Built with Meta Llama 3 · BF16 LoRA + DPO, `15.7x` DolphinBench lift) |
+| **8B Edge Agent & Referee LoRA (`L1.5`)** | [`krush420/llama3-hermes3-8b-sre-lora`](https://huggingface.co/krush420/llama3-hermes3-8b-sre-lora) | [`NousResearch/Hermes-3-Llama-3.1-8B`](https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B) (Built with Meta Llama 3 · BF16 LoRA + DPO, `18.33%` [`110/600`] = `15.7x` DolphinBench lift) |
 | **30B Student QLoRA (`L2`)** | [`krush420/qwen3-coder-30b-sre-lora`](https://huggingface.co/krush420/qwen3-coder-30b-sre-lora) | [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) (`30.5B` total / `3.3B` active MoE · `42.67%` [`256/600`] DolphinBench @ `$0.00`) |
-| **120B Teacher QLoRA (`L2.5`)** | [`krush420/gpt-oss-120b-sre-lora`](https://huggingface.co/krush420/gpt-oss-120b-sre-lora) | [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) (`116.8B` total / `5.1B` active MXFP4 MoE · `39.50%` [`237/600`] DolphinBench) |
-| **Hermetic Benchmarks (`73/73` Gates)** | [`krush420/sovereign-g4-benchmarks`](https://huggingface.co/datasets/krush420/sovereign-g4-benchmarks) · [`Arena`](https://huggingface.co/spaces/krush420/sovereign-router-arena) | `317,581+` queries/episodes across `11` suites, `26` SHA-256 raw audit logs, and `14` viewer splits |
+| **120B Teacher QLoRA (`L2.5`)** | [`krush420/gpt-oss-120b-sre-lora`](https://huggingface.co/krush420/gpt-oss-120b-sre-lora) | [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) (`116.8B` total / `5.1B` active MXFP4 MoE · `39.50%` [`237/600`] DolphinBench @ `$0.00`) |
+| **Hermetic Benchmarks (`73/73` Gates)** | [`krush420/sovereign-g4-benchmarks`](https://huggingface.co/datasets/krush420/sovereign-g4-benchmarks) · [`Arena`](https://huggingface.co/spaces/krush420/sovereign-router-arena) | `317,581+` queries/episodes across `11` suites (`#1` Official DolphinBench `89.17%` Argon + `7`-run `4,200`-trace matrix), `29` SHA-256 raw JSON audit logs, and `14` viewer splits |
 
 ---
 
