@@ -306,6 +306,31 @@ export function startHttpGateway(options = {}) {
       return;
     }
 
+    if (req.method === 'POST' && url.pathname.startsWith('/action-harness/')) {
+      const action = url.pathname.slice('/action-harness/'.length);
+      readBoundedJson()
+        .then(({ parsed }) => {
+          const actionMap = {
+            start: () => stack.actionHarness.startSession(parsed),
+            intercept: () => stack.actionHarness.interceptToolCall(parsed),
+            outcome: () => stack.actionHarness.recordToolOutcome(parsed),
+            'verify-stop': () => stack.actionHarness.verifyStop(parsed),
+            summary: () => stack.actionHarness.sessionSummary(parsed)
+          };
+          const handler = actionMap[action];
+          if (!handler) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ ok: false, error: `Unknown action-harness action: ${action}` }));
+            return;
+          }
+          const result = handler();
+          res.writeHead(result.ok ? 200 : 400);
+          res.end(JSON.stringify(result, null, 2));
+        })
+        .catch(sendGatewayError);
+      return;
+    }
+
     res.writeHead(404);
     res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
   });

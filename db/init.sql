@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS fs_page_memories (
 CREATE INDEX IF NOT EXISTS idx_fs_page_memories_path
   ON fs_page_memories(file_path, page_number);
 
--- Tier 3: krusch-harness Staged 2PC Tasks
+-- Tier 3: krusch-harness Staged 2PC Tasks & Durable Apply Journal
 CREATE TABLE IF NOT EXISTS harness_tasks (
   task_id TEXT PRIMARY KEY,
   goal TEXT NOT NULL,
@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS harness_tasks (
   files_json TEXT NOT NULL DEFAULT '[]',
   invariant_findings_json TEXT NOT NULL DEFAULT '[]',
   explanation TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS harness_apply_journal (
+  task_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('APPLYING', 'APPLIED', 'ROLLED_BACK', 'RECOVERY_PENDING')),
+  entries_json TEXT NOT NULL DEFAULT '[]',
+  last_error TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -133,3 +142,79 @@ CREATE TABLE IF NOT EXISTS workspace_files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_workspace_files_embedding_hnsw ON workspace_files USING hnsw (embedding vector_cosine_ops);
+
+-- Resilience Engine: Async HITL Lease Gates & Non-Blocking Shadow Runs
+CREATE TABLE IF NOT EXISTS stack_hitl_gates (
+  gate_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  staged_payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at_ms BIGINT NOT NULL,
+  expires_at_ms BIGINT NOT NULL,
+  decided_at_ms BIGINT,
+  reviewer TEXT,
+  decision_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_stack_hitl_gates_task_status
+  ON stack_hitl_gates(task_id, status);
+
+CREATE TABLE IF NOT EXISTS stack_shadow_runs (
+  comparison_id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL,
+  primary_model TEXT NOT NULL,
+  shadow_model TEXT NOT NULL,
+  sequence_similarity DOUBLE PRECISION NOT NULL,
+  exact_dag_match INTEGER NOT NULL,
+  latency_delta_ms DOUBLE PRECISION NOT NULL,
+  cost_delta_usd DOUBLE PRECISION NOT NULL,
+  created_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stack_shadow_runs_request
+  ON stack_shadow_runs(request_id, created_at_ms);
+
+-- INV-STACK-10: 2PC Tool-Action Harness, Trajectory Spin-Loop Guard & Verify-on-Stop Gate
+CREATE TABLE IF NOT EXISTS action_harness_sessions (
+  session_id TEXT PRIMARY KEY,
+  persona TEXT NOT NULL DEFAULT '',
+  goal TEXT NOT NULL,
+  anchor_date TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
+  max_identical_reads INTEGER NOT NULL DEFAULT 1,
+  max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
+  max_read_streak INTEGER NOT NULL DEFAULT 6,
+  max_verify_nudges INTEGER NOT NULL DEFAULT 1,
+  enforce_context_nudge INTEGER NOT NULL DEFAULT 0,
+  consecutive_app_reads INTEGER NOT NULL DEFAULT 0,
+  committed_reads INTEGER NOT NULL DEFAULT 0,
+  committed_mutations INTEGER NOT NULL DEFAULT 0,
+  verify_nudges_used INTEGER NOT NULL DEFAULT 0,
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS action_harness_events (
+  event_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  step INTEGER NOT NULL DEFAULT 0,
+  tool_name TEXT NOT NULL,
+  is_mutating INTEGER NOT NULL DEFAULT 0,
+  is_memory_search INTEGER NOT NULL DEFAULT 0,
+  canonical_args_json TEXT NOT NULL,
+  call_signature TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  status TEXT NOT NULL,
+  issues_json TEXT NOT NULL DEFAULT '[]',
+  result_preview TEXT NOT NULL DEFAULT '',
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_harness_events_sig
+  ON action_harness_events(session_id, call_signature);
+
+CREATE INDEX IF NOT EXISTS idx_action_harness_events_session_time
+  ON action_harness_events(session_id, created_at_ms);

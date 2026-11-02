@@ -51,13 +51,19 @@ import {
   estimateTokenCount,
   RESILIENCE_SCHEMA_SQL
 } from './engines/resilience-engine.js';
+import {
+  createActionHarnessEngine,
+  classifyToolMutability,
+  canonicalizeToolCallKey,
+  ACTION_HARNESS_SCHEMA_SQL
+} from './engines/action-harness-engine.js';
 import { generateIdeConfig, writeIdeConfigs, IDE_CONFIG_PATHS } from './installer/ide-config.js';
 import { runStackDoctor } from './installer/doctor.js';
 
 export const VERSION = '1.0.0';
 
 /**
- * Create a unified KruschStack instance with all 7 component engines + production resilience engine wired to a shared SQLite/Postgres substrate.
+ * Create a unified KruschStack instance with all 7 component engines + production resilience & 2PC action-harness engines wired to a shared SQLite/Postgres substrate.
  * @param {object} [options]
  * @param {string} [options.workspaceRoot]
  * @param {string} [options.dbPath]
@@ -102,6 +108,7 @@ export function createKruschStack(options = {}) {
   const workspace = createWorkspaceEngine({ db, workspaceRoot });
   const router = createRouterEngine({ config: options.routerConfig });
   const resilience = createResilienceEngine({ db });
+  const actionHarness = createActionHarnessEngine({ db, contextEngine: context });
 
   const engines = {
     context,
@@ -111,7 +118,8 @@ export function createKruschStack(options = {}) {
     frontend,
     workspace,
     router,
-    resilience
+    resilience,
+    actionHarness
   };
 
   return {
@@ -128,6 +136,7 @@ export function createKruschStack(options = {}) {
     workspace,
     router,
     resilience,
+    actionHarness,
     doctor: () => runStackDoctor({ workspaceRoot, db, profile }),
     status: () => router.getStackStatus({ engines })
   };
@@ -140,6 +149,7 @@ export {
   okEnvelope,
   STACK_SCHEMA_SQL,
   RESILIENCE_SCHEMA_SQL,
+  ACTION_HARNESS_SCHEMA_SQL,
   createContextEngine,
   packStackTokenBudget,
   prunePreRetrieval,
@@ -168,6 +178,9 @@ export {
   createRouterEngine,
   createResilienceEngine,
   estimateTokenCount,
+  createActionHarnessEngine,
+  classifyToolMutability,
+  canonicalizeToolCallKey,
   generateIdeConfig,
   writeIdeConfigs,
   IDE_CONFIG_PATHS,
