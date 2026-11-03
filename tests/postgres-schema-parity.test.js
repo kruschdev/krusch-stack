@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { STACK_SCHEMA_SQL } from '../src/db/sqlite.js';
 import { RESILIENCE_SCHEMA_SQL } from '../src/engines/resilience-engine.js';
+import { GROUNDED_HARNESS_SCHEMA_SQL } from '../src/engines/grounded-harness-engine.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,7 +27,9 @@ const REQUIRED_POSTGRES_TABLES = [
   'stack_hitl_gates',
   'stack_shadow_runs',
   'action_harness_sessions',
-  'action_harness_events'
+  'action_harness_events',
+  'grounded_sessions',
+  'grounded_events'
 ];
 
 /**
@@ -297,7 +300,7 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
     }
   });
 
-  test('All 14 core, journal, resilience, and INV-STACK-10 action-harness tables and indexes match SQLite parity', () => {
+  test('All 16 core, journal, resilience, INV-STACK-10 action-harness, and INV-STACK-11 grounded-harness tables and indexes match SQLite parity', () => {
     for (const tableName of REQUIRED_POSTGRES_TABLES) {
       assert.ok(pgTables.has(tableName), `Missing required PostgreSQL table: ${tableName}`);
     }
@@ -395,11 +398,35 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
       ]
     );
 
+    // 4. Cross-check INV-STACK-11 Grounded Harness tables & types
+    const sqliteGroundedTables = extractTableColumns(GROUNDED_HARNESS_SCHEMA_SQL);
+    for (const [tableName, sqliteCols] of sqliteGroundedTables.entries()) {
+      const pgCols = pgTables.get(tableName);
+      assert.ok(pgCols, `Grounded harness table ${tableName} missing from db/init.sql`);
+      assert.deepEqual([...pgCols.keys()], [...sqliteCols.keys()]);
+    }
+
+    const groundedSessionCols = pgTables.get('grounded_sessions');
+    assert.equal(groundedSessionCols.get('session_id'), 'TEXT PRIMARY KEY');
+    assert.equal(
+      groundedSessionCols.get('schema_reduction_pct'),
+      'DOUBLE PRECISION NOT NULL DEFAULT 0'
+    );
+    assert.equal(groundedSessionCols.get('created_at_ms'), 'BIGINT NOT NULL');
+    assert.equal(groundedSessionCols.get('updated_at_ms'), 'BIGINT NOT NULL');
+
+    const groundedEventCols = pgTables.get('grounded_events');
+    assert.equal(groundedEventCols.get('event_id'), 'TEXT PRIMARY KEY');
+    assert.equal(groundedEventCols.get('created_at_ms'), 'BIGINT NOT NULL');
+    assert.equal(groundedEventCols.get('updated_at_ms'), 'BIGINT NOT NULL');
+
     const requiredIndexes = [
       ['idx_stack_hitl_gates_task_status', 'stack_hitl_gates', '(task_id, status)'],
       ['idx_stack_shadow_runs_request', 'stack_shadow_runs', '(request_id, created_at_ms)'],
       ['idx_action_harness_events_sig', 'action_harness_events', '(session_id, call_signature)'],
-      ['idx_action_harness_events_session_time', 'action_harness_events', '(session_id, created_at_ms)']
+      ['idx_action_harness_events_session_time', 'action_harness_events', '(session_id, created_at_ms)'],
+      ['idx_grounded_events_sig', 'grounded_events', '(session_id, call_signature)'],
+      ['idx_grounded_events_session_time', 'grounded_events', '(session_id, created_at_ms)']
     ];
 
     for (const [idxName, tblName, colTuple] of requiredIndexes) {

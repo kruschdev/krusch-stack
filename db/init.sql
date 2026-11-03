@@ -218,3 +218,60 @@ CREATE INDEX IF NOT EXISTS idx_action_harness_events_sig
 
 CREATE INDEX IF NOT EXISTS idx_action_harness_events_session_time
   ON action_harness_events(session_id, created_at_ms);
+
+-- INV-STACK-11: Turn-0 Grounded, Scale-Aware, Defect-Only Harness
+CREATE TABLE IF NOT EXISTS grounded_sessions (
+  session_id TEXT PRIMARY KEY,
+  goal TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  scale_tier TEXT NOT NULL,
+  scale_profile_json TEXT NOT NULL,
+  anchor_date TEXT NOT NULL DEFAULT '',
+  prefix_hash TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
+  max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
+  seen_chunks_json TEXT NOT NULL DEFAULT '[]',
+  file_digests_json TEXT NOT NULL DEFAULT '{}',
+  schema_tokens_saved INTEGER NOT NULL DEFAULT 0,
+  schema_reduction_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+  turn0_tokens INTEGER NOT NULL DEFAULT 0,
+  exploratory_reads INTEGER NOT NULL DEFAULT 0,
+  committed_reads INTEGER NOT NULL DEFAULT 0,
+  committed_mutations INTEGER NOT NULL DEFAULT 0,
+  memoized_reads INTEGER NOT NULL DEFAULT 0,
+  spin_loops_blocked INTEGER NOT NULL DEFAULT 0,
+  output_defects_caught INTEGER NOT NULL DEFAULT 0,
+  timeouts_with_partial_stdout INTEGER NOT NULL DEFAULT 0,
+  turn0_duplicates_suppressed INTEGER NOT NULL DEFAULT 0,
+  duplicate_writes_blocked INTEGER NOT NULL DEFAULT 0,
+  policy_floor_blocks INTEGER NOT NULL DEFAULT 0,
+  truncation_recoveries INTEGER NOT NULL DEFAULT 0,
+  verify_nudges_used INTEGER NOT NULL DEFAULT 0,
+  pending_diffs_count INTEGER NOT NULL DEFAULT 0,
+  latest_verification_passed INTEGER NOT NULL DEFAULT 1,
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS grounded_events (
+  event_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  step INTEGER NOT NULL DEFAULT 0,
+  tool_name TEXT NOT NULL,
+  is_mutating INTEGER NOT NULL DEFAULT 0,
+  is_foraging INTEGER NOT NULL DEFAULT 0,
+  canonical_args_json TEXT NOT NULL,
+  call_signature TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  status TEXT NOT NULL,
+  issues_json TEXT NOT NULL DEFAULT '[]',
+  result_preview TEXT NOT NULL DEFAULT '',
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_grounded_events_sig
+  ON grounded_events(session_id, call_signature);
+
+CREATE INDEX IF NOT EXISTS idx_grounded_events_session_time
+  ON grounded_events(session_id, created_at_ms);

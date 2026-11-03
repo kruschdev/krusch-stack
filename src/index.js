@@ -57,13 +57,29 @@ import {
   canonicalizeToolCallKey,
   ACTION_HARNESS_SCHEMA_SQL
 } from './engines/action-harness-engine.js';
+import {
+  GROUNDED_HARNESS_SCHEMA_SQL,
+  SCALE_TIERS,
+  inferModelScaleMetadata,
+  resolveScaleProfile,
+  buildScaleAwareDirective,
+  buildSafeGeminiToolConfig,
+  normalizeCodeSnippetForHash,
+  canonicalizeGroundedToolCallKey,
+  inspectOutputDefects,
+  formatTimeoutWithPartialStdout,
+  execCommandWithPartialStdout,
+  introspectWorkspaceSchemas,
+  compileTurnZeroGrounding,
+  createGroundedHarnessEngine
+} from './engines/grounded-harness-engine.js';
 import { generateIdeConfig, writeIdeConfigs, IDE_CONFIG_PATHS } from './installer/ide-config.js';
 import { runStackDoctor } from './installer/doctor.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 /**
- * Create a unified KruschStack instance with all 7 component engines + production resilience & 2PC action-harness engines wired to a shared SQLite/Postgres substrate.
+ * Create a unified KruschStack instance with all 7 component engines + production resilience, 2PC action-harness, and Turn-0 grounded-harness engines wired to a shared SQLite/Postgres substrate.
  * @param {object} [options]
  * @param {string} [options.workspaceRoot]
  * @param {string} [options.dbPath]
@@ -109,6 +125,7 @@ export function createKruschStack(options = {}) {
   const router = createRouterEngine({ config: options.routerConfig });
   const resilience = createResilienceEngine({ db });
   const actionHarness = createActionHarnessEngine({ db, contextEngine: context });
+  const groundedHarness = createGroundedHarnessEngine({ db, workspaceRoot });
 
   const engines = {
     context,
@@ -119,7 +136,8 @@ export function createKruschStack(options = {}) {
     workspace,
     router,
     resilience,
-    actionHarness
+    actionHarness,
+    groundedHarness
   };
 
   return {
@@ -137,6 +155,7 @@ export function createKruschStack(options = {}) {
     router,
     resilience,
     actionHarness,
+    groundedHarness,
     doctor: () => runStackDoctor({ workspaceRoot, db, profile }),
     status: () => router.getStackStatus({ engines })
   };
@@ -150,6 +169,8 @@ export {
   STACK_SCHEMA_SQL,
   RESILIENCE_SCHEMA_SQL,
   ACTION_HARNESS_SCHEMA_SQL,
+  GROUNDED_HARNESS_SCHEMA_SQL,
+  SCALE_TIERS,
   createContextEngine,
   packStackTokenBudget,
   prunePreRetrieval,
@@ -181,6 +202,18 @@ export {
   createActionHarnessEngine,
   classifyToolMutability,
   canonicalizeToolCallKey,
+  inferModelScaleMetadata,
+  resolveScaleProfile,
+  buildScaleAwareDirective,
+  buildSafeGeminiToolConfig,
+  normalizeCodeSnippetForHash,
+  canonicalizeGroundedToolCallKey,
+  inspectOutputDefects,
+  formatTimeoutWithPartialStdout,
+  execCommandWithPartialStdout,
+  introspectWorkspaceSchemas,
+  compileTurnZeroGrounding,
+  createGroundedHarnessEngine,
   generateIdeConfig,
   writeIdeConfigs,
   IDE_CONFIG_PATHS,

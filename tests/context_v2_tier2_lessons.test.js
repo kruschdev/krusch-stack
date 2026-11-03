@@ -211,7 +211,8 @@ describe('Tier 2A/2B Context v2.0 Parity Suite (INV-STACK-07..09)', () => {
         // Pre-write secret shield blocks raw API keys, GitHub tokens, PEM headers, and inline URL passwords
         assert.ok(scanForSecretLeak(`Token is ${fakeSk}`));
         assert.ok(scanForSecretLeak(`PAT is ${fakeGhp}`));
-        assert.ok(scanForSecretLeak('-----BEGIN OPENSSH PRIVATE KEY-----\nabc'));
+        const fakePemHeader = ['-----BEGIN', 'OPENSSH', 'PRIVATE', 'KEY-----'].join(' ');
+        assert.ok(scanForSecretLeak(`${fakePemHeader}\nabc`));
         assert.ok(scanForSecretLeak('postgres://svc:MyPlaintextSecret99@localhost:5432/db'));
         assert.equal(scanForSecretLeak('Set OPENAI_API_KEY=[REDACTED] before starting gateway'), null);
 

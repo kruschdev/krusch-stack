@@ -1,5 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -84,9 +85,16 @@ describe('KruschStack Unified Ecosystem Suite (v1.0.0)', () => {
     const forbiddenPatterns = [
       /\b192\.168\.\d+\.\d+\b/,
       /\b10\.10\.10\.\d+\b/,
-      /\b100\.(65|106|105|98|124|92|94|69)\.\d+\.\d+\b/,
-      /\b(kruschserv|kruschgame|kruschmedia|kruschsandbox|crush0|kr1yoga)\b/i
+      /\b100\.(65|106|105|98|124|92|94|69)\.\d+\.\d+\b/
     ];
+    const forbiddenTokenDigests = new Set([
+      '3cde8e0814835f51e98331706df86f127dc48aa2699e8d578b733684527a1880',
+      '617252969aa6598536819c64c0c887fa872ddda4a6c3b875fd1b7eb4e9f0bb50',
+      'e5426e7b2378f591845c65fd105fdc2997d7069013cb0516ab0e487203df167b',
+      '5b40d48f3e9aee96321eea47125fb84a9d1125ee06e50add165d8812665d667f',
+      'e2e7a47799dccf87884c9374a6865025ecaf0b1d590342bc490bc849388acf9d',
+      'b87c5ee4bd1d1a627867a2428c35387e10e497224afae6846c7cd4cc5b70b5e3'
+    ]);
 
     function walkFiles(dir) {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -111,7 +119,16 @@ describe('KruschStack Unified Ecosystem Suite (v1.0.0)', () => {
         assert.equal(
           regex.test(content),
           false,
-          `Forbidden private hostname/IP pattern ${regex} found in ${path.relative(REPO_ROOT, file)}`
+          `Forbidden private IP pattern ${regex} found in ${path.relative(REPO_ROOT, file)}`
+        );
+      }
+      const tokens = content.match(/[A-Za-z0-9_-]{3,}/g) || [];
+      for (const raw of tokens) {
+        const digest = crypto.createHash('sha256').update(`toolkit-guard:${raw.toLowerCase()}`).digest('hex');
+        assert.equal(
+          forbiddenTokenDigests.has(digest),
+          false,
+          `Forbidden internal hostname token found in ${path.relative(REPO_ROOT, file)}`
         );
       }
     }

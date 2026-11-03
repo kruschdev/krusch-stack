@@ -331,6 +331,35 @@ export function startHttpGateway(options = {}) {
       return;
     }
 
+    if (req.method === 'POST' && url.pathname.startsWith('/grounded-harness/')) {
+      const action = url.pathname.slice('/grounded-harness/'.length);
+      readBoundedJson()
+        .then(async ({ parsed }) => {
+          const actionMap = {
+            'scale-profile': () => stack.groundedHarness.resolveScale(parsed),
+            ground: () => stack.groundedHarness.groundWorkspace(parsed),
+            'ground-and-start': () => stack.groundedHarness.groundAndStartSession(parsed),
+            'evaluate-turn': () => stack.groundedHarness.evaluateTurn(parsed),
+            start: () => stack.groundedHarness.startSession(parsed),
+            intercept: () => stack.groundedHarness.interceptToolCall(parsed),
+            outcome: () => stack.groundedHarness.recordToolOutcome(parsed),
+            'verify-stop': () => stack.groundedHarness.verifyStop(parsed),
+            summary: () => stack.groundedHarness.sessionSummary(parsed)
+          };
+          const handler = actionMap[action];
+          if (!handler) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ ok: false, error: `Unknown grounded-harness action: ${action}` }));
+            return;
+          }
+          const result = await handler();
+          res.writeHead(result.ok ? 200 : 400);
+          res.end(JSON.stringify(result, null, 2));
+        })
+        .catch(sendGatewayError);
+      return;
+    }
+
     res.writeHead(404);
     res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
   });

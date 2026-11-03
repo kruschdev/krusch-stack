@@ -1,7 +1,7 @@
 # KruschStack (`krusch-stack`) — Specification
 
 > **Repository**: `https://github.com/kruschdev/krusch-stack.git`
-> **Version**: `1.0.0`
+> **Version**: `1.1.0`
 > **Runtime**: Node.js `>=22.0.0` (Native ESM + `node:sqlite`) & Docker Compose (`pgvector/pgvector:pg16`)
 > **License**: MIT
 
@@ -14,7 +14,7 @@
 1. **Tier 1 — Working Memory & Invariants (`krusch-context-mcp`)**: `retrieve`, `remember`, `revise`, `nudge`, `health` with `INV-12` span-grounded drift detection.
 2. **Tier 2A — Codebase AST & Git DAG (`krusch-git`)**: `list_repos`, `read_tree`, `read_blob`, `search_symbols`, `file_symbols`, `dependency_graph`, `semantic_search`.
 3. **Tier 2B — OS Filesystem & Page-Anchored Memory (`krusch-fs`)**: `locate`, `search`, `page_tree`, `read_page`, `remember_on_page`, `sync` with SHA-256 page drift tracking (`VALID` vs `STALE_DRIFT`).
-4. **Tier 3 — 2PC Staged Execution Harness (`krusch-harness`)**: `run`, `task_status`, `diff`, `apply_diff`, `explain`, `reject`, `abort` — stages unified diffs, enforces invariants, and verifies before touching the working tree.
+4. **Tier 3 — 2PC Staged Execution & Turn-0 Grounded Harnesses (`krusch-harness` + `grounded-harness`)**: `run`, `task_status`, `diff`, `apply_diff`, `explain`, `reject`, `abort` — stages unified diffs, enforces invariants, and exposes both `stack.actionHarness` (`INV-STACK-10`) and `stack.groundedHarness` (`INV-STACK-11`: zero-LLM Turn-0 schema grounding, scale-aware thinking/verification tiers, memoized call deduplication, and zero-turn-when-healthy defect-only output gating).
 5. **Frontend Design & Styling Engine (`krusch-frontend-mcp`)**: `generate_color_palette`, `css_to_tailwind`, `query_design_rules`, `get_canonical_template`, `list_canonical_templates`, `generate_responsive_breakpoints`.
 6. **Workspace Hub & Hybrid RAG (`g-krusch`)**: `get_agent_steering`, `search_drive_rag`, `read_drive_file`, `write_drive_file`, `list_drive_workspace`, `get_workspace_status`.
 7. **Cognitive Model Router (`krusch-cascade-router`)**: `krusch_route_task` & `krusch_stack_status` — `<25µs` L1 heuristic fast-path + L2/L3 model escalation across local Ollama and cloud APIs.
@@ -33,6 +33,7 @@
 - **`INV-STACK-08` (Tier 2B `.env` `KEYS_ONLY` Redaction & Pre-Write Secret Shield)**: `src/engines/fs-engine.js` redacts sensitive `.env` and `.env.*` file values (`KEY=[REDACTED]`, excluding `.env.example`, `.env.sample`, `.env.template`, `.env.schema`, `.env.dist`) via `redactEnvSecrets` before computing SHA-256 `page_hash` or storing `fs_pages.page_text`, and blocks raw API keys, tokens, PEM private keys, and inline URL passwords in `rememberOnPage` via `scanForSecretLeak(text)` before SQLite insertion while permitting `[REDACTED]` placeholders.
 - **`INV-STACK-09` (Tier 2A 2-Hop `git_edges` Call-Graph Bridging & Token/Identifier Telemetry)**: `semanticSearch` in `src/engines/git-engine.js` expands Top-3 Hop-1 symbol hits across 1-hop `git_edges` callers/callees when multi-term queries (`>= 2` distinctive tokens) leave at least one query token uncovered, capping bridged symbol scores strictly at `Math.min(topHop1Score * 0.84, Math.max(0.01, topHop1Score - 0.01))` (`bridge_hop: true`, `bridge_via`), and both `krusch_git_semantic_search` and `krusch_fs_search` accept optional `limit_tokens` while reporting `unattested_query_identifiers` / `unattested_query_terms` (`string[]`) without altering `ALL_STACK_TOOLS.length === 39`.
 - **`INV-STACK-10` (2PC Tool-Action Harness, Trajectory Spin-Loop Guard & Verify-on-Stop Gate)**: `src/engines/action-harness-engine.js` extends Tier 3 2PC governance beyond filesystem diffs to arbitrary external RPC/MCP tool-calling trajectories without altering `ALL_STACK_TOOLS.length === 39`. All sessions and events persist in SQLite (`action_harness_sessions`, `action_harness_events` via `ACTION_HARNESS_SCHEMA_SQL`) and return strict `INV-STACK-02` `okEnvelope` payloads exposed on `stack.actionHarness` and `POST /action-harness/{start,intercept,outcome,verify-stop,summary}`: (1) blocks duplicate `(tool_name, canonical_args)` read spin-loops (`BLOCK_SPIN_LOOP`) and runaway consecutive read streaks (`BLOCK_READ_STREAK`); (2) blocks duplicate mutating side-effects (`BLOCK_DUPLICATE_WRITE`); (3) stages mutating tool calls (`ALLOW_MUTATION`) after auditing unresolved placeholders, malformed non-ISO date placeholders, `scanForSecretLeak`, and optional `contextEngine.nudge` invariants (`HOLD_FOR_REVISION`); and (4) gates premature zero-mutation stops via `verifyStop` (`CONTINUE_VERIFY` vs. `ALLOW_STOP`) while respecting intentional policy-grounded abstentions.
+- **`INV-STACK-11` (Turn-0 Grounded, Scale-Aware, Defect-Only Agent Harness — `INV-GH-01..10`)**: `src/engines/grounded-harness-engine.js` (`krusch-stack/grounded-harness`, `stack.groundedHarness`, and `POST /grounded-harness/{scale-profile,ground,ground-and-start,evaluate-turn,start,intercept,outcome,verify-stop,summary}`) provides zero-dependency SQLite/PostgreSQL (`grounded_sessions`, `grounded_events`) parity with [`kruschdev/grounded-harness`](https://github.com/kruschdev/grounded-harness) while keeping `ALL_STACK_TOOLS.length === 39` strictly intact: (1) zero-LLM Turn-0 workspace schema & hazard introspection (RFC-4180 CSV literal `"NA"` `keep_default_na=False` flags, JSON `null`/`[]` wildcard flags, read-only SQLite DDL/row counts, `.env` exclusion, `256/32`-token Raw-RAG BM25 chunks, and KV-cache-stable SHA-256 `prefixHash`); (2) Gemini tool-less guard (`functionCallingConfig: { mode: 'NONE' }`); (3) monotonic scale-aware profiles (`SMALL_MODEL`, `MID_MODEL`, `FRONTIER_REASONING`) with `maxReadStreak = 0` so multi-step analytical/workspace foraging is never capped; (4) quote-safe, Python-`//`-safe comment-normalized call hashing (`MEMOIZED_PRIOR_READ` $\rightarrow$ `BLOCK_SPIN_LOOP`) with SQLite `rowid`-ordered post-mutation verification re-read allowance; (5) staged-diff-only `FORCE_VERIFY` + zero-turn-when-healthy `inspectOutputDefects` (`0` self-doubt nudges on `FRONTIER_REASONING`/`MID_MODEL` and legitimate `"0"`/`"Not Applicable"`/policy abstentions); and (6) `execCommandWithPartialStdout` preserving partial `stdout` on subprocess timeouts.
 
 ---
 
@@ -119,3 +120,18 @@
     - `sessionSummary({ session_id })`
 - **HTTP Gateway Contract (`bin/krusch-stack.js`)**:
   - Mounts `POST /action-harness/{start,intercept,outcome,verify-stop,summary}` delegating to `stack.actionHarness` while strictly preserving `ALL_STACK_TOOLS.length === 39`.
+
+### Module Group E — Turn-0 Grounded, Scale-Aware, Defect-Only Harness Engine (`src/engines/grounded-harness-engine.js`, `bin/krusch-stack.js`)
+- **`src/engines/grounded-harness-engine.js` (`krusch-stack/grounded-harness`)**:
+  - Exports `GROUNDED_HARNESS_SCHEMA_SQL`, `SCALE_TIERS`, `inferModelScaleMetadata`, `resolveScaleProfile`, `buildScaleAwareDirective`, `buildSafeGeminiToolConfig`, `normalizeCodeSnippetForHash`, `canonicalizeGroundedToolCallKey`, `inspectOutputDefects`, `formatTimeoutWithPartialStdout`, `execCommandWithPartialStdout`, `introspectWorkspaceSchemas`, `compileTurnZeroGrounding`, and `createGroundedHarnessEngine({ db, workspaceRoot })` returning:
+    - `resolveScale(params)`
+    - `groundWorkspace(params)`
+    - `startSession(params)`
+    - `groundAndStartSession(params)`
+    - `evaluateTurn({ session_id, turn_response })`
+    - `interceptToolCall({ session_id, step = 0, tool_name, args = {}, mutating, suppress_turn0_reads = true, block_spin_loop = false })`
+    - `recordToolOutcome({ session_id, event_id, ok = true, result_preview = "", timed_out = false, partial_stdout = "", pending_diffs_delta = 0, verification_passed })`
+    - `verifyStop({ session_id, assistant_text = "", candidate_answer, finish_reason = null, truncated_tool_calls = false, tool_calls = [], expect_non_empty_answer = false, pending_diffs_count, latest_verification_passed, verification_command = "npm test" })`
+    - `sessionSummary({ session_id })`
+- **HTTP Gateway Contract (`bin/krusch-stack.js`)**:
+  - Mounts `POST /grounded-harness/{scale-profile,ground,ground-and-start,evaluate-turn,start,intercept,outcome,verify-stop,summary}` delegating to `stack.groundedHarness` while strictly preserving `ALL_STACK_TOOLS.length === 39`.

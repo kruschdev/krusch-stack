@@ -1,7 +1,7 @@
 {
   "name": "krusch-stack",
-  "version": "1.0.0",
-  "description": "The unified Sovereign AI & Coding Agent Stack — one-command installer and MCP gateway bundling Tier 1 Working Memory (krusch-context-mcp), Tier 2A Git DAG & AST Graph (krusch-git), Tier 2B Page-Anchored OS Filesystem (krusch-fs), Tier 3 2PC Staged Execution Harness (krusch-harness), Frontend Design Engine (krusch-frontend-mcp), Google Workspace Hub (g-krusch), and L1-L3 Cascade Router.",
+  "version": "1.1.0",
+  "description": "The unified Sovereign AI & Coding Agent Stack — one-command installer and MCP gateway bundling Tier 1 Working Memory (krusch-context-mcp), Tier 2A Git DAG & AST Graph (krusch-git), Tier 2B Page-Anchored OS Filesystem (krusch-fs), Tier 3 Staged 2PC & Turn-0 Grounded Harnesses (krusch-harness + grounded-harness), Frontend Design Engine (krusch-frontend-mcp), Google Workspace Hub (g-krusch), and L1-L3 Cascade Router.",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -14,7 +14,9 @@
     "./sqlite": "./src/db/sqlite.js",
     "./installer": "./src/installer/ide-config.js",
     "./doctor": "./src/installer/doctor.js",
-    "./resilience": "./src/engines/resilience-engine.js"
+    "./resilience": "./src/engines/resilience-engine.js",
+    "./action-harness": "./src/engines/action-harness-engine.js",
+    "./grounded-harness": "./src/engines/grounded-harness-engine.js"
   },
   "engines": {
     "node": ">=22.0.0"
@@ -56,6 +58,8 @@
     "git-dag",
     "episodic-memory",
     "coding-harness",
+    "grounded-harness",
+    "turn-zero-grounding",
     "cascade-router",
     "design-system",
     "google-workspace",
@@ -63,7 +67,7 @@
     "pgvector",
     "sovereign-ai"
   ],
-  "author": "Kevin Ruschman (kruschdev)",
+  "author": "kruschdev <kruschdev@users.noreply.github.com>",
   "license": "MIT",
   "repository": {
     "type": "git",
