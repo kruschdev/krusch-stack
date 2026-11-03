@@ -123,7 +123,8 @@
 
 ### Module Group E — Turn-0 Grounded, Scale-Aware, Defect-Only Harness Engine (`src/engines/grounded-harness-engine.js`, `bin/krusch-stack.js`)
 - **`src/engines/grounded-harness-engine.js` (`krusch-stack/grounded-harness`)**:
-  - Exports `GROUNDED_HARNESS_SCHEMA_SQL`, `SCALE_TIERS`, `inferModelScaleMetadata`, `resolveScaleProfile`, `buildScaleAwareDirective`, `buildSafeGeminiToolConfig`, `normalizeCodeSnippetForHash`, `canonicalizeGroundedToolCallKey`, `inspectOutputDefects`, `formatTimeoutWithPartialStdout`, `execCommandWithPartialStdout`, `introspectWorkspaceSchemas`, `compileTurnZeroGrounding`, and `createGroundedHarnessEngine({ db, workspaceRoot })` returning:
+  - Operates strictly at the outer orchestration/HTTP boundary (`0` MCP tools registered in `src/mcp/server.js`, so `ALL_STACK_TOOLS.length === 39` is unchanged and `INV-STACK-03` MCP tool annotations apply solely to `src/mcp/tools.js`). Imports `okEnvelope` from internal package sibling `../db/sqlite.js` (`INV-STACK-01` zero external npm dependencies preserved).
+  - Pure synchronous helper primitives (`inferModelScaleMetadata`, `resolveScaleProfile`, `buildScaleAwareDirective`, `buildSafeGeminiToolConfig`, `normalizeCodeSnippetForHash`, `canonicalizeGroundedToolCallKey`, `inspectOutputDefects`, `formatTimeoutWithPartialStdout`, `execCommandWithPartialStdout`, `introspectWorkspaceSchemas`) return typed domain values directly, whereas `compileTurnZeroGrounding` and all `createGroundedHarnessEngine({ db, workspaceRoot })` engine methods return `INV-STACK-02` `{ ok, tool, summary, data }` envelopes:
     - `resolveScale(params)`
     - `groundWorkspace(params)`
     - `startSession(params)`
