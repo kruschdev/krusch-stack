@@ -1,0 +1,67 @@
+1
+00:00:00,350 --> 00:00:06,555
+Coding agents lose context across sessions, grep codebases blindly, and edit files without guardrails.
+
+2
+00:00:06,595 --> 00:00:11,515
+Wiring memory, AST graphs, and safety harnesses usually takes 7 separate servers.
+
+3
+00:00:11,555 --> 00:00:16,082
+So I built KruschStack — one unified sovereign AI & coding agent stack.
+
+4
+00:00:16,652 --> 00:00:22,933
+In under 30 seconds, npx krusch-stack init wires Claude Code, Cursor, Windsurf & Antigravity.
+
+5
+00:00:22,973 --> 00:00:27,012
+Backed by Node 22 native node:sqlite — zero Docker required.
+
+6
+00:00:27,052 --> 00:00:33,621
+npx krusch-stack doctor verifies 39 MCP tools — or cuts schema tokens 80.7% via --defer-tools.
+
+7
+00:00:34,191 --> 00:00:39,631
+Seven unified pillars: Tier 1 Working Memory with INV-12 SHA-256 span-drift checks,
+
+8
+00:00:39,671 --> 00:00:45,838
+Tier 2A Git & AST call graphs, Tier 2B page-anchored OS memory, Frontend Lego & Workspace RAG,
+
+9
+00:00:45,878 --> 00:00:51,075
+Plus a <25µs pure-CPU Stage-0 Cognitive Cascade Router across L1 through L3.
+
+10
+00:00:51,645 --> 00:00:57,590
+Before any edit touches disk, Turn-0 Grounding scans schemas, blocks spin-loops & gates output defects.
+
+11
+00:00:57,630 --> 00:01:01,773
+Every mutation stages in isolation behind an import-frozen policy floor,
+
+12
+00:01:01,813 --> 00:01:06,119
+Committing through a <32ms write-ahead journal and POSIX atomic rename.
+
+13
+00:01:06,689 --> 00:01:12,066
+Across 335,000+ traces & 14 external suites with 95/95 SHA-256 clean-room gates:
+
+14
+00:01:12,106 --> 00:01:17,889
+DolphinBench: 91.17% Argon Low (~3.9x cheaper vs. Mem0) & 57.33% Open-Weights @ $0.00.
+
+15
+00:01:17,929 --> 00:01:25,151
+Snap LoCoMo: 90.26% Acc @ $0.00 ingest · RouterArena PR #169: 0.7263 CI-verified · AgentDojo: 0.00% ASR.
+
+16
+00:01:25,771 --> 00:01:30,670
+One command. 39 tools. Sovereign memory & verified execution.
+
+17
+00:01:30,710 --> 00:01:39,797
+Run npx krusch-stack init — explore MIT source & audit logs at github.com/kruschdev/krusch-stack & krusch.dev.
