@@ -128,7 +128,13 @@ Options:
  * Start the lightweight HTTP status & REST gateway (for Docker and health checks).
  */
 export function startHttpGateway(options = {}) {
-  const port = Number(options.port || process.env.KRUSCH_STACK_PORT || 3780);
+  const rawPort =
+    options.port !== undefined && options.port !== null && options.port !== ''
+      ? options.port
+      : process.env.KRUSCH_STACK_PORT !== undefined && process.env.KRUSCH_STACK_PORT !== ''
+        ? process.env.KRUSCH_STACK_PORT
+        : 3780;
+  const port = Number(rawPort);
   const stack = options.stack || createKruschStack(options);
   const tools = getStackTools({
     profile: stack.profile,
@@ -368,7 +374,9 @@ export function startHttpGateway(options = {}) {
   return new Promise((resolve, reject) => {
     server.on('error', reject);
     server.listen(port, bindHost, () => {
-      resolve({ server, port, host: bindHost, stack });
+      const addr = server.address();
+      const boundPort = addr && typeof addr === 'object' ? addr.port : port;
+      resolve({ server, port: boundPort, host: bindHost, stack });
     });
   });
 }
