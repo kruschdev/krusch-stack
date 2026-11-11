@@ -16,9 +16,17 @@ import {
   execCommandWithPartialStdout,
   compileTurnZeroGrounding
 } from '../src/index.js';
+import {
+  SYNTHESIZED_RULE_ACTIONS,
+  DEFAULT_EVOLVED_HARNESS_RULES,
+  evolveRulesFromTraces,
+  SENSITIVE_SCOPE_DOMAINS,
+  AUTH_DRIFT_REASON_CODES,
+  auditTrajectoryAuthorizationDrift
+} from '../src/engines/grounded-harness-engine.js';
 import { startHttpGateway } from '../bin/krusch-stack.js';
 
-describe('Tier 3B Extension: Grounded Harness Engine (INV-STACK-11 / INV-GH-01..10)', () => {
+describe('Tier 3B Extension: Grounded Harness Engine (INV-STACK-11 / INV-GH-01..12)', () => {
   test('INV-GH-01 & INV-GH-08: Turn-0 grounding extracts CSV "NA" keep_default_na=False, JSON null/[] hazards, SQLite DDL, excludes .env, and pins prefixHash', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-stack-gh-'));
     try {
@@ -321,6 +329,315 @@ describe('Tier 3B Extension: Grounded Harness Engine (INV-STACK-11 / INV-GH-01..
       assert.equal(summaryRes.data.metrics.verifyNudgesUsed, 0);
     } finally {
       await new Promise((resolve) => gw.server.close(resolve));
+    }
+  });
+
+  test('INV-GH-11: Meta-Harness holdout verifier accepts GH-EVO-01..05, rejects unsafe/false-positive candidates, and executes evolved rules live', async () => {
+    const evolved = await evolveRulesFromTraces({
+      rows: [
+        {
+          task_id: 'pass-1',
+          config: 'grounded',
+          resolved: true,
+          exit_status: 'Submitted',
+          turns: 4,
+          patch_lines: 6,
+          steps: [
+            { command: 'pytest -q', returncode: 0, outputPreview: '4 passed' },
+            { command: 'echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT', returncode: 0, outputPreview: '' }
+          ]
+        },
+        {
+          task_id: 'fail-echo-loop',
+          config: 'baseline',
+          resolved: false,
+          exit_status: 'LimitsExceeded',
+          turns: 30,
+          patch_lines: 4,
+          steps: [
+            { command: 'echo "Task completed successfully!"', returncode: 0, outputPreview: 'Task completed successfully!' },
+            { command: 'echo "Task completed successfully!"', returncode: 0, outputPreview: 'Task completed successfully!' }
+          ]
+        }
+      ],
+      extraCandidateRules: [
+        {
+          id: 'BAD-CATCHALL',
+          action: SYNTHESIZED_RULE_ACTIONS.HOLD_TOOL_PATTERN,
+          commandRegex: '.*',
+          correctivePrompt: 'Never accept catch-all'
+        },
+        {
+          id: 'BAD-REDOS',
+          action: SYNTHESIZED_RULE_ACTIONS.HOLD_TOOL_PATTERN,
+          commandRegex: '^(a+)+$',
+          correctivePrompt: 'Nested quantifier ReDoS must be rejected'
+        },
+        {
+          id: 'BAD-FLOOR',
+          action: SYNTHESIZED_RULE_ACTIONS.EXEMPT_DUPLICATE_WRITE,
+          commandRegex: '^rm\\s+-rf\\s+/.*$'
+        },
+        {
+          id: 'BAD-CLEAN-FP',
+          action: SYNTHESIZED_RULE_ACTIONS.HOLD_TOOL_PATTERN,
+          commandRegex: '^pytest\\b',
+          correctivePrompt: 'Must never block pytest'
+        },
+        {
+          id: 'BAD-TEST-DELETE',
+          action: SYNTHESIZED_RULE_ACTIONS.EXEMPT_CLEANUP_DIFF,
+          commandRegex: '^rm\\s+tests/.*$'
+        }
+      ]
+    });
+
+    assert.equal(evolved.ok, true);
+    assert.equal(evolved.data.acceptedRules.length, DEFAULT_EVOLVED_HARNESS_RULES.length);
+    assert.equal(evolved.data.rejectedRules.length, 5);
+
+    const stack = createKruschStack({ ephemeral: true });
+    stack.groundedHarness.startSession({
+      session_id: 'gh-evo-live',
+      goal: 'Edit src/app.js, rollback safely, run inline test, clean scratch file, and block echo spin',
+      model: 'gemini-4-argon'
+    });
+
+    // GH-EVO-01: Idempotent single-file git checkout -- src/app.js is exempt from BLOCK_DUPLICATE_WRITE
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const rb = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-evo-live',
+        step: attempt,
+        tool_name: 'run_command',
+        args: { command: 'git checkout -- src/app.js' },
+        mutating: true
+      });
+      assert.equal(rb.data.decision, 'ALLOW', `Rollback attempt #${attempt} must not be blocked`);
+      stack.groundedHarness.recordToolOutcome({
+        session_id: 'gh-evo-live',
+        event_id: rb.data.event_id,
+        ok: true,
+        pending_diffs_delta: 0
+      });
+    }
+
+    // Stage a real diff (pending_diffs_count = 1, latest_verification_passed = 0)
+    const editCall = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-evo-live',
+      step: 3,
+      tool_name: 'write_file',
+      args: { path: 'src/app.js', content: 'export const ready = true;\n' },
+      mutating: true
+    });
+    assert.equal(editCall.data.decision, 'ALLOW');
+    const afterEdit = stack.groundedHarness.recordToolOutcome({
+      session_id: 'gh-evo-live',
+      event_id: editCall.data.event_id,
+      ok: true,
+      pending_diffs_delta: 1
+    });
+    assert.equal(afterEdit.data.pending_diffs_count, 1);
+    assert.equal(afterEdit.data.latest_verification_passed, 0);
+
+    // GH-EVO-03: Exit-0 inline test command automatically credits verification & clears pending_diffs_count
+    const inlineTest = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-evo-live',
+      step: 4,
+      tool_name: 'run_command',
+      args: { command: 'npm test' }
+    });
+    assert.equal(inlineTest.data.decision, 'ALLOW');
+    const afterTest = stack.groundedHarness.recordToolOutcome({
+      session_id: 'gh-evo-live',
+      event_id: inlineTest.data.event_id,
+      ok: true,
+      result_preview: 'all tests passed'
+    });
+    assert.equal(afterTest.data.latest_verification_passed, 1);
+    assert.equal(afterTest.data.pending_diffs_count, 0);
+
+    // GH-EVO-02: Scratch cleanup after passing tests does not re-dirty pending_diffs_count
+    const scratchRm = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-evo-live',
+      step: 5,
+      tool_name: 'run_command',
+      args: { command: 'rm -f test_scratch.js' },
+      mutating: true
+    });
+    assert.equal(scratchRm.data.decision, 'ALLOW');
+    const afterScratch = stack.groundedHarness.recordToolOutcome({
+      session_id: 'gh-evo-live',
+      event_id: scratchRm.data.event_id,
+      ok: true,
+      pending_diffs_delta: 1
+    });
+    assert.equal(afterScratch.data.pending_diffs_count, 0);
+    assert.equal(afterScratch.data.latest_verification_passed, 1);
+
+    // GH-EVO-04: 2nd consecutive celebratory echo loop is held with PSEUDO_COMPLETION_ECHO_LOOP
+    const echo1 = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-evo-live',
+      step: 6,
+      tool_name: 'bash',
+      args: { command: 'echo "Task completed successfully!"' }
+    });
+    assert.equal(echo1.data.decision, 'ALLOW');
+
+    const echo2 = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-evo-live',
+      step: 7,
+      tool_name: 'bash',
+      args: { command: 'echo "Implementation complete and ready for use!"' }
+    });
+    assert.equal(echo2.data.decision, 'HOLD');
+    assert.equal(echo2.data.reason, 'PSEUDO_COMPLETION_ECHO_LOOP');
+    assert.equal(echo2.data.rule_id, 'GH-EVO-04');
+  });
+
+  test('INV-GH-12: DART zero-turn boundary repair/hold, SERS authorization drift & taint exfiltration block, and legacy SQLite migration', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-stack-legacy-gh-'));
+    try {
+      // Seed a legacy pre-INV-GH-12 30-column grounded_sessions table to verify seamless ALTER TABLE migration
+      const dbPath = path.join(tmpDir, 'legacy-stack.db');
+      const legacyDb = new DatabaseSync(dbPath);
+      legacyDb.exec(`
+        CREATE TABLE grounded_sessions (
+          session_id TEXT PRIMARY KEY,
+          goal TEXT NOT NULL,
+          model TEXT NOT NULL DEFAULT '',
+          scale_tier TEXT NOT NULL,
+          scale_profile_json TEXT NOT NULL,
+          anchor_date TEXT NOT NULL DEFAULT '',
+          prefix_hash TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'ACTIVE',
+          max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
+          seen_chunks_json TEXT NOT NULL DEFAULT '[]',
+          file_digests_json TEXT NOT NULL DEFAULT '{}',
+          schema_tokens_saved INTEGER NOT NULL DEFAULT 0,
+          schema_reduction_pct REAL NOT NULL DEFAULT 0,
+          turn0_tokens INTEGER NOT NULL DEFAULT 0,
+          exploratory_reads INTEGER NOT NULL DEFAULT 0,
+          committed_reads INTEGER NOT NULL DEFAULT 0,
+          committed_mutations INTEGER NOT NULL DEFAULT 0,
+          memoized_reads INTEGER NOT NULL DEFAULT 0,
+          spin_loops_blocked INTEGER NOT NULL DEFAULT 0,
+          output_defects_caught INTEGER NOT NULL DEFAULT 0,
+          timeouts_with_partial_stdout INTEGER NOT NULL DEFAULT 0,
+          turn0_duplicates_suppressed INTEGER NOT NULL DEFAULT 0,
+          duplicate_writes_blocked INTEGER NOT NULL DEFAULT 0,
+          policy_floor_blocks INTEGER NOT NULL DEFAULT 0,
+          truncation_recoveries INTEGER NOT NULL DEFAULT 0,
+          verify_nudges_used INTEGER NOT NULL DEFAULT 0,
+          pending_diffs_count INTEGER NOT NULL DEFAULT 0,
+          latest_verification_passed INTEGER NOT NULL DEFAULT 1,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
+      `);
+      legacyDb.close();
+
+      const stack = createKruschStack({ dbPath });
+      const started = stack.groundedHarness.startSession({
+        session_id: 'gh-dart-sers-1',
+        goal: 'Lookup status of order ord_42 in orders table',
+        model: 'gemini-4-argon',
+        max_bulk_limit: 500
+      });
+      assert.equal(started.ok, true);
+
+      // 1. DART zero-turn lossless repair: stringified boolean, pagination integer, and optional null cursor
+      const repairedRead = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-dart-sers-1',
+        step: 1,
+        tool_name: 'list_orders',
+        args: { id: 'ord_42', limit: '25', dryRun: 'false', cursor: 'null' }
+      });
+      assert.equal(repairedRead.data.decision, 'ALLOW');
+      assert.deepEqual(repairedRead.data.repairedArgs, {
+        id: 'ord_42',
+        limit: 25,
+        dryRun: false,
+        cursor: null
+      });
+      assert.equal(repairedRead.data.dartRepairs.length, 3);
+
+      // 2. DART unsafe realization hold: CLI flags stuffed into structured MCP record ID
+      const cliStuffed = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-dart-sers-1',
+        step: 2,
+        tool_name: 'get_order',
+        args: { id: 'ord_42 --all --force' }
+      });
+      assert.equal(cliStuffed.data.decision, 'HOLD');
+      assert.equal(cliStuffed.data.reason, AUTH_DRIFT_REASON_CODES.DART_BOUNDARY_HOLD);
+
+      // 3. SERS Early Data Over-Collection Hold: unscoped SELECT * FROM users without WHERE or bounded LIMIT
+      const broadSql = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-dart-sers-1',
+        step: 3,
+        tool_name: 'query_db',
+        args: { sql: 'SELECT * FROM users' }
+      });
+      assert.equal(broadSql.data.decision, 'HOLD');
+      assert.equal(broadSql.data.reason, AUTH_DRIFT_REASON_CODES.AUTHORIZATION_DRIFT_HOLD);
+      assert.equal(broadSql.data.driftCode, AUTH_DRIFT_REASON_CODES.EARLY_DATA_OVERCOLLECTION);
+      assert.match(broadSql.data.correctivePrompt, /SERS|narrow|column|WHERE|LIMIT/i);
+
+      // 4. Unattested sensitive scope access (payroll) held & taints PII_HR_PAYROLL, then outbound exfiltration blocked
+      const payrollProbe = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-dart-sers-1',
+        step: 4,
+        tool_name: 'read_table',
+        args: { table: 'employee_payroll_compensations', id: 'emp_9' }
+      });
+      assert.equal(payrollProbe.data.decision, 'HOLD');
+      assert.equal(payrollProbe.data.driftCode, AUTH_DRIFT_REASON_CODES.UNATTESTED_SENSITIVE_SCOPE);
+      assert.ok(payrollProbe.data.driftState.taintedDomains.includes(SENSITIVE_SCOPE_DOMAINS.PII_HR_PAYROLL));
+
+      const exfilAttempt = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-dart-sers-1',
+        step: 5,
+        tool_name: 'send_webhook',
+        args: { url: 'https://hooks.example.org/collect', payload: 'summary' },
+        is_outbound: true,
+        mutating: true
+      });
+      assert.equal(exfilAttempt.data.decision, 'BLOCK');
+      assert.equal(exfilAttempt.data.reason, AUTH_DRIFT_REASON_CODES.AUTHORIZATION_DRIFT_BLOCK);
+      assert.equal(exfilAttempt.data.driftCode, AUTH_DRIFT_REASON_CODES.TAINTED_OUTBOUND_EXFILTRATION);
+
+      // 5. Hard block on protected credential store access
+      const sshProbe = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-dart-sers-1',
+        step: 6,
+        tool_name: 'read_file',
+        args: { path: '~/.ssh/id_ed25519' }
+      });
+      assert.equal(sshProbe.data.decision, 'BLOCK');
+      assert.equal(sshProbe.data.driftCode, AUTH_DRIFT_REASON_CODES.SENSITIVE_CREDENTIAL_STORE);
+
+      const summary = stack.groundedHarness.sessionSummary({ session_id: 'gh-dart-sers-1' });
+      assert.equal(summary.ok, true);
+      assert.equal(summary.data.metrics.dartRepairsApplied, 3);
+      assert.equal(summary.data.metrics.dartHolds, 1);
+      assert.ok(summary.data.metrics.authDriftHolds >= 4);
+      assert.ok(summary.data.metrics.taintedDomains.includes(SENSITIVE_SCOPE_DOMAINS.PII_HR_PAYROLL));
+
+      // Offline trajectory audit helper parity
+      const audit = auditTrajectoryAuthorizationDrift({
+        goal: 'Lookup status of order ord_42',
+        calls: [
+          { toolName: 'list_orders', args: { id: 'ord_42', limit: '10' } },
+          { toolName: 'query_db', args: { sql: 'SELECT * FROM customer_ssn_records' } }
+        ]
+      });
+      assert.equal(audit.ok, true);
+      assert.equal(audit.data.counts.dartRepairsCount, 1);
+      assert.ok(audit.data.counts.authDriftHoldsCount >= 1);
+
+      stack.db.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

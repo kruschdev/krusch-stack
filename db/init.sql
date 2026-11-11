@@ -219,7 +219,7 @@ CREATE INDEX IF NOT EXISTS idx_action_harness_events_sig
 CREATE INDEX IF NOT EXISTS idx_action_harness_events_session_time
   ON action_harness_events(session_id, created_at_ms);
 
--- INV-STACK-11: Turn-0 Grounded, Scale-Aware, Defect-Only Harness
+-- INV-STACK-11: Turn-0 Grounded, Scale-Aware, Defect-Only Harness (INV-GH-01..12)
 CREATE TABLE IF NOT EXISTS grounded_sessions (
   session_id TEXT PRIMARY KEY,
   goal TEXT NOT NULL,
@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS grounded_sessions (
   max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
   seen_chunks_json TEXT NOT NULL DEFAULT '[]',
   file_digests_json TEXT NOT NULL DEFAULT '{}',
+  allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
+  drift_state_json TEXT NOT NULL DEFAULT '{}',
   schema_tokens_saved INTEGER NOT NULL DEFAULT 0,
   schema_reduction_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
   turn0_tokens INTEGER NOT NULL DEFAULT 0,
@@ -245,6 +247,9 @@ CREATE TABLE IF NOT EXISTS grounded_sessions (
   turn0_duplicates_suppressed INTEGER NOT NULL DEFAULT 0,
   duplicate_writes_blocked INTEGER NOT NULL DEFAULT 0,
   policy_floor_blocks INTEGER NOT NULL DEFAULT 0,
+  auth_drift_holds INTEGER NOT NULL DEFAULT 0,
+  dart_repairs_applied INTEGER NOT NULL DEFAULT 0,
+  dart_holds INTEGER NOT NULL DEFAULT 0,
   truncation_recoveries INTEGER NOT NULL DEFAULT 0,
   verify_nudges_used INTEGER NOT NULL DEFAULT 0,
   pending_diffs_count INTEGER NOT NULL DEFAULT 0,

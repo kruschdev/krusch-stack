@@ -15,6 +15,10 @@
  *   5. Passive safety floor, secret-leak guard, duplicate-write guard, staged-diff-only FORCE_VERIFY,
  *      and zero-turn-when-healthy defect-only output gate (inspectOutputDefects).
  *   6. Partial stdout preservation on subprocess/sandbox timeouts (execCommandWithPartialStdout).
+ *   7. INV-GH-11 Meta-Harness failure-trace mining, holdout-verified regex synthesis, and default
+ *      evolved rules (GH-EVO-01..05).
+ *   8. INV-GH-12 Early Scope & Authorization Drift + SERS data-minimization guard and DART
+ *      zero-turn MCP-vs-CLI boundary realization repair/hold.
  */
 
 import crypto from 'node:crypto';
@@ -25,6 +29,25 @@ import { DatabaseSync } from 'node:sqlite';
 import { okEnvelope } from '../db/sqlite.js';
 import { scanForSecretLeak } from './fs-engine.js';
 import { classifyToolMutability } from './action-harness-engine.js';
+import {
+  SENSITIVE_SCOPE_DOMAINS,
+  AUTH_DRIFT_REASON_CODES,
+  inferGoalAttestedScopes,
+  inspectAndRepairDartBoundaries,
+  evaluateAuthorizationDrift,
+  auditTrajectoryAuthorizationDrift
+} from './grounded-auth-drift.js';
+import {
+  SYNTHESIZED_RULE_ACTIONS,
+  DEFAULT_EVOLVED_HARNESS_RULES,
+  compileSafeRuleRegex,
+  compileExecutableRules,
+  extractShellCommandsFromTrajectory,
+  mineFailureTrajectories,
+  verifyCandidateRulesOnTraces,
+  synthesizeRulesWithTeacher,
+  evolveRulesFromTraces
+} from './grounded-trace-synthesizer.js';
 
 export const GROUNDED_HARNESS_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS grounded_sessions (
@@ -39,6 +62,8 @@ export const GROUNDED_HARNESS_SCHEMA_SQL = `
     max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
     seen_chunks_json TEXT NOT NULL DEFAULT '[]',
     file_digests_json TEXT NOT NULL DEFAULT '{}',
+    allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
+    drift_state_json TEXT NOT NULL DEFAULT '{}',
     schema_tokens_saved INTEGER NOT NULL DEFAULT 0,
     schema_reduction_pct REAL NOT NULL DEFAULT 0,
     turn0_tokens INTEGER NOT NULL DEFAULT 0,
@@ -52,6 +77,9 @@ export const GROUNDED_HARNESS_SCHEMA_SQL = `
     turn0_duplicates_suppressed INTEGER NOT NULL DEFAULT 0,
     duplicate_writes_blocked INTEGER NOT NULL DEFAULT 0,
     policy_floor_blocks INTEGER NOT NULL DEFAULT 0,
+    auth_drift_holds INTEGER NOT NULL DEFAULT 0,
+    dart_repairs_applied INTEGER NOT NULL DEFAULT 0,
+    dart_holds INTEGER NOT NULL DEFAULT 0,
     truncation_recoveries INTEGER NOT NULL DEFAULT 0,
     verify_nudges_used INTEGER NOT NULL DEFAULT 0,
     pending_diffs_count INTEGER NOT NULL DEFAULT 0,
@@ -1171,30 +1199,93 @@ function scanSmallModelArgumentIssues(obj, prefix = '', acc = []) {
   return acc;
 }
 
+const OUTBOUND_TOOL_HINT_RE =
+  /(?:^|[_.:/-])(?:send|email|mail|reply|forward|post|publish|webhook|slack|upload|dispatch|share|invite|http_post)(?:$|[_.:/-])/i;
+
+function safeParseJsonArray(rawJson) {
+  if (typeof rawJson !== 'string' || !rawJson.trim()) return [];
+  try {
+    const parsed = JSON.parse(rawJson);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function safeParseJsonObject(rawJson) {
+  if (typeof rawJson !== 'string' || !rawJson.trim()) return {};
+  try {
+    const parsed = JSON.parse(rawJson);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function extractCommandTextFromArgs(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const cmd = args.command ?? args.cmd ?? args.CommandLine ?? args.commandLine ?? '';
+  return typeof cmd === 'string' ? cmd : '';
+}
+
+function matchesEvolvedRule(rule, toolName, commandText) {
+  if (!commandText) return false;
+  if (!rule.toolRe.test(toolName)) return false;
+  if (!rule.commandRe.test(commandText)) return false;
+  if (rule.excludeRe && rule.excludeRe.test(commandText)) return false;
+  return true;
+}
+
 /**
  * Create the zero-dependency SQLite-backed Grounded Harness Engine (`stack.groundedHarness`).
  * @param {object} options
  * @param {DatabaseSync} options.db
  * @param {string} [options.workspaceRoot]
+ * @param {Array<object>} [options.evolvedRules]
  */
-export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() } = {}) {
+export function createGroundedHarnessEngine({
+  db,
+  workspaceRoot = process.cwd(),
+  evolvedRules = DEFAULT_EVOLVED_HARNESS_RULES
+} = {}) {
   if (!db || typeof db.exec !== 'function') {
     throw new Error('createGroundedHarnessEngine requires a Node 22 DatabaseSync instance.');
   }
   db.exec(GROUNDED_HARNESS_SCHEMA_SQL);
+
+  // Idempotent column migrations for pre-existing .krusch-stack/stack.db databases
+  const migrationCols = [
+    "allowed_scopes_json TEXT NOT NULL DEFAULT '[]'",
+    "drift_state_json TEXT NOT NULL DEFAULT '{}'",
+    'auth_drift_holds INTEGER NOT NULL DEFAULT 0',
+    'dart_repairs_applied INTEGER NOT NULL DEFAULT 0',
+    'dart_holds INTEGER NOT NULL DEFAULT 0'
+  ];
+  for (const colDef of migrationCols) {
+    try {
+      db.exec(`ALTER TABLE grounded_sessions ADD COLUMN ${colDef}`);
+    } catch {
+      // Column already exists on initialized schema
+    }
+  }
+
+  const activeEvolvedRules = compileExecutableRules(evolvedRules);
+  const ruleStreaks = new Map();
 
   const selectSessionStmt = db.prepare('SELECT * FROM grounded_sessions WHERE session_id = ?');
   const upsertSessionStmt = db.prepare(`
     INSERT INTO grounded_sessions (
       session_id, goal, model, scale_tier, scale_profile_json, anchor_date, prefix_hash,
       status, max_duplicate_writes, seen_chunks_json, file_digests_json,
+      allowed_scopes_json, drift_state_json,
       schema_tokens_saved, schema_reduction_pct, turn0_tokens,
       exploratory_reads, committed_reads, committed_mutations, memoized_reads,
       spin_loops_blocked, output_defects_caught, timeouts_with_partial_stdout,
       turn0_duplicates_suppressed, duplicate_writes_blocked, policy_floor_blocks,
+      auth_drift_holds, dart_repairs_applied, dart_holds,
       truncation_recoveries, verify_nudges_used, pending_diffs_count,
       latest_verification_passed, created_at_ms, updated_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, ?, ?)
     ON CONFLICT(session_id) DO UPDATE SET
       goal = excluded.goal,
       model = excluded.model,
@@ -1206,6 +1297,8 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       max_duplicate_writes = excluded.max_duplicate_writes,
       seen_chunks_json = excluded.seen_chunks_json,
       file_digests_json = excluded.file_digests_json,
+      allowed_scopes_json = excluded.allowed_scopes_json,
+      drift_state_json = excluded.drift_state_json,
       schema_tokens_saved = excluded.schema_tokens_saved,
       schema_reduction_pct = excluded.schema_reduction_pct,
       turn0_tokens = excluded.turn0_tokens,
@@ -1219,6 +1312,9 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       turn0_duplicates_suppressed = 0,
       duplicate_writes_blocked = 0,
       policy_floor_blocks = 0,
+      auth_drift_holds = 0,
+      dart_repairs_applied = 0,
+      dart_holds = 0,
       truncation_recoveries = 0,
       verify_nudges_used = 0,
       pending_diffs_count = 0,
@@ -1241,6 +1337,10 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
   const countMutationsAfterStmt = db.prepare(`
     SELECT COUNT(*) AS cnt FROM grounded_events
     WHERE session_id = ? AND is_mutating = 1 AND status = 'COMMITTED' AND rowid > ?
+  `);
+  const maxDiffMutationRowStmt = db.prepare(`
+    SELECT MAX(rowid) AS max_rowid FROM grounded_events
+    WHERE session_id = ? AND is_mutating = 1 AND status = 'COMMITTED' AND call_signature != ?
   `);
   const selectEventStmt = db.prepare(
     'SELECT * FROM grounded_events WHERE event_id = ? AND session_id = ?'
@@ -1276,7 +1376,7 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
         false
       );
     }
-    const sessionId = String(params.session_id || `gh_${crypto.randomUUID()}`).trim();
+    const sessionId = String(params.session_id || params.sessionId || `gh_${crypto.randomUUID()}`).trim();
     const scaleProfile = resolveScaleProfile({
       model: params.model || '',
       activeParamsB: params.activeParamsB,
@@ -1284,9 +1384,38 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       thinkingEnabled: params.thinkingEnabled,
       reasoningEffort: params.reasoningEffort
     });
-    const seenChunks = Array.isArray(params.seen_chunk_ids) ? params.seen_chunk_ids : [];
-    const fileDigests =
-      params.file_digests && typeof params.file_digests === 'object' ? params.file_digests : {};
+    const seenChunks = Array.isArray(params.seen_chunk_ids ?? params.seenChunkIds)
+      ? (params.seen_chunk_ids ?? params.seenChunkIds)
+      : [];
+    const rawDigests = params.file_digests ?? params.fileDigests;
+    const fileDigests = rawDigests && typeof rawDigests === 'object' ? rawDigests : {};
+
+    const rawAllowedScopes = params.allowed_scopes ?? params.allowedScopes;
+    const allowedScopes = Array.isArray(rawAllowedScopes)
+      ? Array.from(
+          new Set(
+            rawAllowedScopes
+              .map((s) => String(s ?? '').trim().toUpperCase())
+              .filter(Boolean)
+          )
+        )
+      : [];
+    const rawBulk = Number(params.max_bulk_limit ?? params.maxBulkLimit ?? 1000);
+    const maxBulkLimit = Number.isFinite(rawBulk) && rawBulk > 0 ? Math.trunc(rawBulk) : 1000;
+    const enableAuthDriftGuard =
+      params.enable_auth_drift_guard !== false && params.enableAuthDriftGuard !== false;
+    const enableDartBoundaryGuard =
+      params.enable_dart_boundary_guard !== false && params.enableDartBoundaryGuard !== false;
+    const initialDriftState = {
+      driftScore: 0,
+      overcollectionCount: 0,
+      scopeViolations: 0,
+      taintedDomains: [],
+      maxBulkLimit,
+      enableAuthDriftGuard,
+      enableDartBoundaryGuard
+    };
+    const attestedScopes = inferGoalAttestedScopes(goal, allowedScopes);
     const now = Date.now();
 
     db.exec('BEGIN IMMEDIATE');
@@ -1298,14 +1427,16 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
         scaleProfile.model,
         scaleProfile.tier,
         JSON.stringify(scaleProfile),
-        String(params.anchor_date || ''),
-        String(params.prefix_hash || ''),
-        Math.max(1, Number(params.max_duplicate_writes || 1)),
+        String(params.anchor_date ?? params.anchorDate ?? ''),
+        String(params.prefix_hash ?? params.prefixHash ?? ''),
+        Math.max(1, Number(params.max_duplicate_writes ?? params.maxDuplicateWrites ?? 1)),
         JSON.stringify(seenChunks),
         JSON.stringify(fileDigests),
-        Number(params.schema_tokens_saved || 0),
-        Number(params.schema_reduction_pct || 0),
-        Number(params.turn0_tokens || 0),
+        JSON.stringify(allowedScopes),
+        JSON.stringify(initialDriftState),
+        Number(params.schema_tokens_saved ?? params.schemaTokensSaved ?? 0),
+        Number(params.schema_reduction_pct ?? params.schemaReductionPct ?? 0),
+        Number(params.turn0_tokens ?? params.turn0Tokens ?? 0),
         now,
         now
       );
@@ -1319,6 +1450,12 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       throw err;
     }
 
+    for (const key of Array.from(ruleStreaks.keys())) {
+      if (key.startsWith(`${sessionId}::`)) {
+        ruleStreaks.delete(key);
+      }
+    }
+
     return okEnvelope(
       'krusch_grounded_session_start',
       `Grounded session ${sessionId} initialized (${scaleProfile.tier}).`,
@@ -1327,7 +1464,8 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
         goal,
         status: 'ACTIVE',
         scaleProfile,
-        directive: buildScaleAwareDirective(scaleProfile)
+        directive: buildScaleAwareDirective(scaleProfile),
+        attestedScopes
       }
     );
   }
@@ -1380,16 +1518,32 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
     );
   }
 
-  function interceptToolCall({
-    session_id,
-    step = 0,
-    tool_name,
-    args = {},
-    mutating,
-    suppress_turn0_reads = true,
-    block_spin_loop = false
-  } = {}) {
-    const sessionId = String(session_id || '').trim();
+  function interceptToolCall(params = {}) {
+    const {
+      session_id,
+      sessionId: altSessionId,
+      step = 0,
+      tool_name,
+      toolName: altToolName,
+      args = {},
+      tool_schema,
+      toolSchema,
+      mutating,
+      is_outbound,
+      isOutbound,
+      allowed_scopes,
+      allowedScopes,
+      max_bulk_limit,
+      maxBulkLimit,
+      enable_auth_drift_guard,
+      enableAuthDriftGuard,
+      enable_dart_boundary_guard,
+      enableDartBoundaryGuard,
+      suppress_turn0_reads = true,
+      block_spin_loop = false
+    } = params || {};
+
+    const sessionId = String(session_id ?? altSessionId ?? '').trim();
     const session = sessionId ? selectSessionStmt.get(sessionId) : null;
     if (!session) {
       return okEnvelope(
@@ -1400,20 +1554,55 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       );
     }
 
-    const toolName = String(tool_name || '').trim();
+    const toolName = String(tool_name ?? altToolName ?? '').trim();
     const isMutating = classifyToolMutability(toolName, mutating);
+    const storedDriftState = safeParseJsonObject(session.drift_state_json);
+    const storedAllowedScopes = safeParseJsonArray(session.allowed_scopes_json)
+      .map((s) => String(s ?? ''))
+      .filter(Boolean);
+
+    const dartEnabled =
+      storedDriftState.enableDartBoundaryGuard !== false &&
+      enable_dart_boundary_guard !== false &&
+      enableDartBoundaryGuard !== false;
+    const authDriftEnabled =
+      storedDriftState.enableAuthDriftGuard !== false &&
+      enable_auth_drift_guard !== false &&
+      enableAuthDriftGuard !== false;
+
+    const rawSafeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+    const dartResult = dartEnabled
+      ? inspectAndRepairDartBoundaries({
+          toolName,
+          args: rawSafeArgs,
+          toolSchema: tool_schema ?? toolSchema ?? null
+        })
+      : {
+          action: 'ALLOW',
+          repaired: false,
+          repairedArgs: rawSafeArgs,
+          repairs: [],
+          issues: [],
+          correctivePrompt: null
+        };
+    const effectiveArgs = dartResult.repaired ? dartResult.repairedArgs : rawSafeArgs;
+
     const isForaging = !isMutating && FORAGING_TOOL_RE.test(toolName);
-    const { canonicalArgs, canonicalArgsJson, callSignature } = canonicalizeGroundedToolCallKey(
-      toolName,
-      args
-    );
+    const rawKey = canonicalizeGroundedToolCallKey(toolName, rawSafeArgs);
+    const { canonicalArgs, canonicalArgsJson, callSignature } = dartResult.repaired
+      ? canonicalizeGroundedToolCallKey(toolName, effectiveArgs)
+      : rawKey;
+
     const eventId = `ghe_${crypto.randomUUID()}`;
     const now = Date.now();
     const stepNum = Math.max(0, Math.trunc(Number(step || 0)));
     const scaleProfile = JSON.parse(session.scale_profile_json);
 
-    // 1. Frozen destructive policy floor
-    if (DESTRUCTIVE_SHELL_RE.test(canonicalArgsJson)) {
+    // 1. Frozen destructive policy floor (checked across both raw and DART-repaired arguments)
+    if (
+      DESTRUCTIVE_SHELL_RE.test(rawKey.canonicalArgsJson) ||
+      DESTRUCTIVE_SHELL_RE.test(canonicalArgsJson)
+    ) {
       insertEventStmt.run(
         eventId,
         sessionId,
@@ -1442,7 +1631,8 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
     }
 
     // 2. Secret leak guard
-    const secretHit = scanForSecretLeak(canonicalArgsJson);
+    const secretHit =
+      scanForSecretLeak(rawKey.canonicalArgsJson) || scanForSecretLeak(canonicalArgsJson);
     if (secretHit) {
       insertEventStmt.run(
         eventId,
@@ -1471,12 +1661,235 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       });
     }
 
+    // 2.2. DART MCP-vs-CLI Action Realization Boundary Hold (INV-GH-12)
+    if (dartResult.action === 'HOLD') {
+      insertEventStmt.run(
+        eventId,
+        sessionId,
+        stepNum,
+        toolName,
+        isMutating ? 1 : 0,
+        isForaging ? 1 : 0,
+        canonicalArgsJson,
+        callSignature,
+        'HOLD',
+        'HELD',
+        JSON.stringify(dartResult.issues),
+        '',
+        now,
+        now
+      );
+      db.prepare(
+        'UPDATE grounded_sessions SET dart_holds = dart_holds + 1, updated_at_ms = ? WHERE session_id = ?'
+      ).run(now, sessionId);
+      return okEnvelope(
+        'krusch_grounded_intercept',
+        `Held ${toolName} by DART boundary guard (${dartResult.issues.length} issue(s)).`,
+        {
+          event_id: eventId,
+          decision: 'HOLD',
+          reason: AUTH_DRIFT_REASON_CODES.DART_BOUNDARY_HOLD,
+          issues: dartResult.issues,
+          correctivePrompt: dartResult.correctivePrompt
+        }
+      );
+    }
+
+    // 2.3. Early Scope & Authorization Drift Guard + SERS Data Minimization (INV-GH-12)
+    let updatedDriftStateJson = null;
+    if (authDriftEnabled) {
+      const groundedFiles = safeParseJsonObject(session.file_digests_json);
+      const seenChunks = safeParseJsonArray(session.seen_chunks_json);
+      const hasTurnZeroGrounding =
+        Object.keys(groundedFiles).length > 0 || seenChunks.length > 0;
+      const extraScopes = allowed_scopes ?? allowedScopes;
+      const mergedAllowedScopes = Array.isArray(extraScopes)
+        ? [...storedAllowedScopes, ...extraScopes]
+        : storedAllowedScopes;
+      const sessionMaxBulkLimit =
+        max_bulk_limit ?? maxBulkLimit ?? storedDriftState.maxBulkLimit ?? 1000;
+      const isOutboundCall = Boolean(
+        is_outbound ?? isOutbound ?? OUTBOUND_TOOL_HINT_RE.test(toolName)
+      );
+
+      const driftVerdict = evaluateAuthorizationDrift({
+        toolName,
+        args: effectiveArgs,
+        isMutating,
+        isOutbound: isOutboundCall,
+        step: stepNum,
+        goal: session.goal,
+        allowedScopes: mergedAllowedScopes,
+        groundedFiles,
+        hasTurnZeroGrounding,
+        priorDriftState: storedDriftState,
+        maxBulkLimit: sessionMaxBulkLimit
+      });
+
+      updatedDriftStateJson = JSON.stringify({
+        ...storedDriftState,
+        ...driftVerdict.nextDriftState
+      });
+
+      if (driftVerdict.decision === 'BLOCK') {
+        insertEventStmt.run(
+          eventId,
+          sessionId,
+          stepNum,
+          toolName,
+          isMutating ? 1 : 0,
+          isForaging ? 1 : 0,
+          canonicalArgsJson,
+          callSignature,
+          'BLOCK',
+          'BLOCKED',
+          JSON.stringify(driftVerdict.issues),
+          '',
+          now,
+          now
+        );
+        db.prepare(
+          `UPDATE grounded_sessions
+           SET policy_floor_blocks = policy_floor_blocks + 1,
+               auth_drift_holds = auth_drift_holds + 1,
+               drift_state_json = ?,
+               updated_at_ms = ?
+           WHERE session_id = ?`
+        ).run(updatedDriftStateJson, now, sessionId);
+        return okEnvelope(
+          'krusch_grounded_intercept',
+          `Blocked ${toolName} by authorization drift guard (${driftVerdict.code}).`,
+          {
+            event_id: eventId,
+            decision: 'BLOCK',
+            reason: AUTH_DRIFT_REASON_CODES.AUTHORIZATION_DRIFT_BLOCK,
+            driftCode: driftVerdict.code,
+            issues: driftVerdict.issues,
+            correctivePrompt: driftVerdict.correctivePrompt,
+            driftState: driftVerdict.nextDriftState
+          }
+        );
+      }
+
+      if (driftVerdict.decision === 'HOLD') {
+        insertEventStmt.run(
+          eventId,
+          sessionId,
+          stepNum,
+          toolName,
+          isMutating ? 1 : 0,
+          isForaging ? 1 : 0,
+          canonicalArgsJson,
+          callSignature,
+          'HOLD',
+          'HELD',
+          JSON.stringify(driftVerdict.issues),
+          '',
+          now,
+          now
+        );
+        db.prepare(
+          `UPDATE grounded_sessions
+           SET auth_drift_holds = auth_drift_holds + 1,
+               drift_state_json = ?,
+               updated_at_ms = ?
+           WHERE session_id = ?`
+        ).run(updatedDriftStateJson, now, sessionId);
+        return okEnvelope(
+          'krusch_grounded_intercept',
+          `Held ${toolName} by authorization drift guard (${driftVerdict.code}).`,
+          {
+            event_id: eventId,
+            decision: 'HOLD',
+            reason: AUTH_DRIFT_REASON_CODES.AUTHORIZATION_DRIFT_HOLD,
+            driftCode: driftVerdict.code,
+            issues: driftVerdict.issues,
+            correctivePrompt: driftVerdict.correctivePrompt,
+            driftState: driftVerdict.nextDriftState
+          }
+        );
+      }
+    }
+
+    // 2.5. Meta-Harness Evolved HOLD_* Rules (INV-GH-11)
+    const commandText = extractCommandTextFromArgs(effectiveArgs);
+    for (const rule of activeEvolvedRules) {
+      if (
+        rule.action !== SYNTHESIZED_RULE_ACTIONS.HOLD_PSEUDO_COMPLETION_LOOP &&
+        rule.action !== SYNTHESIZED_RULE_ACTIONS.HOLD_TOOL_PATTERN
+      ) {
+        continue;
+      }
+      const streakKey = `${sessionId}::${rule.id}`;
+      if (matchesEvolvedRule(rule, toolName, commandText)) {
+        const nextStreak = (ruleStreaks.get(streakKey) || 0) + 1;
+        ruleStreaks.set(streakKey, nextStreak);
+        if (nextStreak >= rule.minConsecutiveMatches) {
+          const reasonCode =
+            rule.action === SYNTHESIZED_RULE_ACTIONS.HOLD_PSEUDO_COMPLETION_LOOP
+              ? 'PSEUDO_COMPLETION_ECHO_LOOP'
+              : rule.id;
+          insertEventStmt.run(
+            eventId,
+            sessionId,
+            stepNum,
+            toolName,
+            isMutating ? 1 : 0,
+            isForaging ? 1 : 0,
+            canonicalArgsJson,
+            callSignature,
+            'HOLD',
+            'HELD',
+            JSON.stringify([{ code: reasonCode, rule_id: rule.id, message: rule.correctivePrompt }]),
+            '',
+            now,
+            now
+          );
+          db.prepare(
+            'UPDATE grounded_sessions SET spin_loops_blocked = spin_loops_blocked + 1, updated_at_ms = ? WHERE session_id = ?'
+          ).run(now, sessionId);
+          return okEnvelope(
+            'krusch_grounded_intercept',
+            `Held ${toolName} by evolved rule ${rule.id} (${reasonCode}).`,
+            {
+              event_id: eventId,
+              decision: 'HOLD',
+              reason: reasonCode,
+              rule_id: rule.id,
+              correctivePrompt: rule.correctivePrompt,
+              issues: [{ code: reasonCode, rule_id: rule.id, message: rule.correctivePrompt }]
+            }
+          );
+        }
+      } else if (ruleStreaks.has(streakKey)) {
+        ruleStreaks.set(streakKey, 0);
+      }
+    }
+
+    const persistDartAndDriftOnAllow = (extraExploratory = 0) => {
+      const dartRepairDelta = dartResult.repaired ? dartResult.repairs.length : 0;
+      if (extraExploratory > 0 || dartRepairDelta > 0 || updatedDriftStateJson !== null) {
+        db.prepare(
+          `UPDATE grounded_sessions
+           SET exploratory_reads = exploratory_reads + ?,
+               dart_repairs_applied = dart_repairs_applied + ?,
+               drift_state_json = COALESCE(?, drift_state_json),
+               updated_at_ms = ?
+           WHERE session_id = ?`
+        ).run(extraExploratory, dartRepairDelta, updatedDriftStateJson, now, sessionId);
+      }
+    };
+
+    const dartAllowFields = dartResult.repaired
+      ? { repairedArgs: effectiveArgs, dartRepairs: dartResult.repairs }
+      : {};
+
     // 3. Read-only path: Turn-0 digest suppression + post-mutation re-read allowance + MEMOIZED -> BLOCK_SPIN_LOOP
     if (!isMutating) {
-      if (suppress_turn0_reads && args && typeof args === 'object') {
-        const relPath = String(args.relPath || args.path || '').replace(/\\/g, '/');
-        const reqDigest = String(args.fileDigest || '');
-        const digests = JSON.parse(session.file_digests_json || '{}');
+      if (suppress_turn0_reads && effectiveArgs && typeof effectiveArgs === 'object') {
+        const relPath = String(effectiveArgs.relPath || effectiveArgs.path || '').replace(/\\/g, '/');
+        const reqDigest = String(effectiveArgs.fileDigest || '');
+        const digests = safeParseJsonObject(session.file_digests_json);
         if (relPath && reqDigest && digests[relPath] && digests[relPath] === reqDigest) {
           insertEventStmt.run(
             eventId,
@@ -1597,49 +2010,61 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
         now,
         now
       );
-      if (isForaging) {
-        db.prepare(
-          'UPDATE grounded_sessions SET exploratory_reads = exploratory_reads + 1, updated_at_ms = ? WHERE session_id = ?'
-        ).run(now, sessionId);
-      }
+      persistDartAndDriftOnAllow(isForaging ? 1 : 0);
       return okEnvelope('krusch_grounded_intercept', `Allowed read call ${toolName}.`, {
         event_id: eventId,
         decision: 'ALLOW',
         reason: 'ALLOW_READ',
-        issues: []
+        issues: [],
+        ...dartAllowFields
       });
     }
 
-    // 4. Mutating path: duplicate-write prevention + SMALL_MODEL soft holds
-    const priorMutations = selectEventsBySigStmt
-      .all(sessionId, callSignature)
-      .filter((r) => r.status === 'STAGED' || r.status === 'COMMITTED');
-    if (priorMutations.length >= Number(session.max_duplicate_writes || 1)) {
-      insertEventStmt.run(
-        eventId,
-        sessionId,
-        stepNum,
-        toolName,
-        1,
-        0,
-        canonicalArgsJson,
-        callSignature,
-        'BLOCK',
-        'BLOCKED',
-        '[]',
-        '',
-        now,
-        now
+    // 4. Mutating path: duplicate-write prevention (with GH-EVO-01 rollback exemption) + SMALL_MODEL soft holds
+    const exemptDuplicateWrite = activeEvolvedRules.some(
+      (rule) =>
+        rule.action === SYNTHESIZED_RULE_ACTIONS.EXEMPT_DUPLICATE_WRITE &&
+        matchesEvolvedRule(rule, toolName, commandText)
+    );
+
+    if (!exemptDuplicateWrite) {
+      const afterDiffRowId = Number(
+        maxDiffMutationRowStmt.get(sessionId, callSignature)?.max_rowid || 0
       );
-      db.prepare(
-        'UPDATE grounded_sessions SET duplicate_writes_blocked = duplicate_writes_blocked + 1, updated_at_ms = ? WHERE session_id = ?'
-      ).run(now, sessionId);
-      return okEnvelope('krusch_grounded_intercept', `Blocked duplicate write on ${toolName}.`, {
-        event_id: eventId,
-        decision: 'BLOCK',
-        reason: 'BLOCK_DUPLICATE_WRITE',
-        issues: []
-      });
+      const priorMutations = selectEventsBySigStmt
+        .all(sessionId, callSignature)
+        .filter(
+          (r) =>
+            Number(r._rowid || 0) > afterDiffRowId &&
+            (r.status === 'STAGED' || r.status === 'COMMITTED')
+        );
+      if (priorMutations.length >= Number(session.max_duplicate_writes || 1)) {
+        insertEventStmt.run(
+          eventId,
+          sessionId,
+          stepNum,
+          toolName,
+          1,
+          0,
+          canonicalArgsJson,
+          callSignature,
+          'BLOCK',
+          'BLOCKED',
+          '[]',
+          '',
+          now,
+          now
+        );
+        db.prepare(
+          'UPDATE grounded_sessions SET duplicate_writes_blocked = duplicate_writes_blocked + 1, updated_at_ms = ? WHERE session_id = ?'
+        ).run(now, sessionId);
+        return okEnvelope('krusch_grounded_intercept', `Blocked duplicate write on ${toolName}.`, {
+          event_id: eventId,
+          decision: 'BLOCK',
+          reason: 'BLOCK_DUPLICATE_WRITE',
+          issues: []
+        });
+      }
     }
 
     if (scaleProfile.softHoldPlaceholdersAndDates) {
@@ -1690,11 +2115,13 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       now,
       now
     );
+    persistDartAndDriftOnAllow(0);
     return okEnvelope('krusch_grounded_intercept', `Allowed mutating call ${toolName}.`, {
       event_id: eventId,
       decision: 'ALLOW',
       reason: 'ALLOW_MUTATION',
-      issues: []
+      issues: [],
+      ...dartAllowFields
     });
   }
 
@@ -1706,7 +2133,8 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
     timed_out = false,
     partial_stdout = '',
     pending_diffs_delta = 0,
-    verification_passed = undefined
+    verification_passed = undefined,
+    clear_pending_diffs = undefined
   } = {}) {
     const sessionId = String(session_id || '').trim();
     const session = sessionId ? selectSessionStmt.get(sessionId) : null;
@@ -1734,15 +2162,53 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       ? String(partial_stdout || result_preview || '').slice(0, 2000)
       : String(result_preview || '').slice(0, 1024);
     const now = Date.now();
+    const deltaNum = Number(pending_diffs_delta || 0);
 
-    let nextDiffs = Math.max(0, Number(session.pending_diffs_count || 0) + Number(pending_diffs_delta || 0));
+    const eventArgs = safeParseJsonObject(event.canonical_args_json);
+    const eventCommandText = extractCommandTextFromArgs(eventArgs);
+    const eventToolName = String(event.tool_name || '');
+
+    let nextDiffs = Number(session.pending_diffs_count || 0);
     let nextVerifyPassed = Number(session.latest_verification_passed ?? 1);
-    if (Number(pending_diffs_delta || 0) > 0) {
-      nextVerifyPassed = 0;
+
+    if (finalStatus === 'COMMITTED') {
+      const exemptCleanupDiff =
+        Boolean(event.is_mutating) &&
+        nextDiffs === 0 &&
+        nextVerifyPassed === 1 &&
+        activeEvolvedRules.some(
+          (rule) =>
+            rule.action === SYNTHESIZED_RULE_ACTIONS.EXEMPT_CLEANUP_DIFF &&
+            matchesEvolvedRule(rule, eventToolName, eventCommandText)
+        );
+
+      if (!exemptCleanupDiff) {
+        nextDiffs = Math.max(0, nextDiffs + deltaNum);
+        if (deltaNum > 0 && verification_passed === undefined) {
+          nextVerifyPassed = 0;
+        }
+      }
+
+      if (verification_passed === undefined && deltaNum <= 0) {
+        const creditInlineVerify = activeEvolvedRules.some(
+          (rule) =>
+            rule.action === SYNTHESIZED_RULE_ACTIONS.CREDIT_INLINE_VERIFY &&
+            matchesEvolvedRule(rule, eventToolName, eventCommandText)
+        );
+        if (creditInlineVerify) {
+          nextVerifyPassed = 1;
+          if (clear_pending_diffs !== false) {
+            nextDiffs = 0;
+          }
+        }
+      }
     }
+
     if (verification_passed === true) {
       nextVerifyPassed = 1;
-      nextDiffs = 0;
+      if (clear_pending_diffs !== false) {
+        nextDiffs = 0;
+      }
     } else if (verification_passed === false) {
       nextVerifyPassed = 0;
     }
@@ -1781,6 +2247,8 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       session_id: sessionId,
       event_id: event.event_id,
       status: finalStatus,
+      pending_diffs_count: nextDiffs,
+      latest_verification_passed: nextVerifyPassed,
       timed_out: isTimeout,
       preserved_stdout: isTimeout ? preview : undefined,
       has_final_answer: false,
@@ -1926,6 +2394,8 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
       result_preview: e.result_preview
     }));
 
+    const hydratedDrift = safeParseJsonObject(row.drift_state_json);
+
     return okEnvelope('krusch_grounded_summary', `Summary for grounded session ${sessionId}.`, {
       session: {
         session_id: row.session_id,
@@ -1949,6 +2419,13 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
         turn0DuplicatesSuppressed: Number(row.turn0_duplicates_suppressed || 0),
         duplicateWritesBlocked: Number(row.duplicate_writes_blocked || 0),
         policyFloorBlocks: Number(row.policy_floor_blocks || 0),
+        authDriftHolds: Number(row.auth_drift_holds || 0),
+        dartRepairsApplied: Number(row.dart_repairs_applied || 0),
+        dartHolds: Number(row.dart_holds || 0),
+        driftScore: Number(hydratedDrift.driftScore || 0),
+        taintedDomains: Array.isArray(hydratedDrift.taintedDomains)
+          ? hydratedDrift.taintedDomains
+          : [],
         truncationRecoveries: Number(row.truncation_recoveries || 0),
         verifyNudgesUsed: Number(row.verify_nudges_used || 0)
       },
@@ -1968,3 +2445,21 @@ export function createGroundedHarnessEngine({ db, workspaceRoot = process.cwd() 
     sessionSummary
   };
 }
+
+export {
+  SENSITIVE_SCOPE_DOMAINS,
+  AUTH_DRIFT_REASON_CODES,
+  inferGoalAttestedScopes,
+  inspectAndRepairDartBoundaries,
+  evaluateAuthorizationDrift,
+  auditTrajectoryAuthorizationDrift,
+  SYNTHESIZED_RULE_ACTIONS,
+  DEFAULT_EVOLVED_HARNESS_RULES,
+  compileSafeRuleRegex,
+  compileExecutableRules,
+  extractShellCommandsFromTrajectory,
+  mineFailureTrajectories,
+  verifyCandidateRulesOnTraces,
+  synthesizeRulesWithTeacher,
+  evolveRulesFromTraces
+};
