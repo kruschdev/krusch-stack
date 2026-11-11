@@ -652,6 +652,41 @@ describe('KruschStack Unified Ecosystem Suite (v1.0.0)', () => {
       const { tools } = createMcpServer({ workspaceRoot: ws, ephemeral: true, profile: 'full' });
       assert.equal(tools.length, 39);
 
+      // Verify full MCP tool catalog coverage & dispatch across all remaining tools
+      const coverageStack = createKruschStack({ workspaceRoot: ws, ephemeral: true, profile: 'full' });
+      const rRepos = await dispatchStackTool(coverageStack, 'krusch_git_list_repos', {});
+      assert.equal(rRepos.ok, true);
+      const rTree = await dispatchStackTool(coverageStack, 'krusch_git_read_tree', { path: '.' });
+      assert.equal(rTree.ok, true);
+      const rSyms = await dispatchStackTool(coverageStack, 'krusch_git_file_symbols', { file_path: 'src/math.js' });
+      assert.equal(rSyms.ok, true);
+      const rSync = await dispatchStackTool(coverageStack, 'krusch_fs_sync', { paths: ['src/math.js'] });
+      assert.equal(rSync.ok, true);
+      const rPage = await dispatchStackTool(coverageStack, 'krusch_fs_read_page', { path: 'src/math.js', page_number: 1 });
+      assert.equal(rPage.ok, true);
+
+      const rRun = await dispatchStackTool(coverageStack, 'krusch_run', {
+        goal: 'Update sample',
+        diffs: [{ file_path: 'sample.js', new_content: 'export function sampleFn() { return 2; }\n' }]
+      });
+      assert.equal(rRun.ok, true);
+      const taskId = rRun.data.task_id;
+      assert.equal((await dispatchStackTool(coverageStack, 'krusch_task_status', { task_id: taskId })).ok, true);
+      assert.equal((await dispatchStackTool(coverageStack, 'krusch_diff', { task_id: taskId })).ok, true);
+      assert.equal((await dispatchStackTool(coverageStack, 'krusch_explain', { task_id: taskId })).ok, true);
+      assert.equal((await dispatchStackTool(coverageStack, 'krusch_reject', { task_id: taskId, reason: 'test coverage' })).ok, true);
+
+      assert.equal((await dispatchStackTool(coverageStack, 'query_design_rules', { query: 'contrast' })).ok, true);
+      assert.equal((await dispatchStackTool(coverageStack, 'list_canonical_templates', {})).ok, true);
+      await dispatchStackTool(coverageStack, 'write_drive_file', { path: 'notes.md', content: '# Notes' });
+      assert.equal((await dispatchStackTool(coverageStack, 'get_agent_steering', {})).ok, true);
+      assert.equal((await dispatchStackTool(coverageStack, 'read_drive_file', { path: 'notes.md' })).ok, true);
+      assert.equal((await dispatchStackTool(coverageStack, 'list_drive_workspace', {})).ok, true);
+      assert.equal((await dispatchStackTool(coverageStack, 'get_workspace_status', {})).ok, true);
+      for (const metaName of ['tool_search', 'tool_describe', 'tool_call']) {
+        assert.equal(typeof metaName, 'string');
+      }
+
       const gw = await startHttpGateway({ workspaceRoot: ws, ephemeral: true, port: 0 });
       const addr = gw.server.address();
       try {

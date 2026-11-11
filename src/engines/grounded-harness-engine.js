@@ -955,6 +955,13 @@ function deferToolsForTurnZero(tools = [], pinnedToolNames = [], deferThreshold 
         type: 'object',
         properties: { query: { type: 'string' }, limit: { type: 'number' } },
         required: ['query']
+      },
+      annotations: {
+        title: 'Search Deferred Tools (BM25)',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
       }
     },
     {
@@ -964,6 +971,13 @@ function deferToolsForTurnZero(tools = [], pinnedToolNames = [], deferThreshold 
         type: 'object',
         properties: { toolName: { type: 'string' } },
         required: ['toolName']
+      },
+      annotations: {
+        title: 'Describe Deferred Tool Schema',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
       }
     },
     {
@@ -973,6 +987,13 @@ function deferToolsForTurnZero(tools = [], pinnedToolNames = [], deferThreshold 
         type: 'object',
         properties: { toolName: { type: 'string' }, args: { type: 'object' } },
         required: ['toolName']
+      },
+      annotations: {
+        title: 'Invoke Deferred Tool',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false
       }
     }
   ];
