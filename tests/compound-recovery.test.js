@@ -1,9 +1,11 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   openStackDatabase,
@@ -812,6 +814,204 @@ describe('SQLite-Style Compound-Fault Recovery Suite (INV-REC-01..05)', () => {
       assert.equal(fs.readFileSync(path.join(ws, 'src', 'b.js'), 'utf8'), baseB);
       db.close();
     } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  test('9. Real 3-Process SIGKILL After First Rename + Cold Fresh-Process SQLite WAL Startup Recovery', async () => {
+    const ws = makeTempDir();
+    let child1 = null;
+    try {
+      const dbDir = path.join(ws, '.krusch-stack');
+      const dbPath = path.join(dbDir, 'stack.db');
+      const markerPath = path.join(dbDir, 'first-rename.marker');
+      const workerApplyPath = path.join(dbDir, 'worker-apply.mjs');
+      const workerRecoverPath = path.join(dbDir, 'worker-recover.mjs');
+      const stackEntryUrl = pathToFileURL(
+        path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/index.js')
+      ).href;
+
+      fs.mkdirSync(path.join(ws, 'src'), { recursive: true });
+      const baseFee = 'export function calculateFee(amount) {\n  return Math.round(amount * 0.01);\n}\n';
+      const baseSettle = 'export function settleBatch(total, fee) {\n  return total - fee;\n}\n';
+      const stagedFee = 'export function calculateFee(amount) {\n  return Math.round(amount * 0.025);\n}\n';
+      const stagedSettle = 'export function settleBatch(total, fee) {\n  return Math.max(0, total - fee);\n}\n';
+
+      fs.writeFileSync(path.join(ws, 'src', 'fee.js'), baseFee, 'utf8');
+      fs.writeFileSync(path.join(ws, 'src', 'settle.js'), baseSettle, 'utf8');
+
+      // (a) Seed file-backed stack.db, stage 2-file update, and close stack.db
+      const setupStack = createKruschStack({ workspaceRoot: ws, dbPath, ephemeral: false });
+      assert.equal(setupStack.startupRecovery?.ok, true);
+      const staged = setupStack.harness.run({
+        goal: 'Atomically update fee.js and settle.js across real OS worker crash',
+        edits: [
+          { file_path: 'src/fee.js', content: stagedFee },
+          { file_path: 'src/settle.js', content: stagedSettle }
+        ]
+      });
+      assert.equal(staged.ok, true);
+      assert.equal(staged.data.status, 'STAGED');
+      const taskId = staged.data.task_id;
+      setupStack.db.close();
+
+      // (b) Write worker-apply.mjs & spawn Child Process 1 with pause-after-first-rename hook
+      fs.writeFileSync(
+        workerApplyPath,
+        [
+          `import { createKruschStack } from ${JSON.stringify(stackEntryUrl)};`,
+          'const [ws, dbPath, taskId] = process.argv.slice(2);',
+          'const stack = createKruschStack({ workspaceRoot: ws, dbPath, ephemeral: false, recoverOnStartup: false });',
+          'const res = stack.harness.applyDiff({ task_id: taskId });',
+          'stack.db.close();',
+          'process.stdout.write(JSON.stringify(res) + "\\n");'
+        ].join('\n'),
+        'utf8'
+      );
+
+      child1 = spawn(process.execPath, [workerApplyPath, ws, dbPath, taskId], {
+        env: {
+          ...process.env,
+          KRUSCH_ENABLE_TEST_HOOKS: '1',
+          KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME: '1',
+          KRUSCH_TEST_HOOK_MARKER_FILE: markerPath
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      let child1Stderr = '';
+      child1.stderr.on('data', (chunk) => {
+        child1Stderr += chunk.toString('utf8');
+      });
+      const child1ExitPromise = new Promise((resolve, reject) => {
+        child1.once('error', reject);
+        child1.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+
+      // (c) Poll for KRUSCH_TEST_HOOK_MARKER_FILE, send SIGKILL to Child 1, and assert SIGKILL exit
+      const deadline = Date.now() + 10000;
+      let markerText = '';
+      while (Date.now() < deadline) {
+        if (fs.existsSync(markerPath)) {
+          const content = fs.readFileSync(markerPath, 'utf8');
+          if (content.includes('\n')) {
+            markerText = content.trim();
+            break;
+          }
+        }
+        if (child1.exitCode !== null || child1.signalCode !== null) {
+          throw new Error(
+            `Child 1 exited prematurely before writing marker (code=${child1.exitCode}, signal=${child1.signalCode}): ${child1Stderr}`
+          );
+        }
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      assert.ok(markerText.length > 0, 'Timed out waiting for KRUSCH_TEST_HOOK_MARKER_FILE');
+      assert.equal(Number(markerText), child1.pid);
+
+      child1.kill('SIGKILL');
+      const child1Exit = await child1ExitPromise;
+      assert.equal(child1Exit.signal, 'SIGKILL');
+      assert.equal(child1Exit.code, null);
+      child1 = null;
+
+      // (d) Verify torn on-disk state prior to cold recovery (without opening stack.db in parent!)
+      assert.equal(fs.readFileSync(path.join(ws, 'src', 'fee.js'), 'utf8'), stagedFee);
+      assert.equal(fs.readFileSync(path.join(ws, 'src', 'settle.js'), 'utf8'), baseSettle);
+      const tornOrphans = listTempOrphans(ws);
+      assert.equal(tornOrphans.length, 1, 'Expected unrenamed .settle.js.krusch-tmp-* orphan on disk');
+      assert.ok(
+        path.basename(tornOrphans[0]).startsWith('.settle.js.krusch-tmp-'),
+        `Unexpected orphan filename: ${tornOrphans[0]}`
+      );
+
+      // (e) Spawn cold fresh Child Process 2 exercising default recoverOnStartup: true over SQLite WAL
+      fs.writeFileSync(
+        workerRecoverPath,
+        [
+          `import assert from 'node:assert/strict';`,
+          `import { createKruschStack } from ${JSON.stringify(stackEntryUrl)};`,
+          'const [ws, dbPath] = process.argv.slice(2);',
+          'const stack = createKruschStack({ workspaceRoot: ws, dbPath, ephemeral: false });',
+          'assert.equal(stack.startupRecovery?.ok, true);',
+          'assert.equal(stack.startupRecovery?.data?.recovered_count, 1);',
+          'assert.equal(stack.startupRecovery?.data?.outcomes?.[0]?.outcome, "ROLLED_BACK_TO_STAGED");',
+          'const payload = { pid: process.pid, startupRecovery: stack.startupRecovery };',
+          'stack.db.close();',
+          'process.stdout.write(JSON.stringify(payload) + "\\n");'
+        ].join('\n'),
+        'utf8'
+      );
+
+      const child2 = spawn(process.execPath, [workerRecoverPath, ws, dbPath], {
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      let child2Stdout = '';
+      let child2Stderr = '';
+      child2.stdout.on('data', (chunk) => {
+        child2Stdout += chunk.toString('utf8');
+      });
+      child2.stderr.on('data', (chunk) => {
+        child2Stderr += chunk.toString('utf8');
+      });
+      const child2Exit = await new Promise((resolve, reject) => {
+        child2.once('error', reject);
+        child2.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+      assert.equal(
+        child2Exit.code,
+        0,
+        `Child 2 cold recovery failed (signal=${child2Exit.signal}): ${child2Stderr}`
+      );
+
+      const recoverPayload = JSON.parse(child2Stdout.trim());
+      assert.notEqual(recoverPayload.pid, Number(markerText));
+      assert.notEqual(recoverPayload.pid, process.pid);
+      assert.equal(recoverPayload.startupRecovery.ok, true);
+      assert.equal(recoverPayload.startupRecovery.data.recovered_count, 1);
+      assert.equal(recoverPayload.startupRecovery.data.outcomes[0].task_id, taskId);
+      assert.equal(recoverPayload.startupRecovery.data.outcomes[0].outcome, 'ROLLED_BACK_TO_STAGED');
+
+      // (f) Parent reopens stack.db, verifies journal + task + files + 0 orphans, then applies cleanly
+      const verifyStack = createKruschStack({ workspaceRoot: ws, dbPath, ephemeral: false });
+      assert.equal(verifyStack.startupRecovery?.ok, true);
+      assert.equal(verifyStack.startupRecovery?.data?.recovered_count, 0);
+
+      const journalAfterRecovery = verifyStack.db
+        .prepare('SELECT state, last_error FROM harness_apply_journal WHERE task_id = ?')
+        .get(taskId);
+      assert.equal(journalAfterRecovery.state, 'ROLLED_BACK');
+      assert.equal(journalAfterRecovery.last_error, null);
+
+      const statusAfterRecovery = verifyStack.harness.taskStatus({ task_id: taskId });
+      assert.equal(statusAfterRecovery.ok, true);
+      assert.equal(statusAfterRecovery.data.status, 'STAGED');
+      assert.deepEqual(listTempOrphans(ws), []);
+      assert.equal(fs.readFileSync(path.join(ws, 'src', 'fee.js'), 'utf8'), baseFee);
+      assert.equal(fs.readFileSync(path.join(ws, 'src', 'settle.js'), 'utf8'), baseSettle);
+
+      const cleanApply = verifyStack.harness.applyDiff({ task_id: taskId });
+      assert.equal(cleanApply.ok, true);
+      assert.equal(cleanApply.data.status, 'APPLIED');
+      assert.equal(verifyStack.harness.taskStatus({ task_id: taskId }).data.status, 'APPLIED');
+
+      const journalFinal = verifyStack.db
+        .prepare('SELECT state FROM harness_apply_journal WHERE task_id = ?')
+        .get(taskId);
+      assert.equal(journalFinal.state, 'APPLIED');
+      assert.deepEqual(listTempOrphans(ws), []);
+      assert.equal(fs.readFileSync(path.join(ws, 'src', 'fee.js'), 'utf8'), stagedFee);
+      assert.equal(fs.readFileSync(path.join(ws, 'src', 'settle.js'), 'utf8'), stagedSettle);
+      verifyStack.db.close();
+    } finally {
+      if (child1 && child1.exitCode === null && child1.signalCode === null) {
+        try {
+          child1.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+      }
       fs.rmSync(ws, { recursive: true, force: true });
     }
   });

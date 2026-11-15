@@ -89,6 +89,7 @@ export const VERSION = '1.1.0';
  * @param {string} [options.embedEndpoint]
  * @param {string} [options.embedModel]
  * @param {boolean} [options.autoEmbed]
+ * @param {boolean} [options.recoverOnStartup]
  */
 export function createKruschStack(options = {}) {
   const workspaceRoot = path.resolve(
@@ -100,6 +101,7 @@ export function createKruschStack(options = {}) {
     options.ephemeral === true ||
     options.dbPath === ':memory:' ||
     (options.ephemeral !== false && !hasExplicitFileDb && process.env.KRUSCH_EPHEMERAL === '1');
+  const recoverOnStartup = Boolean(options.recoverOnStartup ?? !ephemeral);
   const db = options.db || openStackDatabase({
     workspaceRoot,
     dbPath: options.dbPath,
@@ -120,6 +122,7 @@ export function createKruschStack(options = {}) {
   const git = createGitEngine({ db, workspaceRoot });
   const fs = createFsEngine({ db, workspaceRoot });
   const harness = createHarnessEngine({ db, workspaceRoot, contextEngine: context });
+  const startupRecovery = recoverOnStartup ? harness.recoverInFlight() : null;
   const frontend = createFrontendEngine({ db });
   const workspace = createWorkspaceEngine({ db, workspaceRoot });
   const router = createRouterEngine({ config: options.routerConfig });
@@ -145,6 +148,7 @@ export function createKruschStack(options = {}) {
     workspaceRoot,
     profile,
     db,
+    startupRecovery,
     engines,
     context,
     git,

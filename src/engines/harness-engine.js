@@ -182,11 +182,18 @@ export function fsyncDirectory(dirPath, fsImpl = fs) {
 /**
  * Write full UTF-8 buffer to an open file descriptor, handling partial writes.
  * @param {number} fd
- * @param {string} content
- * @param {typeof fs} fsImpl
+ * @param {string|Buffer} content
+ * @param {string|typeof fs} [pathOrFsImpl]
+ * @param {typeof fs} [maybeFsImpl]
  */
-function writeAllSync(fd, content, fsImpl) {
-  const buf = Buffer.from(String(content ?? ''), 'utf8');
+function writeAllSync(fd, content, pathOrFsImpl, maybeFsImpl) {
+  const fsImpl =
+    typeof maybeFsImpl?.writeSync === 'function'
+      ? maybeFsImpl
+      : typeof pathOrFsImpl?.writeSync === 'function'
+        ? pathOrFsImpl
+        : fs;
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content ?? ''), 'utf8');
   if (buf.length === 0) {
     fsImpl.writeSync(fd, buf, 0, 0);
     return;
@@ -1008,6 +1015,11 @@ export function createHarnessEngine({
     }
 
     // Phase 3: Atomic rename + parent-directory fsync across batch with compound-safe rollback
+    const allowHooks =
+      process.env.NODE_ENV === 'test' ||
+      process.env.KRUSCH_ENABLE_TEST_HOOKS === '1' ||
+      process.env.KRUSCH_ENABLE_TEST_HOOKS === 'true' ||
+      process.env.npm_lifecycle_event === 'test';
     const renamedSoFar = [];
     try {
       for (const target of contentTargets) {
@@ -1015,6 +1027,30 @@ export function createHarnessEngine({
         target.tempPath = null;
         renamedSoFar.push(target);
         fsyncDirectory(path.dirname(target.absPath), fsImpl);
+
+        if (
+          allowHooks &&
+          process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME === '1' &&
+          renamedSoFar.length === 1
+        ) {
+          const markerPath = process.env.KRUSCH_TEST_HOOK_MARKER_FILE;
+          if (markerPath) {
+            let fd = null;
+            try {
+              fd = fsImpl.openSync(markerPath, 'w', 0o600);
+              writeAllSync(fd, Buffer.from(String(process.pid) + '\n', 'utf8'), markerPath, fsImpl);
+              fsImpl.fsyncSync(fd);
+            } finally {
+              if (fd !== null) {
+                fsImpl.closeSync(fd);
+              }
+            }
+          }
+          if (process.env.KRUSCH_TEST_HOOK_SELF_SIGKILL === '1') {
+            process.kill(process.pid, 'SIGKILL');
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15000);
+        }
       }
     } catch (renameOrFsyncErr) {
       for (const target of contentTargets) {
