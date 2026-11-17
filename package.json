@@ -16,7 +16,8 @@
     "./doctor": "./src/installer/doctor.js",
     "./resilience": "./src/engines/resilience-engine.js",
     "./action-harness": "./src/engines/action-harness-engine.js",
-    "./grounded-harness": "./src/engines/grounded-harness-engine.js"
+    "./grounded-harness": "./src/engines/grounded-harness-engine.js",
+    "./brick-exchange": "./src/engines/brick-exchange-engine.js"
   },
   "engines": {
     "node": ">=22.0.0"

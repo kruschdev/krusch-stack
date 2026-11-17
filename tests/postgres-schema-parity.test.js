@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { STACK_SCHEMA_SQL } from '../src/db/sqlite.js';
 import { RESILIENCE_SCHEMA_SQL } from '../src/engines/resilience-engine.js';
 import { GROUNDED_HARNESS_SCHEMA_SQL } from '../src/engines/grounded-harness-engine.js';
+import { BRICK_EXCHANGE_SCHEMA_SQL } from '../src/engines/brick-exchange-engine.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,7 +30,10 @@ const REQUIRED_POSTGRES_TABLES = [
   'action_harness_sessions',
   'action_harness_events',
   'grounded_sessions',
-  'grounded_events'
+  'grounded_events',
+  'brick_exchange_bricks',
+  'brick_exchange_grants',
+  'brick_exchange_adoptions'
 ];
 
 /**
@@ -420,13 +424,24 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
     assert.equal(groundedEventCols.get('created_at_ms'), 'BIGINT NOT NULL');
     assert.equal(groundedEventCols.get('updated_at_ms'), 'BIGINT NOT NULL');
 
+    // 5. Cross-check INV-STACK-12 Brick Exchange tables & types
+    const sqliteBrickTables = extractTableColumns(BRICK_EXCHANGE_SCHEMA_SQL);
+    for (const [tableName, sqliteCols] of sqliteBrickTables.entries()) {
+      const pgCols = pgTables.get(tableName);
+      assert.ok(pgCols, `Brick Exchange table ${tableName} missing from db/init.sql`);
+      assert.deepEqual([...pgCols.keys()], [...sqliteCols.keys()]);
+    }
+
     const requiredIndexes = [
       ['idx_stack_hitl_gates_task_status', 'stack_hitl_gates', '(task_id, status)'],
       ['idx_stack_shadow_runs_request', 'stack_shadow_runs', '(request_id, created_at_ms)'],
       ['idx_action_harness_events_sig', 'action_harness_events', '(session_id, call_signature)'],
       ['idx_action_harness_events_session_time', 'action_harness_events', '(session_id, created_at_ms)'],
       ['idx_grounded_events_sig', 'grounded_events', '(session_id, call_signature)'],
-      ['idx_grounded_events_session_time', 'grounded_events', '(session_id, created_at_ms)']
+      ['idx_grounded_events_session_time', 'grounded_events', '(session_id, created_at_ms)'],
+      ['idx_brick_exchange_bricks_org', 'brick_exchange_bricks', '(org_id, brick_id)'],
+      ['idx_brick_exchange_grants_brick', 'brick_exchange_grants', '(brick_id, source_hash)'],
+      ['idx_brick_exchange_adoptions_brick', 'brick_exchange_adoptions', '(brick_id, created_at_ms)']
     ];
 
     for (const [idxName, tblName, colTuple] of requiredIndexes) {

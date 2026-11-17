@@ -73,6 +73,12 @@ import {
   compileTurnZeroGrounding,
   createGroundedHarnessEngine
 } from './engines/grounded-harness-engine.js';
+import {
+  BRICK_EXCHANGE_SCHEMA_SQL,
+  generateEd25519BrickKeys,
+  verifySealedBrickBundle,
+  createBrickExchangeEngine
+} from './engines/brick-exchange-engine.js';
 import { generateIdeConfig, writeIdeConfigs, IDE_CONFIG_PATHS } from './installer/ide-config.js';
 import { runStackDoctor, runStackCrashRecoveryDrill } from './installer/doctor.js';
 
@@ -129,6 +135,7 @@ export function createKruschStack(options = {}) {
   const resilience = createResilienceEngine({ db });
   const actionHarness = createActionHarnessEngine({ db, contextEngine: context });
   const groundedHarness = createGroundedHarnessEngine({ db, workspaceRoot });
+  const brickExchange = createBrickExchangeEngine({ db, workspaceRoot });
 
   const engines = {
     context,
@@ -140,7 +147,8 @@ export function createKruschStack(options = {}) {
     router,
     resilience,
     actionHarness,
-    groundedHarness
+    groundedHarness,
+    brickExchange
   };
 
   return {
@@ -160,6 +168,7 @@ export function createKruschStack(options = {}) {
     resilience,
     actionHarness,
     groundedHarness,
+    brickExchange,
     doctor: () => runStackDoctor({ workspaceRoot, db, profile }),
     status: () => router.getStackStatus({ engines })
   };
@@ -174,6 +183,7 @@ export {
   RESILIENCE_SCHEMA_SQL,
   ACTION_HARNESS_SCHEMA_SQL,
   GROUNDED_HARNESS_SCHEMA_SQL,
+  BRICK_EXCHANGE_SCHEMA_SQL,
   SCALE_TIERS,
   createContextEngine,
   packStackTokenBudget,
@@ -218,6 +228,9 @@ export {
   introspectWorkspaceSchemas,
   compileTurnZeroGrounding,
   createGroundedHarnessEngine,
+  generateEd25519BrickKeys,
+  verifySealedBrickBundle,
+  createBrickExchangeEngine,
   generateIdeConfig,
   writeIdeConfigs,
   IDE_CONFIG_PATHS,

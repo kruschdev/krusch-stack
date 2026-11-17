@@ -370,6 +370,40 @@ export function startHttpGateway(options = {}) {
       return;
     }
 
+    if (req.method === 'POST' && url.pathname.startsWith('/brick-exchange/')) {
+      const action = url.pathname.slice('/brick-exchange/'.length);
+      readBoundedJson()
+        .then(async ({ parsed }) => {
+          const actionMap = {
+            keygen: () => stack.brickExchange.keygen ? stack.brickExchange.keygen() : stack.brickExchange.stats(),
+            seal: () => stack.brickExchange.sealBrick(parsed),
+            verify: () => stack.brickExchange.verifyBrick(parsed),
+            publish: () => stack.brickExchange.publishBrick(parsed),
+            grant: () => stack.brickExchange.issueGrant(parsed),
+            revoke: () => stack.brickExchange.revokeGrant(parsed),
+            inbox: () => stack.brickExchange.listInbox(parsed),
+            try: () => stack.brickExchange.tryBrick(parsed),
+            adopt: () => stack.brickExchange.adoptBrick(parsed),
+            'audit-locks': () => stack.brickExchange.auditBrickLocks(parsed),
+            'blast-radius': () => stack.brickExchange.analyzeBlastRadius(parsed),
+            fanout: () => stack.brickExchange.planFanOut(parsed),
+            'verify-blast-radius': () => stack.brickExchange.verifyBlastRadius(parsed),
+            stats: () => stack.brickExchange.stats()
+          };
+          const handler = actionMap[action];
+          if (!handler) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ ok: false, error: `Unknown brick-exchange action: ${action}` }));
+            return;
+          }
+          const result = await handler();
+          res.writeHead(result.ok ? 200 : 400);
+          res.end(JSON.stringify(result, null, 2));
+        })
+        .catch(sendGatewayError);
+      return;
+    }
+
     res.writeHead(404);
     res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
   });

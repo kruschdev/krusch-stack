@@ -280,3 +280,53 @@ CREATE INDEX IF NOT EXISTS idx_grounded_events_sig
 
 CREATE INDEX IF NOT EXISTS idx_grounded_events_session_time
   ON grounded_events(session_id, created_at_ms);
+
+-- INV-STACK-12: Multi-Engineer & Multi-Agent Validated Brick Exchange
+CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
+  brick_key TEXT PRIMARY KEY,
+  brick_id TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  name TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  brick_class TEXT NOT NULL DEFAULT 'general',
+  author_id TEXT NOT NULL,
+  org_id TEXT NOT NULL,
+  key_id TEXT NOT NULL,
+  capabilities_json TEXT NOT NULL DEFAULT '[]',
+  bundle_json TEXT NOT NULL,
+  estimated_hours_saved DOUBLE PRECISION NOT NULL DEFAULT 0,
+  created_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brick_exchange_bricks_org
+  ON brick_exchange_bricks(org_id, brick_id);
+
+CREATE TABLE IF NOT EXISTS brick_exchange_grants (
+  grant_id TEXT PRIMARY KEY,
+  brick_id TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  issuer_id TEXT NOT NULL,
+  issuer_org_id TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'federated',
+  recipients_json TEXT NOT NULL DEFAULT '[]',
+  revoked INTEGER NOT NULL DEFAULT 0,
+  expires_at_ms BIGINT NOT NULL,
+  created_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brick_exchange_grants_brick
+  ON brick_exchange_grants(brick_id, source_hash);
+
+CREATE TABLE IF NOT EXISTS brick_exchange_adoptions (
+  adoption_id TEXT PRIMARY KEY,
+  brick_id TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  org_id TEXT NOT NULL,
+  grant_id TEXT NOT NULL DEFAULT '',
+  binding_hash TEXT NOT NULL DEFAULT '',
+  created_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
+  ON brick_exchange_adoptions(brick_id, created_at_ms);
