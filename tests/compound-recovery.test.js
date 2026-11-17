@@ -15,7 +15,7 @@ import {
   createHarnessEngine,
   fsyncDirectory
 } from '../src/engines/harness-engine.js';
-import { createKruschStack } from '../src/index.js';
+import { createKruschStack, runStackCrashRecoveryDrill } from '../src/index.js';
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-compound-rec-'));
@@ -1014,5 +1014,16 @@ describe('SQLite-Style Compound-Fault Recovery Suite (INV-REC-01..05)', () => {
       }
       fs.rmSync(ws, { recursive: true, force: true });
     }
+  });
+
+  test('runStackCrashRecoveryDrill self-test verifies multi-process SIGKILL -> ROLLED_BACK convergence via doctor API', async () => {
+    const drill = await runStackCrashRecoveryDrill();
+    assert.equal(drill.ok, true);
+    assert.equal(drill.data.converged, true);
+    assert.equal(drill.data.workerKilledSignal, 'SIGKILL');
+    assert.equal(drill.data.journalStateBefore, 'APPLYING');
+    assert.equal(drill.data.journalStateAfter, 'ROLLED_BACK');
+    assert.equal(drill.data.halfWrittenFiles, 0);
+    assert.equal(drill.data.orphanedTempCleaned, true);
   });
 });

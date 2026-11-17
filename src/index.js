@@ -74,7 +74,7 @@ import {
   createGroundedHarnessEngine
 } from './engines/grounded-harness-engine.js';
 import { generateIdeConfig, writeIdeConfigs, IDE_CONFIG_PATHS } from './installer/ide-config.js';
-import { runStackDoctor } from './installer/doctor.js';
+import { runStackDoctor, runStackCrashRecoveryDrill } from './installer/doctor.js';
 
 export const VERSION = '1.1.0';
 
@@ -221,5 +221,6 @@ export {
   generateIdeConfig,
   writeIdeConfigs,
   IDE_CONFIG_PATHS,
-  runStackDoctor
+  runStackDoctor,
+  runStackCrashRecoveryDrill
 };

@@ -18,7 +18,8 @@ import {
   VERSION,
   createKruschStack,
   writeIdeConfigs,
-  runStackDoctor
+  runStackDoctor,
+  runStackCrashRecoveryDrill
 } from '../src/index.js';
 import { runMcpServer, getStackTools, dispatchStackTool } from '../src/mcp/server.js';
 
@@ -46,6 +47,7 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       process.env.KRUSCH_STACK_DEFER_TOOLS === '1' ||
       process.env.KRUSCH_STACK_DEFER_TOOLS === 'true',
     json: false,
+    crashDrill: false,
     ephemeral: false,
     port: Number(process.env.KRUSCH_STACK_PORT || 3780),
     workspaceRoot: process.env.KRUSCH_WORKSPACE_ROOT || process.cwd()
@@ -79,6 +81,8 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       flags.port = Number(argv[++i]);
     } else if (arg === '--json') {
       flags.json = true;
+    } else if (arg === '--crash-drill') {
+      flags.crashDrill = true;
     } else if (arg === '--ephemeral') {
       flags.ephemeral = true;
     } else if (arg === '-h' || arg === '--help') {
@@ -425,6 +429,13 @@ async function main() {
       ephemeral: flags.ephemeral
     });
     const report = stack.doctor();
+    const drillReport = flags.crashDrill ? await runStackCrashRecoveryDrill() : null;
+    if (drillReport) {
+      report.data.crash_drill = drillReport.data;
+      if (!drillReport.ok) {
+        report.ok = false;
+      }
+    }
     if (flags.json) {
       console.log(JSON.stringify(report, null, 2));
     } else {
@@ -434,11 +445,17 @@ async function main() {
       console.log(`   SQLite   : ${report.data.sqlite_ready ? 'READY' : 'FAILED'}`);
       console.log(`   Postgres : ${report.data.postgres_configured ? 'CONFIGURED' : 'Not set (using zero-setup SQLite)'}`);
       console.log(`   Ollama   : ${report.data.ollama_host}`);
+      if (drillReport) {
+        console.log(`   SIGKILL  : ${drillReport.ok ? 'CONVERGED' : 'FAILED'} (${drillReport.summary})`);
+      }
       console.log(`\n   Active Pillars (${report.data.profile} profile):`);
       for (const comp of report.data.components) {
         console.log(`     ✓ [${comp.tier}] ${comp.name} — ${comp.description}`);
       }
       console.log('');
+    }
+    if (!report.ok) {
+      process.exitCode = 1;
     }
     return;
   }
