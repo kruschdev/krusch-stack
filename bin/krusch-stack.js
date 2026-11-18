@@ -388,6 +388,10 @@ export function startHttpGateway(options = {}) {
             'blast-radius': () => stack.brickExchange.analyzeBlastRadius(parsed),
             fanout: () => stack.brickExchange.planFanOut(parsed),
             'verify-blast-radius': () => stack.brickExchange.verifyBlastRadius(parsed),
+            'ontology-inspect': () => stack.brickExchange.inspectOntology(parsed),
+            'ontology-check': () => stack.brickExchange.checkOntologyCompatibility(parsed),
+            'ontology-compose': () => stack.brickExchange.composeCrossStack(parsed),
+            'ontology-bind': () => stack.brickExchange.synthesizeBinding(parsed),
             stats: () => stack.brickExchange.stats()
           };
           const handler = actionMap[action];

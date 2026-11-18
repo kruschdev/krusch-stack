@@ -23,6 +23,33 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import { okEnvelope, openStackDatabase } from '../db/sqlite.js';
+import {
+  STACK_ONTOLOGY_STACKS,
+  STACK_ONTOLOGY_PORTS,
+  STACK_ONTOLOGY_CHANNELS,
+  STACK_ONTOLOGY_MOE_PROFILES,
+  isWebStandardPureBrickSource,
+  areOntologyPortsCompatible,
+  inspectBrickOntology,
+  checkBrickOntologyCompatibility,
+  composeCrossStackBricks,
+  synthesizeHexagonalBinding,
+  createBrickOntologyEngine
+} from './brick-ontology-engine.js';
+
+export {
+  STACK_ONTOLOGY_STACKS,
+  STACK_ONTOLOGY_PORTS,
+  STACK_ONTOLOGY_CHANNELS,
+  STACK_ONTOLOGY_MOE_PROFILES,
+  isWebStandardPureBrickSource,
+  areOntologyPortsCompatible,
+  inspectBrickOntology,
+  checkBrickOntologyCompatibility,
+  composeCrossStackBricks,
+  synthesizeHexagonalBinding,
+  createBrickOntologyEngine
+};
 
 export const BRICK_EXCHANGE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
@@ -4729,6 +4756,16 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     );
   }
 
+  const ontologyEngine = createBrickOntologyEngine({
+    getAuthorizedBricksFn: (opts = {}) =>
+      listInbox({
+        viewerId: opts.viewerId,
+        viewerOrgId: opts.viewerOrgId,
+        nowMs: opts.nowMs
+      }),
+    tryBrickFn: tryBrick
+  });
+
   return Object.freeze({
     keygen: generateEd25519BrickKeys,
     sealBrick,
@@ -4743,6 +4780,10 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     analyzeBlastRadius,
     planFanOut,
     verifyBlastRadius,
+    inspectOntology: ontologyEngine.inspectOntology,
+    checkOntologyCompatibility: ontologyEngine.checkCompatibility,
+    composeCrossStack: ontologyEngine.composeBricks,
+    synthesizeBinding: ontologyEngine.synthesizeBinding,
     stats
   });
 }

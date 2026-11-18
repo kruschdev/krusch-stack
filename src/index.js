@@ -77,7 +77,18 @@ import {
   BRICK_EXCHANGE_SCHEMA_SQL,
   generateEd25519BrickKeys,
   verifySealedBrickBundle,
-  createBrickExchangeEngine
+  createBrickExchangeEngine,
+  STACK_ONTOLOGY_STACKS,
+  STACK_ONTOLOGY_PORTS,
+  STACK_ONTOLOGY_CHANNELS,
+  STACK_ONTOLOGY_MOE_PROFILES,
+  isWebStandardPureBrickSource,
+  areOntologyPortsCompatible,
+  inspectBrickOntology,
+  checkBrickOntologyCompatibility,
+  composeCrossStackBricks,
+  synthesizeHexagonalBinding,
+  createBrickOntologyEngine
 } from './engines/brick-exchange-engine.js';
 import { generateIdeConfig, writeIdeConfigs, IDE_CONFIG_PATHS } from './installer/ide-config.js';
 import { runStackDoctor, runStackCrashRecoveryDrill } from './installer/doctor.js';
@@ -231,6 +242,17 @@ export {
   generateEd25519BrickKeys,
   verifySealedBrickBundle,
   createBrickExchangeEngine,
+  STACK_ONTOLOGY_STACKS,
+  STACK_ONTOLOGY_PORTS,
+  STACK_ONTOLOGY_CHANNELS,
+  STACK_ONTOLOGY_MOE_PROFILES,
+  isWebStandardPureBrickSource,
+  areOntologyPortsCompatible,
+  inspectBrickOntology,
+  checkBrickOntologyCompatibility,
+  composeCrossStackBricks,
+  synthesizeHexagonalBinding,
+  createBrickOntologyEngine,
   generateIdeConfig,
   writeIdeConfigs,
   IDE_CONFIG_PATHS,
