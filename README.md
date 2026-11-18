@@ -26,6 +26,14 @@ Instead of installing, configuring, and wiring 7 separate repositories across Cl
 
 ## ⚡ Quick Start (Under 30 Seconds)
 
+### Agent-Assisted Setup
+
+Ask your coding agent (Claude Code, Codex, Cursor, Windsurf, or Antigravity):
+
+```text
+Read https://raw.githubusercontent.com/kruschdev/krusch-stack/main/INSTALL.md and set up krusch-stack on this machine.
+```
+
 ### Option A: Zero-Docker Local Install (`npx`)
 
 ```bash
