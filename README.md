@@ -62,6 +62,11 @@ Read https://raw.githubusercontent.com/kruschdev/krusch-stack/main/INSTALL.md an
 
 Need custom composition or Docker? Use `npx krusch-stack mcp --components context,git,harness`, `npx krusch-stack init --modular` (dedicated per-pillar MCP entries), or `docker compose up -d` (`http://127.0.0.1:3780/health` + companion PostgreSQL 16 `db/init.sql`).
 
+> 📘 **Focused 3-Minute Guides & Community**:
+> - **[Adding Reliable Memory to Cursor and Claude Code in One Command](docs/guides/adding-memory-to-cursor-and-claude-code.md)** (`--profile memory-only`, 5 verbs, SHA-256 span drift vs. stale `CLAUDE.md`)
+> - **[Why Two-Phase Commit (2PC) for Agent File Writes](docs/guides/why-2pc-for-agent-file-writes.md)** (staging unified diffs, pre-commit invariants, and `<32ms` `SIGKILL`-safe journal recovery)
+> - **[GitHub Discussions](https://github.com/kruschdev/krusch-stack/discussions)** (questions, local GPU setups, and benchmark reproductions)
+
 ### 🎬 Optional Watch: 100-Second Narrated Product Tour (`1080p`)
 
 [![Watch the KruschStack Narrated Product Tour (01:40, 1080p HD)](docs/video/krusch-stack-video-card.jpg)](https://krusch.dev/assets/video/krusch-stack-tour.mp4)
