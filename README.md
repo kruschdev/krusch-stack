@@ -68,12 +68,18 @@ curl http://127.0.0.1:3780/health
 │ • revise / nudge     │ • dependency_graph        │ • page_tree / read_page │
 │ • INV-12 span drift  │ • read_tree / read_blob   │ • remember_on_page      │
 ├──────────────────────┼───────────────────────────┼─────────────────────────┤
-│ 3. 2PC HARNESS       │ 4. FRONTEND DESIGN MCP    │ 5. WORKSPACE HUB        │
+│ 3A. 2PC HARNESS      │ 4. FRONTEND DESIGN MCP    │ 5. WORKSPACE HUB        │
 │ krusch-harness       │ krusch-frontend-mcp       │ g-krusch                │
 │ • run (stages diff)  │ • generate_color_palette  │ • get_agent_steering    │
 │ • apply_diff (2PC)   │ • css_to_tailwind         │ • search_drive_rag      │
 │ • explain / reject   │ • canonical_templates     │ • write (.gdoc/.slides) │
 ├──────────────────────┴───────────────────────────┴─────────────────────────┤
+│ 3B. GROUNDED HARNESS (INV-STACK-11)                                        │
+│ • Turn-0 schema/hazard grounding, scale tiers & defect-only stop gate      │
+├────────────────────────────────────────────────────────────────────────────┤
+│ 3C. BRICK EXCHANGE & 4-AXIS ONTOLOGY (INV-STACK-12 / INV-LEGO-36)          │
+│ • Ed25519 --permission brick seals, 2-hop AST fan-out & HydraScope bind    │
+├────────────────────────────────────────────────────────────────────────────┤
 │ 6. COGNITIVE CASCADE ROUTER (`krusch-cascade-router`)                      │
 │ • <25µs pure-CPU Stage-0 dispatch -> L2 Local MoE -> L2.5 120B -> L3 Ref.  │
 └────────────────────────────────────────────────────────────────────────────┘
