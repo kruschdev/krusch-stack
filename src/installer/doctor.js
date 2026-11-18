@@ -26,8 +26,12 @@ const REQUIRED_TABLES = [
   'fs_pages',
   'fs_page_memories',
   'harness_tasks',
+  'harness_apply_journal',
   'frontend_design_rules',
-  'workspace_files'
+  'workspace_files',
+  'brick_exchange_bricks',
+  'brick_exchange_grants',
+  'brick_exchange_adoptions'
 ];
 
 const ALL_COMPONENTS = [

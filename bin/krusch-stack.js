@@ -374,24 +374,129 @@ export function startHttpGateway(options = {}) {
       const action = url.pathname.slice('/brick-exchange/'.length);
       readBoundedJson()
         .then(async ({ parsed }) => {
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: 'Request JSON body must be a plain object' }));
+            return;
+          }
+
+          // SEC-03: Block arbitrary inline invariantScript execution over HTTP gateway!
+          if (
+            action === 'verify-blast-radius' &&
+            parsed.invariantScript !== undefined &&
+            parsed.invariantScript !== null &&
+            parsed.invariantScript !== ''
+          ) {
+            res.writeHead(403);
+            res.end(
+              JSON.stringify(
+                {
+                  ok: false,
+                  tool: 'krusch_brick_verify_blast_radius',
+                  summary: 'Inline invariantScript execution is forbidden over HTTP',
+                  error: {
+                    code: 'HTTP_INVARIANT_SCRIPT_FORBIDDEN',
+                    message:
+                      'Inline invariantScript execution is forbidden over HTTP; use programmatic verifyBlastRadius or CLI'
+                  }
+                },
+                null,
+                2
+              )
+            );
+            return;
+          }
+
+          // SEC-03: Strip internal/callback keys & prototype-pollution keys from untrusted HTTP JSON bodies!
+          const strippedKeys = new Set([
+            'authorizedBricks',
+            'tryBrickFn',
+            'getAuthorizedBricksFn',
+            'invariantScript',
+            'repairFn',
+            'assertFn',
+            '__proto__',
+            'constructor',
+            'prototype'
+          ]);
+          const httpPayload = {};
+          for (const key of Object.keys(parsed)) {
+            if (strippedKeys.has(key)) continue;
+            Object.defineProperty(httpPayload, key, {
+              value: parsed[key],
+              enumerable: true,
+              writable: true,
+              configurable: true
+            });
+          }
+
+          // SEC-03: Require viewerId on ontology-compose so HTTP callers must authenticate against listInbox grants!
+          if (action === 'ontology-compose') {
+            const rawViewerId =
+              typeof httpPayload.viewerId === 'string' ? httpPayload.viewerId.trim() : '';
+            if (!rawViewerId) {
+              res.writeHead(401);
+              res.end(
+                JSON.stringify(
+                  {
+                    ok: false,
+                    tool: 'krusch_brick_ontology_compose',
+                    summary: 'viewerId is required on POST /brick-exchange/ontology-compose',
+                    error: {
+                      code: 'VIEWER_AUTH_REQUIRED',
+                      message:
+                        'Authenticated viewerId is required on POST /brick-exchange/ontology-compose'
+                    }
+                  },
+                  null,
+                  2
+                )
+              );
+              return;
+            }
+            if (
+              strippedKeys.has(rawViewerId) ||
+              rawViewerId.includes('..') ||
+              !/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/.test(rawViewerId)
+            ) {
+              res.writeHead(403);
+              res.end(
+                JSON.stringify(
+                  {
+                    ok: false,
+                    tool: 'krusch_brick_ontology_compose',
+                    summary: 'Invalid or forbidden viewerId on POST /brick-exchange/ontology-compose',
+                    error: {
+                      code: 'VIEWER_FORBIDDEN',
+                      message: 'viewerId must be a valid safe identifier'
+                    }
+                  },
+                  null,
+                  2
+                )
+              );
+              return;
+            }
+          }
+
           const actionMap = {
-            keygen: () => stack.brickExchange.keygen ? stack.brickExchange.keygen() : stack.brickExchange.stats(),
-            seal: () => stack.brickExchange.sealBrick(parsed),
-            verify: () => stack.brickExchange.verifyBrick(parsed),
-            publish: () => stack.brickExchange.publishBrick(parsed),
-            grant: () => stack.brickExchange.issueGrant(parsed),
-            revoke: () => stack.brickExchange.revokeGrant(parsed),
-            inbox: () => stack.brickExchange.listInbox(parsed),
-            try: () => stack.brickExchange.tryBrick(parsed),
-            adopt: () => stack.brickExchange.adoptBrick(parsed),
-            'audit-locks': () => stack.brickExchange.auditBrickLocks(parsed),
-            'blast-radius': () => stack.brickExchange.analyzeBlastRadius(parsed),
-            fanout: () => stack.brickExchange.planFanOut(parsed),
-            'verify-blast-radius': () => stack.brickExchange.verifyBlastRadius(parsed),
-            'ontology-inspect': () => stack.brickExchange.inspectOntology(parsed),
-            'ontology-check': () => stack.brickExchange.checkOntologyCompatibility(parsed),
-            'ontology-compose': () => stack.brickExchange.composeCrossStack(parsed),
-            'ontology-bind': () => stack.brickExchange.synthesizeBinding(parsed),
+            keygen: () => (stack.brickExchange.keygen ? stack.brickExchange.keygen() : stack.brickExchange.stats()),
+            seal: () => stack.brickExchange.sealBrick(httpPayload),
+            verify: () => stack.brickExchange.verifyBrick(httpPayload),
+            publish: () => stack.brickExchange.publishBrick(httpPayload),
+            grant: () => stack.brickExchange.issueGrant(httpPayload),
+            revoke: () => stack.brickExchange.revokeGrant(httpPayload),
+            inbox: () => stack.brickExchange.listInbox(httpPayload),
+            try: () => stack.brickExchange.tryBrick(httpPayload),
+            adopt: () => stack.brickExchange.adoptBrick(httpPayload),
+            'audit-locks': () => stack.brickExchange.auditBrickLocks(httpPayload),
+            'blast-radius': () => stack.brickExchange.analyzeBlastRadius(httpPayload),
+            fanout: () => stack.brickExchange.planFanOut(httpPayload),
+            'verify-blast-radius': () => stack.brickExchange.verifyBlastRadius(httpPayload),
+            'ontology-inspect': () => stack.brickExchange.inspectOntology(httpPayload),
+            'ontology-check': () => stack.brickExchange.checkOntologyCompatibility(httpPayload),
+            'ontology-compose': () => stack.brickExchange.composeCrossStack(httpPayload),
+            'ontology-bind': () => stack.brickExchange.synthesizeBinding(httpPayload),
             stats: () => stack.brickExchange.stats()
           };
           const handler = actionMap[action];
@@ -401,7 +506,18 @@ export function startHttpGateway(options = {}) {
             return;
           }
           const result = await handler();
-          res.writeHead(result.ok ? 200 : 400);
+          const errCode = result?.error?.code || '';
+          const status = result.ok
+            ? 200
+            : errCode === 'VIEWER_AUTH_REQUIRED' || errCode === 'INVALID_VIEWER'
+              ? 401
+              : errCode === 'GRANT_ISSUER_FORBIDDEN' ||
+                  errCode === 'GRANT_REVOKE_FORBIDDEN' ||
+                  errCode === 'VIEWER_FORBIDDEN' ||
+                  errCode === 'HTTP_INVARIANT_SCRIPT_FORBIDDEN'
+                ? 403
+                : 400;
+          res.writeHead(status);
           res.end(JSON.stringify(result, null, 2));
         })
         .catch(sendGatewayError);

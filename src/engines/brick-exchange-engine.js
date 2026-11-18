@@ -24,12 +24,17 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { okEnvelope, openStackDatabase } from '../db/sqlite.js';
 import {
+  CANONICAL_SHARED_TYPES,
   STACK_ONTOLOGY_STACKS,
   STACK_ONTOLOGY_PORTS,
   STACK_ONTOLOGY_CHANNELS,
   STACK_ONTOLOGY_MOE_PROFILES,
+  hasForbiddenKeyRecursive,
+  parsePortReference,
   isWebStandardPureBrickSource,
   areOntologyPortsCompatible,
+  surrogateOntologyVertexId,
+  normalizeBrickOntology,
   inspectBrickOntology,
   checkBrickOntologyCompatibility,
   composeCrossStackBricks,
@@ -38,12 +43,17 @@ import {
 } from './brick-ontology-engine.js';
 
 export {
+  CANONICAL_SHARED_TYPES,
   STACK_ONTOLOGY_STACKS,
   STACK_ONTOLOGY_PORTS,
   STACK_ONTOLOGY_CHANNELS,
   STACK_ONTOLOGY_MOE_PROFILES,
+  hasForbiddenKeyRecursive,
+  parsePortReference,
   isWebStandardPureBrickSource,
   areOntologyPortsCompatible,
+  surrogateOntologyVertexId,
+  normalizeBrickOntology,
   inspectBrickOntology,
   checkBrickOntologyCompatibility,
   composeCrossStackBricks,
@@ -643,7 +653,12 @@ function deepFreezeClone(value) {
   for (let i = 0; i < keys.length; i += 1) {
     const key = keys[i];
     if (!FORBIDDEN_KEYS.has(key) && value[key] !== undefined) {
-      cloned[key] = deepFreezeClone(value[key]);
+      Object.defineProperty(cloned, key, {
+        value: deepFreezeClone(value[key]),
+        enumerable: true,
+        writable: true,
+        configurable: true
+      });
     }
   }
   return Object.freeze(cloned);
@@ -700,6 +715,16 @@ export function verifySealedBrickBundle(bundle, { trustedPublicKeyPem = null } =
       tool,
       'INVALID_BRICK_BUNDLE',
       'Bundle must be an object with format "krusch-sealed-brick/v1"'
+    );
+  }
+
+  const forbiddenInBundle = hasForbiddenKeyRecursive(bundle);
+  if (forbiddenInBundle) {
+    return failEnvelope(
+      tool,
+      forbiddenInBundle.startsWith('__') ? 'INVALID_BRICK_BUNDLE' : 'ONTOLOGY_FORBIDDEN_KEY',
+      `Rejected unsafe key or depth/cycle violation (${forbiddenInBundle}) in brick bundle`,
+      { key: forbiddenInBundle }
     );
   }
 
@@ -815,6 +840,44 @@ export function verifySealedBrickBundle(bundle, { trustedPublicKeyPem = null } =
       'Brick blueprint hash mismatch; blueprint was modified after sealing',
       { field: 'blueprintHash' }
     );
+  }
+
+  // SEC-02: Verify top-level bundle.ontology (when present) matches normalized signed blueprint.ontology!
+  if (bundle.ontology !== undefined) {
+    if (!isPlainObject(bundle.ontology) || !isPlainObject(bundle.blueprint.ontology)) {
+      return failEnvelope(
+        tool,
+        'TAMPERED_ONTOLOGY',
+        'Unsigned or invalid top-level bundle.ontology detected; ontology must match signed blueprint.ontology',
+        { field: 'ontology' }
+      );
+    }
+    const normSignedOnt = normalizeBrickOntology(bundle.blueprint.ontology, {
+      source: bundle.source,
+      blueprint: bundle.blueprint
+    });
+    if (!normSignedOnt.ok) {
+      return failEnvelope(
+        tool,
+        'TAMPERED_ONTOLOGY',
+        `Signed blueprint.ontology failed normalization: ${normSignedOnt.error.message}`,
+        { field: 'ontology' }
+      );
+    }
+    const canonTopOnt = canonicalJsonResult(bundle.ontology);
+    const canonSignedOnt = canonicalJsonResult(normSignedOnt.data.ontology);
+    if (
+      !canonTopOnt.ok ||
+      !canonSignedOnt.ok ||
+      !constantTimeStringEqual(canonTopOnt.json, canonSignedOnt.json)
+    ) {
+      return failEnvelope(
+        tool,
+        'TAMPERED_ONTOLOGY',
+        'Top-level bundle.ontology does not match signed blueprint.ontology',
+        { field: 'ontology' }
+      );
+    }
   }
 
   const actualContractHash = computeCanonicalHash(extractContractShape(bundle.blueprint));
@@ -2841,6 +2904,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
    */
   async function sealBrick({
     blueprint,
+    ontology = undefined,
     source,
     positiveChecks = [],
     faultChecks = [],
@@ -2877,7 +2941,58 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       });
     }
 
-    // Gate 2: Blueprint & JSON Schema Contract Check
+    // Gate 2: Blueprint, Ontology & JSON Schema Contract Check
+    if (isPlainObject(blueprint)) {
+      const badBpKey = hasForbiddenKeyRecursive(blueprint);
+      if (badBpKey) {
+        return failEnvelope(
+          tool,
+          badBpKey.startsWith('__') ? 'BRICK_VERIFICATION_FAILED' : 'ONTOLOGY_FORBIDDEN_KEY',
+          `Blueprint rejected unsafe key or depth/cycle violation (${badBpKey})`,
+          { key: badBpKey }
+        );
+      }
+    }
+
+    let normalizedSealOntology = null;
+    if (ontology !== undefined || (isPlainObject(blueprint) && blueprint.ontology !== undefined)) {
+      if (ontology !== undefined && ontology !== null && !isPlainObject(ontology)) {
+        return failEnvelope(
+          tool,
+          'INVALID_ONTOLOGY_METADATA',
+          'ontology option must be a plain object when provided'
+        );
+      }
+      if (
+        isPlainObject(blueprint) &&
+        blueprint.ontology !== undefined &&
+        blueprint.ontology !== null &&
+        !isPlainObject(blueprint.ontology)
+      ) {
+        return failEnvelope(
+          tool,
+          'INVALID_ONTOLOGY_METADATA',
+          'blueprint.ontology must be a plain object when provided'
+        );
+      }
+      const mergedRawOntology = {
+        ...(isPlainObject(blueprint?.ontology) ? blueprint.ontology : {}),
+        ...(isPlainObject(ontology) ? ontology : {})
+      };
+      const normOntRes = normalizeBrickOntology(mergedRawOntology, {
+        source,
+        blueprint: isPlainObject(blueprint) ? blueprint : {}
+      });
+      if (!normOntRes.ok) {
+        return failEnvelope(
+          tool,
+          normOntRes.error.code,
+          normOntRes.error.message,
+          normOntRes.error.details || null
+        );
+      }
+      normalizedSealOntology = normOntRes.data.ontology;
+    }
     const contractIssues = [];
     if (!isPlainObject(blueprint)) {
       contractIssues.push('blueprint must be a plain object');
@@ -3441,9 +3556,11 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       );
     }
 
+    // SEC-02: Embed normalized ontology into blueprint.ontology BEFORE computing blueprintHash & mirror on bundle.ontology!
     const normalizedBlueprint = {
       ...blueprint,
-      id: blueprint.id.trim()
+      id: blueprint.id.trim(),
+      ...(normalizedSealOntology ? { ontology: normalizedSealOntology } : {})
     };
     const frozenBlueprint = deepFreezeClone(normalizedBlueprint);
     const sourceHash = computeCanonicalHash(source);
@@ -3509,6 +3626,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       replacesBoilerplate: String(replacesBoilerplate || ''),
       estimatedHoursSaved: safeHoursSaved,
       blueprint: frozenBlueprint,
+      ...(isPlainObject(frozenBlueprint.ontology) ? { ontology: frozenBlueprint.ontology } : {}),
       source,
       checks: checksSummary,
       lineage,
@@ -3940,6 +4058,8 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     bundle,
     targetRepoDir = defaultRoot,
     bindingSource = null,
+    adapterFileName = null,
+    targetStack = null,
     grantId = '',
     userId = 'local-dev',
     orgId = 'local-team'
@@ -3948,6 +4068,32 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     const sealCheck = verifySealedBrickBundle(bundle);
     if (!sealCheck.ok) {
       return failEnvelope(tool, sealCheck.error.code, sealCheck.error.message, sealCheck.error.details);
+    }
+
+    const ALLOWED_ADAPTER_FILENAMES = new Set(['binding.js', 'binding.ts', 'binding_adapter.py']);
+    let resolvedAdapterFileName = 'binding.js';
+    if (adapterFileName !== null && adapterFileName !== undefined && adapterFileName !== '') {
+      const cleanAdapter = typeof adapterFileName === 'string' ? adapterFileName.trim() : '';
+      if (!ALLOWED_ADAPTER_FILENAMES.has(cleanAdapter)) {
+        return failEnvelope(
+          tool,
+          'INVALID_ADAPTER_FILENAME',
+          `adapterFileName must be one of: ${[...ALLOWED_ADAPTER_FILENAMES].join(', ')}`,
+          { adapterFileName }
+        );
+      }
+      resolvedAdapterFileName = cleanAdapter;
+    } else if (typeof targetStack === 'string' && targetStack.trim()) {
+      const cleanTargetStack = targetStack.trim();
+      if (!Object.hasOwn(STACK_ONTOLOGY_STACKS, cleanTargetStack)) {
+        return failEnvelope(
+          tool,
+          'UNKNOWN_ONTOLOGY_STACK',
+          `Unknown targetStack "${cleanTargetStack}"`,
+          { targetStack: cleanTargetStack }
+        );
+      }
+      resolvedAdapterFileName = STACK_ONTOLOGY_STACKS[cleanTargetStack].adapterFileName;
     }
 
     if (typeof targetRepoDir !== 'string' || !targetRepoDir.trim()) {
@@ -3996,7 +4142,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     const entryFileName = bundle.blueprint?.language === 'ts' ? 'index.ts' : 'index.js';
     const entryPath = path.join(realBrickDir, entryFileName);
     const bundleSealPath = path.join(realBrickDir, 'bundle.seal.json');
-    const bindingPath = path.join(realBrickDir, 'binding.js');
+    const bindingPath = path.join(realBrickDir, resolvedAdapterFileName);
     const lockfilePath = path.join(realRepoDir, '.brick-lock.json');
 
     for (const candidateFile of [entryPath, bundleSealPath, bindingPath, lockfilePath]) {
@@ -4016,10 +4162,16 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     if (fs.existsSync(bindingPath)) {
       bindingExisted = true;
     } else {
+      const defaultStarter =
+        resolvedAdapterFileName === 'binding_adapter.py'
+          ? `# Local Python contract adapter for ${bundle.brickId}\nBINDING_CONFIG: dict = {}\n`
+          : resolvedAdapterFileName === 'binding.ts'
+            ? `// Local adapter binding for ${bundle.brickId}\nexport const binding: Record<string, unknown> = {};\n`
+            : `// Local adapter binding for ${bundle.brickId}\nexport const binding = {};\n`;
       const starterBinding =
         typeof bindingSource === 'string' && bindingSource.length > 0
           ? bindingSource
-          : `// Local adapter binding for ${bundle.brickId}\nexport const binding = {};\n`;
+          : defaultStarter;
       fs.writeFileSync(bindingPath, starterBinding, 'utf8');
     }
 
@@ -4102,6 +4254,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
         adoptionId,
         brickId: bundle.brickId,
         sourceHash: bundle.lineage.sourceHash,
+        adapterFileName: resolvedAdapterFileName,
         entryPath,
         bindingPath,
         bundlePath: bundleSealPath,

@@ -61,7 +61,7 @@ function makeTempWorkspace() {
   return dir;
 }
 
-describe('KruschStack Unified Ecosystem Suite (v1.0.0)', () => {
+describe('KruschStack Unified Ecosystem Suite (v1.1.0)', () => {
   test('INV-STACK-03: All 39 MCP tools declare explicit 4-boolean annotations and MIT LICENSE exists', () => {
     assert.equal(ALL_STACK_TOOLS.length, 39, 'Expected 39 total tools across the 7 stack pillars');
     const licensePath = path.join(REPO_ROOT, 'LICENSE');
@@ -100,7 +100,14 @@ describe('KruschStack Unified Ecosystem Suite (v1.0.0)', () => {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       const results = [];
       for (const entry of entries) {
-        if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === '.krusch-stack') continue;
+        if (
+          entry.name === 'node_modules' ||
+          entry.name === '.git' ||
+          entry.name === '.krusch-stack' ||
+          entry.name === '.agent'
+        ) {
+          continue;
+        }
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           results.push(...walkFiles(full));

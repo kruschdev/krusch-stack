@@ -8,6 +8,8 @@
 
 import { okEnvelope } from '../db/sqlite.js';
 
+export const VERSION = '1.1.0';
+
 const TIER_CATALOG = {
   L1_FAST_LOCAL: {
     tier: 'L1_FAST_LOCAL',
@@ -150,7 +152,7 @@ export function createRouterEngine({ config = {} } = {}) {
    * @param {object} [params]
    * @param {object} [params.engines]
    */
-  function getStackStatus({ engines = {} } = {}) {
+  function getStackStatus({ engines = {}, db = null } = {}) {
     const registeredPillars = [
       'context',
       'git',
@@ -170,17 +172,46 @@ export function createRouterEngine({ config = {} } = {}) {
       }
     }
 
+    const auxiliaryEngines = {
+      resilience: { ready: Boolean(engines && engines.resilience) },
+      actionHarness: { ready: Boolean(engines && engines.actionHarness) },
+      groundedHarness: { ready: Boolean(engines && engines.groundedHarness) },
+      brickExchange: { ready: Boolean(engines && engines.brickExchange) }
+    };
+
+    const brickExchangeTables = [
+      'brick_exchange_bricks',
+      'brick_exchange_grants',
+      'brick_exchange_adoptions'
+    ];
+    let brickExchangeTablesReady = Boolean(engines && engines.brickExchange);
+    if (db && typeof db.prepare === 'function') {
+      try {
+        const rows = db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'brick_exchange_%'"
+          )
+          .all();
+        const found = new Set(rows.map((r) => r.name));
+        brickExchangeTablesReady = brickExchangeTables.every((t) => found.has(t));
+      } catch {
+        brickExchangeTablesReady = false;
+      }
+    }
+
     const avgLatencyUs = totalRouted > 0 ? Number((totalLatencyUs / totalRouted).toFixed(2)) : 0;
 
     return okEnvelope(
       'krusch_stack_status',
-      `KruschStack v1.0.0 healthy (${Object.values(engineStates).filter((s) => s.ready).length}/${registeredPillars.length} pillars active)`,
+      `KruschStack v${VERSION} healthy (${Object.values(engineStates).filter((s) => s.ready).length}/${registeredPillars.length} pillars active)`,
       {
         status: 'healthy',
-        version: '1.0.0',
+        version: VERSION,
         ollama_host: ollamaHost,
         burst_host: burstHost,
         engines: engineStates,
+        auxiliary_engines: auxiliaryEngines,
+        brick_exchange_tables_ready: brickExchangeTablesReady,
         router_metrics: {
           total_routed: totalRouted,
           avg_latency_us: avgLatencyUs,

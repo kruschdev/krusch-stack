@@ -253,7 +253,7 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
     assert.equal(parsed.minParenDepth, 0, 'Parenthesis depth must never drop below zero');
     assert.equal(parsed.finalParenDepth, 0, 'Parentheses must be balanced across db/init.sql');
     assert.equal(parsed.unterminatedTrailing, '', 'Every SQL statement must terminate with ";"');
-    assert.ok(parsed.statements.length >= 25, 'Expected extension, 14 tables, and index statements');
+    assert.ok(parsed.statements.length >= 25, 'Expected extension, 19 tables, and index statements');
 
     assert.ok(
       parsed.statements.some((s) => /^CREATE\s+EXTENSION\s+IF\s+EXISTS\b/i.test(s) === false) &&
@@ -304,7 +304,7 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
     }
   });
 
-  test('All 16 core, journal, resilience, INV-STACK-10 action-harness, and INV-STACK-11 grounded-harness tables and indexes match SQLite parity', () => {
+  test('All 19 core, journal, resilience, INV-STACK-10 action-harness, INV-STACK-11 grounded-harness, and INV-STACK-12 brick-exchange tables and indexes match SQLite parity', () => {
     for (const tableName of REQUIRED_POSTGRES_TABLES) {
       assert.ok(pgTables.has(tableName), `Missing required PostgreSQL table: ${tableName}`);
     }
