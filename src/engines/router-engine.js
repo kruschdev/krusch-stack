@@ -8,7 +8,7 @@
 
 import { okEnvelope } from '../db/sqlite.js';
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 const TIER_CATALOG = {
   L1_FAST_LOCAL: {
@@ -180,7 +180,8 @@ export function createRouterEngine({ config = {} } = {}) {
       hydrascope: { ready: Boolean(engines && engines.hydrascope) },
       gitAlignment: { ready: Boolean(engines && engines.gitAlignment) },
       toolGraph: { ready: Boolean(engines && engines.toolGraph) },
-      polyglotAudit: { ready: Boolean(engines && engines.polyglotAudit) }
+      polyglotAudit: { ready: Boolean(engines && engines.polyglotAudit) },
+      observability: { ready: Boolean(engines && engines.observability) }
     };
 
     const brickExchangeTables = [

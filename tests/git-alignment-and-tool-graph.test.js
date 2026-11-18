@@ -17,8 +17,8 @@ describe('INV-STACK-14: Git Alignment Guards, Sovereign ToolGraph & Polyglot Aud
     const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-stack-git-align-'));
     try {
       execFileSync('git', ['init'], { cwd: repoDir });
-      execFileSync('git', ['config', 'user.name', 'kruschdev'], { cwd: repoDir });
-      execFileSync('git', ['config', 'user.email', 'kruschdev@users.noreply.github.com'], { cwd: repoDir });
+      execFileSync('git', ['config', 'user.name', 'Test Developer'], { cwd: repoDir });
+      execFileSync('git', ['config', 'user.email', 'dev@example.com'], { cwd: repoDir });
 
       fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
       fs.writeFileSync(

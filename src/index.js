@@ -158,10 +158,23 @@ import {
   auditPolyglotRepository,
   createPolyglotAuditEngine
 } from './engines/polyglot-audit-engine.js';
-import { generateIdeConfig, writeIdeConfigs, IDE_CONFIG_PATHS } from './installer/ide-config.js';
+import {
+  createObservabilityEngine,
+  isBlockedDecision,
+  formatExplainReportText
+} from './engines/observability-engine.js';
+import {
+  generateIdeConfig,
+  writeIdeConfigs,
+  IDE_CONFIG_PATHS,
+  VALID_STACK_PROFILES,
+  normalizeStackProfile,
+  buildDefaultAgentsMd
+} from './installer/ide-config.js';
 import { runStackDoctor, runStackCrashRecoveryDrill } from './installer/doctor.js';
+import { runStackDemo, formatStackDemoText } from './installer/demo.js';
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 const DEFAULT_STACK_TOOL_GRAPH_SPINE = Object.freeze([
   {
@@ -302,7 +315,10 @@ export function createKruschStack(options = {}) {
   const workspaceRoot = path.resolve(
     options.workspaceRoot || process.env.KRUSCH_WORKSPACE_ROOT || process.cwd()
   );
-  const profile = (options.profile || process.env.KRUSCH_STACK_PROFILE || 'full') === 'core' ? 'core' : 'full';
+  const profile = normalizeStackProfile(
+    options.profile || process.env.KRUSCH_STACK_PROFILE || 'full',
+    'full'
+  );
   const envDbPath = typeof process.env.DB_PATH === 'string' ? process.env.DB_PATH.trim() : '';
   const effectiveDbPath = options.dbPath || envDbPath || undefined;
   const hasExplicitFileDb = Boolean(effectiveDbPath && effectiveDbPath !== ':memory:');
@@ -350,6 +366,7 @@ export function createKruschStack(options = {}) {
   });
   const gitAlignment = createGitAlignmentEngine({ db, workspaceRoot });
   const polyglotAudit = createPolyglotAuditEngine({ workspaceRoot });
+  const observability = createObservabilityEngine({ db, workspaceRoot, contextEngine: context });
 
   const defaultToolGraphDispatcher = async (toolName, toolArgs = {}) => {
     switch (toolName) {
@@ -430,7 +447,8 @@ export function createKruschStack(options = {}) {
     brickExchange,
     gitAlignment,
     toolGraph,
-    polyglotAudit
+    polyglotAudit,
+    observability
   };
 
   return {
@@ -455,6 +473,7 @@ export function createKruschStack(options = {}) {
     gitAlignment,
     toolGraph,
     polyglotAudit,
+    observability,
     doctor: () => runStackDoctor({ workspaceRoot, db, profile }),
     status: () => router.getStackStatus({ engines, db })
   };
@@ -587,6 +606,14 @@ export {
   generateIdeConfig,
   writeIdeConfigs,
   IDE_CONFIG_PATHS,
+  VALID_STACK_PROFILES,
+  normalizeStackProfile,
+  buildDefaultAgentsMd,
   runStackDoctor,
-  runStackCrashRecoveryDrill
+  runStackCrashRecoveryDrill,
+  runStackDemo,
+  formatStackDemoText,
+  createObservabilityEngine,
+  isBlockedDecision,
+  formatExplainReportText
 };

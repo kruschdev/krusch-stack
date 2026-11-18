@@ -325,8 +325,8 @@ describe('Round-2 Audit Remediation & Security Regression Suite (SEC-01..04, MCP
       const gitDir = path.join(tmpDir, 'git-repo');
       fs.mkdirSync(gitDir, { recursive: true });
       execFileSync('git', ['init', '-q'], { cwd: gitDir });
-      execFileSync('git', ['config', 'user.email', 'kruschdev@users.noreply.github.com'], { cwd: gitDir });
-      execFileSync('git', ['config', 'user.name', 'kruschdev'], { cwd: gitDir });
+      execFileSync('git', ['config', 'user.email', 'dev@example.com'], { cwd: gitDir });
+      execFileSync('git', ['config', 'user.name', 'Test Developer'], { cwd: gitDir });
       const modPath = path.join(gitDir, 'fee.js');
       fs.writeFileSync(modPath, 'export const FEE_BPS = 25;\n', 'utf8');
       execFileSync('git', ['add', 'fee.js'], { cwd: gitDir });

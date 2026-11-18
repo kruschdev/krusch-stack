@@ -121,6 +121,8 @@ export function assertPathWithinWorkspace(candidatePath, workspaceRoot, { allowR
   return absCandidate;
 }
 
+const MEMORY_ONLY_COMPONENTS = new Set(['context']);
+const CODING_AGENT_COMPONENTS = new Set(['context', 'git', 'harness']);
 const CORE_COMPONENTS = new Set(['context', 'git', 'fs', 'harness', 'router']);
 const FULL_COMPONENTS = new Set(['context', 'git', 'fs', 'harness', 'frontend', 'workspace', 'router']);
 
@@ -1453,7 +1455,14 @@ function resolveAllowedComponentSet({ profile = 'full', components, server } = {
         .filter(Boolean)
     );
   }
-  return profile === 'core' ? CORE_COMPONENTS : FULL_COMPONENTS;
+  const normalized = typeof profile === 'string' ? profile.trim().toLowerCase() : 'full';
+  if (normalized === 'memory-only' || normalized === 'memory_only' || normalized === 'memory') {
+    return MEMORY_ONLY_COMPONENTS;
+  }
+  if (normalized === 'coding-agent' || normalized === 'coding_agent' || normalized === 'coding') {
+    return CODING_AGENT_COMPONENTS;
+  }
+  return normalized === 'core' ? CORE_COMPONENTS : FULL_COMPONENTS;
 }
 
 /**

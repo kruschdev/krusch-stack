@@ -14,6 +14,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { openStackDatabase, okEnvelope } from '../db/sqlite.js';
+import { normalizeStackProfile, VALID_STACK_PROFILES } from './ide-config.js';
+
+export { normalizeStackProfile, VALID_STACK_PROFILES };
 
 const DOCTOR_DIR = path.dirname(fileURLToPath(import.meta.url));
 const STACK_INDEX_URL = pathToFileURL(path.resolve(DOCTOR_DIR, '..', 'index.js')).href;
@@ -115,12 +118,34 @@ const ALL_COMPONENTS = [
   }
 ];
 
+const MEMORY_ONLY_COMPONENT_IDS = new Set(['context']);
+
+const CODING_AGENT_COMPONENT_IDS = new Set([
+  'context',
+  'git',
+  'harness',
+  'grounded-harness'
+]);
+
+function filterComponentsForProfile(normalizedProfile) {
+  if (normalizedProfile === 'memory-only') {
+    return ALL_COMPONENTS.filter((comp) => MEMORY_ONLY_COMPONENT_IDS.has(comp.id));
+  }
+  if (normalizedProfile === 'coding-agent') {
+    return ALL_COMPONENTS.filter((comp) => CODING_AGENT_COMPONENT_IDS.has(comp.id));
+  }
+  if (normalizedProfile === 'core') {
+    return ALL_COMPONENTS.filter((comp) => comp.core);
+  }
+  return [...ALL_COMPONENTS];
+}
+
 /**
  * Execute a full diagnostic check across the KruschStack runtime and storage engines.
  * @param {object} [options]
  * @param {string} [options.workspaceRoot=process.cwd()]
  * @param {import('node:sqlite').DatabaseSync} [options.db]
- * @param {'core'|'full'} [options.profile='full']
+ * @param {'memory-only'|'coding-agent'|'core'|'full'} [options.profile='full']
  * @param {object} [options.engines]
  */
 export function runStackDoctor({
@@ -129,7 +154,7 @@ export function runStackDoctor({
   profile = 'full'
 } = {}) {
   const resolvedRoot = path.resolve(workspaceRoot);
-  const normalizedProfile = profile === 'core' ? 'core' : 'full';
+  const normalizedProfile = normalizeStackProfile(profile, 'full');
 
   const nodeVersion = process.versions.node;
   const majorVersion = Number(nodeVersion.split('.')[0] || 0);
@@ -167,9 +192,7 @@ export function runStackDoctor({
   );
   const ollamaHost = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
 
-  const selectedComponents = ALL_COMPONENTS.filter(
-    (comp) => normalizedProfile === 'full' || comp.core
-  ).map((comp) => ({
+  const selectedComponents = filterComponentsForProfile(normalizedProfile).map((comp) => ({
     id: comp.id,
     name: comp.name,
     tier: comp.tier,

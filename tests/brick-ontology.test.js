@@ -1132,7 +1132,7 @@ test('P2 Parity: package.json ./brick-ontology subpath, openStackDatabase, runSt
 
       const status = stack.status();
       assert.equal(status.ok, true);
-      assert.equal(status.data.version, '1.2.0');
+      assert.equal(status.data.version, pkgRaw.version);
       assert.equal(status.data.brick_exchange_tables_ready, true);
       assert.equal(status.data.hydrascope_tables_ready, true);
       assert.equal(status.data.auxiliary_engines.brickExchange.ready, true);

@@ -21,8 +21,12 @@ import {
   createKruschStack,
   createToolGraphEngine,
   writeIdeConfigs,
+  normalizeStackProfile,
   runStackDoctor,
-  runStackCrashRecoveryDrill
+  runStackCrashRecoveryDrill,
+  runStackDemo,
+  formatStackDemoText,
+  formatExplainReportText
 } from '../src/index.js';
 import {
   runMcpServer,
@@ -45,8 +49,12 @@ if (majorNode < 22) {
  */
 export function parseCliArgs(argv = process.argv.slice(2)) {
   const positional = [];
+  const envProfile = typeof process.env.KRUSCH_STACK_PROFILE === 'string'
+    ? process.env.KRUSCH_STACK_PROFILE.trim()
+    : '';
   const flags = {
-    profile: process.env.KRUSCH_STACK_PROFILE || 'full',
+    profile: envProfile ? normalizeStackProfile(envProfile, 'full') : 'full',
+    profileExplicit: Boolean(envProfile),
     mode: 'unified',
     ide: 'all',
     components: undefined,
@@ -60,6 +68,9 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     json: false,
     crashDrill: false,
     ephemeral: false,
+    limit: 10,
+    onlyBlocked: false,
+    sessionId: undefined,
     port: Number(process.env.KRUSCH_STACK_PORT || 3780),
     workspaceRoot: process.env.KRUSCH_WORKSPACE_ROOT || process.cwd()
   };
@@ -67,9 +78,11 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--profile' && argv[i + 1]) {
-      flags.profile = argv[++i];
+      flags.profile = normalizeStackProfile(argv[++i], 'full');
+      flags.profileExplicit = true;
     } else if (arg.startsWith('--profile=')) {
-      flags.profile = arg.slice('--profile='.length);
+      flags.profile = normalizeStackProfile(arg.slice('--profile='.length), 'full');
+      flags.profileExplicit = true;
     } else if (arg === '--mode' && argv[i + 1]) {
       flags.mode = argv[++i];
     } else if (arg.startsWith('--mode=')) {
@@ -112,6 +125,18 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       flags.crashDrill = true;
     } else if (arg === '--ephemeral') {
       flags.ephemeral = true;
+    } else if ((arg === '--limit' || arg === '--last') && argv[i + 1]) {
+      flags.limit = Number(argv[++i]);
+    } else if (arg.startsWith('--limit=')) {
+      flags.limit = Number(arg.slice('--limit='.length));
+    } else if (arg.startsWith('--last=')) {
+      flags.limit = Number(arg.slice('--last='.length));
+    } else if (arg === '--blocked' || arg === '--only-blocked') {
+      flags.onlyBlocked = true;
+    } else if (arg === '--session' && argv[i + 1]) {
+      flags.sessionId = argv[++i];
+    } else if (arg.startsWith('--session=')) {
+      flags.sessionId = arg.slice('--session='.length);
     } else if (arg === '-h' || arg === '--help') {
       flags.help = true;
     } else if (arg === '-v' || arg === '--version') {
@@ -121,8 +146,13 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     }
   }
 
+  const command = positional[0] || 'mcp';
+  if (command === 'init' && !flags.profileExplicit) {
+    flags.profile = 'coding-agent';
+  }
+
   return {
-    command: positional[0] || 'mcp',
+    command,
     positional: positional.slice(1),
     flags
   };
@@ -130,20 +160,22 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
 
 function printHelp() {
   console.log(`
-KruschStack v${VERSION}: The Unified Sovereign AI & Coding Agent Stack
+KruschStack v${VERSION}: Local Control Plane for AI Coding Agents
 
 Usage:
   npx krusch-stack <command> [options]
 
 Commands:
+  demo                Run the <1s zero-cloud 3-act walkthrough (memory, blocked edit, 2PC apply)
   init                Configure IDE MCP files (.mcp.json, .cursor/mcp.json, Windsurf, Antigravity) & .agent/AGENTS.md
   mcp                 Start the KruschStack MCP server over stdio (default)
-  doctor              Verify Node 22 SQLite (21 tables), companion Postgres config, Ollama, and all 10 stack pillars
+  doctor              Verify Node 22 SQLite (21 tables), companion Postgres config, Ollama, and active pillars
+  explain [id]        Inspect structured metrics & "Why did the agent do or block that?" decision trace
   route "<prompt>"    Classify a coding or reasoning prompt via the <25us L1-L3 Cascade Router
-  serve               Start the HTTP status & REST tool gateway (default :3780)
+  serve               Start the HTTP status, telemetry & REST tool gateway (default :3780)
 
 Options:
-  --profile <full|core>     Select 'full' (39 unified tools) or 'core' (Tiers 1-3 + Router, 27 tools)
+  --profile <name>          'memory-only' (5), 'coding-agent' (19, init default), 'core' (27), or 'full' (39)
   --defer-tools             Collapse wide tool catalog into 6 pinned tools + 3 BM25 bridge tools
   --include-extended        Include the 23 modular extension tools (hydrascope, brick-exchange, grounded-harness)
   --mode <unified|modular>  Register a single 'krusch-stack' MCP entry or separate per-pillar MCP entries
@@ -151,6 +183,8 @@ Options:
   --components <csv>        Comma-separated subset (context,git,fs,hydrascope,brick-exchange,harness,grounded-harness,frontend,workspace,router)
   --server <name>           Run as a specific pillar server (e.g. krusch-context-mcp, hydrascope, krusch-brick-exchange, krusch-grounded-harness)
   --crash-drill             Run the 2-process SIGKILL write-ahead journal rollback drill during 'doctor'
+  --limit <n>               Max decisions to return for 'explain' (default: 10)
+  --blocked                 Filter 'explain' to blocked, held, rejected, or rolled-back decisions only
   --port <number>           HTTP port for 'serve' (default: 3780)
   --ephemeral               Use in-memory SQLite (:memory:)
   --json                    Emit raw JSON output
@@ -1057,6 +1091,29 @@ export function startHttpGateway(options = {}) {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/telemetry') {
+      const metricsRes = stack.observability.getMetrics();
+      res.writeHead(metricsRes.ok ? 200 : 500);
+      res.end(JSON.stringify(metricsRes, null, 2));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/explain') {
+      const idParam = url.searchParams.get('id') || undefined;
+      const sessionParam = url.searchParams.get('session') || undefined;
+      const limitParam = url.searchParams.get('limit');
+      const blockedParam = url.searchParams.get('blocked');
+      const explainRes = stack.observability.explainDecisions({
+        id: idParam,
+        sessionId: sessionParam,
+        limit: limitParam ? Number(limitParam) : 10,
+        onlyBlocked: blockedParam === '1' || blockedParam === 'true'
+      });
+      res.writeHead(explainRes.ok ? 200 : 400);
+      res.end(JSON.stringify(explainRes, null, 2));
+      return;
+    }
+
     res.writeHead(404);
     res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
   });
@@ -1080,6 +1137,54 @@ async function main() {
   }
   if (flags.version) {
     console.log(VERSION);
+    return;
+  }
+
+  if (command === 'demo') {
+    const demoRes = await runStackDemo();
+    if (flags.json) {
+      console.log(JSON.stringify(demoRes, null, 2));
+    } else {
+      console.log(formatStackDemoText(demoRes));
+    }
+    if (!demoRes.ok) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === 'explain' || command === 'telemetry') {
+    const stack = createKruschStack({
+      workspaceRoot: flags.workspaceRoot,
+      profile: flags.profile,
+      ephemeral: flags.ephemeral
+    });
+    const metricsRes = stack.observability.getMetrics();
+    if (command === 'telemetry') {
+      console.log(JSON.stringify(metricsRes, null, 2));
+      return;
+    }
+    const explainRes = stack.observability.explainDecisions({
+      id: positional[0] || undefined,
+      sessionId: flags.sessionId,
+      limit: flags.limit,
+      onlyBlocked: flags.onlyBlocked
+    });
+    if (flags.json) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: Boolean(metricsRes.ok && explainRes.ok),
+            metrics: metricsRes.data,
+            explain: explainRes.data
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      console.log(formatExplainReportText(explainRes, metricsRes));
+    }
     return;
   }
 

@@ -17,6 +17,33 @@ export const IDE_CONFIG_PATHS = {
   antigravity: path.join('.antigravity', 'mcp_config.json')
 };
 
+export const VALID_STACK_PROFILES = Object.freeze([
+  'memory-only',
+  'coding-agent',
+  'core',
+  'full'
+]);
+
+const PROFILE_ALIAS_MAP = new Map([
+  ['memory-only', 'memory-only'],
+  ['memory_only', 'memory-only'],
+  ['memory', 'memory-only'],
+  ['coding-agent', 'coding-agent'],
+  ['coding_agent', 'coding-agent'],
+  ['coding', 'coding-agent'],
+  ['core', 'core'],
+  ['full', 'full']
+]);
+
+const MEMORY_ONLY_MODULAR_SERVERS = ['krusch-context-mcp'];
+
+const CODING_AGENT_MODULAR_SERVERS = [
+  'krusch-context-mcp',
+  'krusch-git',
+  'krusch-harness',
+  'krusch-grounded-harness'
+];
+
 const CORE_MODULAR_SERVERS = [
   'krusch-context-mcp',
   'krusch-git',
@@ -34,11 +61,44 @@ const FULL_EXTRA_SERVERS = [
 ];
 
 /**
+ * Normalize a progressive KruschStack profile string (`INV-STACK-05`).
+ * Accepts `'memory-only'` (`'memory'`), `'coding-agent'` (`'coding'`), `'core'`, and `'full'`.
+ * Falls back to `fallback` (`'full'` by default) when omitted or unrecognized.
+ * @param {unknown} profile
+ * @param {'memory-only'|'coding-agent'|'core'|'full'} [fallback='full']
+ * @returns {'memory-only'|'coding-agent'|'core'|'full'}
+ */
+export function normalizeStackProfile(profile, fallback = 'full') {
+  const resolvedFallback =
+    typeof fallback === 'string' && PROFILE_ALIAS_MAP.has(fallback.trim().toLowerCase())
+      ? PROFILE_ALIAS_MAP.get(fallback.trim().toLowerCase())
+      : 'full';
+  if (typeof profile !== 'string') {
+    return resolvedFallback;
+  }
+  const key = profile.trim().toLowerCase();
+  return PROFILE_ALIAS_MAP.get(key) || resolvedFallback;
+}
+
+function getModularServersForProfile(normalizedProfile) {
+  if (normalizedProfile === 'memory-only') {
+    return [...MEMORY_ONLY_MODULAR_SERVERS];
+  }
+  if (normalizedProfile === 'coding-agent') {
+    return [...CODING_AGENT_MODULAR_SERVERS];
+  }
+  if (normalizedProfile === 'core') {
+    return [...CORE_MODULAR_SERVERS];
+  }
+  return [...CORE_MODULAR_SERVERS, ...FULL_EXTRA_SERVERS];
+}
+
+/**
  * Generate MCP server configuration for a target IDE, mode, and profile.
  * @param {object} [options]
  * @param {'claude'|'cursor'|'windsurf'|'antigravity'|'all'} [options.ide='claude']
  * @param {'unified'|'modular'} [options.mode='unified']
- * @param {'core'|'full'} [options.profile='full']
+ * @param {'memory-only'|'coding-agent'|'core'|'full'} [options.profile='full']
  * @param {string} [options.workspaceRoot=process.cwd()]
  * @param {boolean} [options.deferTools=false]
  * @param {boolean} [options.includeExtended=false]
@@ -51,7 +111,7 @@ export function generateIdeConfig({
   deferTools = false,
   includeExtended = false
 } = {}) {
-  const normalizedProfile = profile === 'core' ? 'core' : 'full';
+  const normalizedProfile = normalizeStackProfile(profile, 'full');
   const normalizedMode = mode === 'modular' ? 'modular' : 'unified';
   const resolvedRoot = path.resolve(workspaceRoot);
 
@@ -69,10 +129,7 @@ export function generateIdeConfig({
       }
     };
   } else {
-    const serverNames =
-      normalizedProfile === 'full'
-        ? [...CORE_MODULAR_SERVERS, ...FULL_EXTRA_SERVERS]
-        : [...CORE_MODULAR_SERVERS];
+    const serverNames = getModularServersForProfile(normalizedProfile);
 
     for (const serverName of serverNames) {
       const serverArgs = ['-y', 'krusch-stack', 'mcp', '--server', serverName];
@@ -112,8 +169,51 @@ export function generateIdeConfig({
   return configObject;
 }
 
-function buildDefaultAgentsMd({ mode = 'unified', includeExtended = false } = {}) {
+export function buildDefaultAgentsMd({
+  mode = 'unified',
+  profile = 'full',
+  includeExtended = false
+} = {}) {
+  const normalizedProfile = normalizeStackProfile(profile, 'full');
   const hasExtendedMcp = mode === 'modular' || Boolean(includeExtended);
+
+  if (normalizedProfile === 'memory-only') {
+    return `# Agent Operating Manual (\`AGENTS.md\`)
+
+> Powered by **KruschStack** (\`krusch-stack\`, \`memory-only\` profile): Tier 1 Working Memory & Invariants.
+
+## 1. Session Start, Working Memory & Pre-Commit Invariants (Tier 1: \`krusch-context-mcp\`)
+- Call \`krusch_context_retrieve({ query: "*", include_state: true, limit_tokens: 4000 })\` on Turn 1 to hydrate active project invariants, decisions, and lessons.
+- Record durable architecture decisions, bug root-causes, and invariants with \`krusch_context_remember\`.
+- Supersede or invalidate outdated decisions with full lineage via \`krusch_context_revise\`.
+- Audit staged code changes and co-change/blame rules before committing via \`krusch_context_nudge({ trigger: "pre_commit", code: "<diff>" })\`, and inspect store hygiene with \`krusch_context_health\`.
+
+> Tip: Upgrade anytime to AST symbol navigation and 2PC staged execution with \`npx krusch-stack init --profile coding-agent\`.
+`;
+  }
+
+  if (normalizedProfile === 'coding-agent') {
+    const tier3GroundedLine = hasExtendedMcp
+      ? '\n- Use `krusch_ground_workspace` and `krusch_grounded_verify_stop` for zero-LLM Turn-0 schema grounding and defect-only stop gating.'
+      : '';
+    return `# Agent Operating Manual (\`AGENTS.md\`)
+
+> Powered by **KruschStack** (\`krusch-stack\`, \`coding-agent\` profile): Tier 1 Working Memory, Tier 2A AST Graph & Tier 3 2PC Staged Execution.
+
+## 1. Session Start, Working Memory & Git Alignment (Tier 1: \`krusch-context-mcp\`)
+- Call \`krusch_context_retrieve({ query: "*", include_state: true, limit_tokens: 4000 })\` on Turn 1 to hydrate active project invariants, decisions, and lessons.
+- Record durable architecture decisions and invariants with \`krusch_context_remember\`, evolve them with \`krusch_context_revise\`, and inspect store hygiene with \`krusch_context_health\`.
+- Audit staged code changes and co-change/blame rules before committing via \`krusch_context_nudge({ trigger: "pre_commit", code: "<diff>" })\`.
+
+## 2. Codebase AST & Dependency Graph Exploration (Tier 2A: \`krusch-git\`)
+- Locate symbols with \`krusch_git_search_symbols\` and inspect callers/callees via \`krusch_git_dependency_graph\` before modifying public interfaces.
+- Read bounded source ranges with \`krusch_git_read_blob\` and run hybrid symbol search with \`krusch_git_semantic_search\`.
+
+## 3. Staged 2PC Verification Harness (Tier 3: \`krusch-harness\`)
+- Stage multi-file edits with \`krusch_run\`, inspect unified diffs with \`krusch_diff\`, and apply verified changes with \`krusch_apply_diff\`.${tier3GroundedLine}
+`;
+  }
+
   const tier2Extra = hasExtendedMcp
     ? '\n- Traverse multi-hop structural context and temporal `asOf` ADR lineage via `hydrascope_traverse_context`, and verify/compose sealed runtime bricks via `brick_inbox` / `brick_blast_radius`.'
     : '\n- Enable `--modular` (or `--include-extended`) to also expose `hydrascope_*`, `brick_*`, and `krusch_grounded_*` MCP tools alongside the 39 core unified tools.';
@@ -144,7 +244,7 @@ function buildDefaultAgentsMd({ mode = 'unified', includeExtended = false } = {}
  * @param {string} [options.targetDir=process.cwd()]
  * @param {'claude'|'cursor'|'windsurf'|'antigravity'|'all'} [options.ide='all']
  * @param {'unified'|'modular'} [options.mode='unified']
- * @param {'core'|'full'} [options.profile='full']
+ * @param {'memory-only'|'coding-agent'|'core'|'full'} [options.profile='full']
  * @param {boolean} [options.deferTools=false]
  * @param {boolean} [options.includeExtended=false]
  */
@@ -157,6 +257,8 @@ export function writeIdeConfigs({
   includeExtended = false
 } = {}) {
   const resolvedDir = path.resolve(targetDir);
+  const normalizedProfile = normalizeStackProfile(profile, 'full');
+  const normalizedMode = mode === 'modular' ? 'modular' : 'unified';
   const selectedIdes =
     ide === 'all'
       ? Object.keys(IDE_CONFIG_PATHS)
@@ -166,8 +268,8 @@ export function writeIdeConfigs({
 
   const generated = generateIdeConfig({
     ide,
-    mode,
-    profile,
+    mode: normalizedMode,
+    profile: normalizedProfile,
     workspaceRoot: resolvedDir,
     deferTools,
     includeExtended
@@ -213,7 +315,11 @@ export function writeIdeConfigs({
     fs.mkdirSync(path.dirname(agentsMdPath), { recursive: true });
     fs.writeFileSync(
       agentsMdPath,
-      buildDefaultAgentsMd({ mode, includeExtended }),
+      buildDefaultAgentsMd({
+        mode: normalizedMode,
+        profile: normalizedProfile,
+        includeExtended
+      }),
       'utf8'
     );
     agentsMdCreated = true;
@@ -222,12 +328,12 @@ export function writeIdeConfigs({
 
   const envelope = okEnvelope(
     'krusch_ide_install',
-    `Configured ${selectedIdes.length} IDE config file(s) (${mode} mode, ${profile} profile) in ${resolvedDir}.`,
+    `Configured ${selectedIdes.length} IDE config file(s) (${normalizedMode} mode, ${normalizedProfile} profile) in ${resolvedDir}.`,
     {
       target_dir: resolvedDir,
       ide,
-      mode,
-      profile,
+      mode: normalizedMode,
+      profile: normalizedProfile,
       files_written: filesWritten,
       filesWritten,
       agents_md_path: agentsMdPath,
