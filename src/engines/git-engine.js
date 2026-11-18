@@ -1395,12 +1395,57 @@ export function createGitEngine({ db, workspaceRoot = process.cwd() }) {
    * @param {string} [params.repo]
    * @param {string} [params.path='']
    */
+  function isContainedInRepoRoot(targetAbs, repoRoot) {
+    const resolvedRoot = path.resolve(repoRoot);
+    if (targetAbs !== resolvedRoot && !targetAbs.startsWith(resolvedRoot + path.sep)) {
+      return false;
+    }
+    if (!fs.existsSync(resolvedRoot)) {
+      return true;
+    }
+    const realRoot = fs.realpathSync(resolvedRoot);
+    const rel = path.relative(resolvedRoot, targetAbs);
+    const segments = rel.split(path.sep).filter(Boolean);
+    let cur = resolvedRoot;
+    for (const seg of segments) {
+      cur = path.join(cur, seg);
+      let st;
+      try {
+        st = fs.lstatSync(cur);
+      } catch (err) {
+        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') break;
+        return false;
+      }
+      if (st.isSymbolicLink()) {
+        try {
+          const realTarget = fs.realpathSync(cur);
+          if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+      }
+    }
+    if (fs.existsSync(targetAbs)) {
+      try {
+        const realLeaf = fs.realpathSync(targetAbs);
+        if (realLeaf !== realRoot && !realLeaf.startsWith(realRoot + path.sep)) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
   function readTree({ repo, path: relPath = '' } = {}) {
     const repoRecord = resolveRepoRecord(repo);
     const cleanRel = String(relPath ?? '').replace(/^\/+/, '');
     const targetDir = path.resolve(repoRecord.root_path, cleanRel);
 
-    if (!targetDir.startsWith(path.resolve(repoRecord.root_path))) {
+    if (!isContainedInRepoRoot(targetDir, repoRecord.root_path)) {
       return okEnvelope(
         'krusch_git_read_tree',
         'Path traversal outside repository root is not permitted.',
@@ -1473,7 +1518,7 @@ export function createGitEngine({ db, workspaceRoot = process.cwd() }) {
       ? path.resolve(rawRel)
       : path.resolve(repoRecord.root_path, rawRel);
 
-    if (!targetFile.startsWith(path.resolve(repoRecord.root_path))) {
+    if (!isContainedInRepoRoot(targetFile, repoRecord.root_path)) {
       return okEnvelope(
         'krusch_git_read_blob',
         'Path traversal outside repository root is not permitted.',
@@ -1604,8 +1649,16 @@ export function createGitEngine({ db, workspaceRoot = process.cwd() }) {
       ? path.relative(repoRecord.root_path, rawFile).replace(/\\/g, '/')
       : rawFile.replace(/^\.\/+/, '').replace(/\\/g, '/');
 
-    // If file exists on disk and has not been indexed yet (or was recently created), index it now
+    // If file exists on disk inside repository root and has not been indexed yet, index it now
     const absCandidate = path.resolve(repoRecord.root_path, normalizedFile);
+    if (!isContainedInRepoRoot(absCandidate, repoRecord.root_path)) {
+      return okEnvelope(
+        'krusch_git_file_symbols',
+        'Path traversal outside repository root is not permitted.',
+        { error: 'path_traversal_denied', symbols: [] },
+        false
+      );
+    }
     if (fs.existsSync(absCandidate) && fs.statSync(absCandidate).isFile()) {
       const existingCount = db.prepare(`
         SELECT COUNT(*) AS cnt FROM git_symbols WHERE repo_name = ? AND file_path = ?

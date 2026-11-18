@@ -1,7 +1,7 @@
 {
   "name": "krusch-stack",
-  "version": "1.1.0",
-  "description": "The unified Sovereign AI & Coding Agent Stack: one-command installer and MCP gateway bundling Tier 1 Working Memory (krusch-context-mcp), Tier 2A Git DAG & AST Graph (krusch-git), Tier 2B Page-Anchored OS Filesystem (krusch-fs), Tier 3 Staged 2PC & Turn-0 Grounded Harnesses (krusch-harness + grounded-harness), Collaborative Brick Exchange & 4-Axis Ontology, Frontend Design Engine (krusch-frontend-mcp), Google Workspace Hub (g-krusch), and L1-L3 Cascade Router.",
+  "version": "1.2.0",
+  "description": "The unified Sovereign AI & Coding Agent Stack: one-command installer and MCP gateway bundling Tier 1 Working Memory & Git Alignment (krusch-context-mcp), Tier 2A Git DAG & AST Graph (krusch-git), Tier 2B Page-Anchored OS Filesystem (krusch-fs), Tier 2C HydraScope Structural Context & Temporal Ontology, Tier 2D Collaborative Brick Exchange & 4-Axis Ontology, Tier 3 Staged 2PC & Turn-0 Grounded Harnesses (krusch-harness + grounded-harness), Frontend Design Engine (krusch-frontend-mcp), Google Workspace Hub (g-krusch), Sovereign ToolGraph, Polyglot Audit, and L1-L3 Cascade Router.",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -17,8 +17,14 @@
     "./resilience": "./src/engines/resilience-engine.js",
     "./action-harness": "./src/engines/action-harness-engine.js",
     "./grounded-harness": "./src/engines/grounded-harness-engine.js",
+    "./grounded-auth-drift": "./src/engines/grounded-auth-drift.js",
+    "./grounded-trace-synthesizer": "./src/engines/grounded-trace-synthesizer.js",
     "./brick-exchange": "./src/engines/brick-exchange-engine.js",
-    "./brick-ontology": "./src/engines/brick-ontology-engine.js"
+    "./brick-ontology": "./src/engines/brick-ontology-engine.js",
+    "./hydrascope": "./src/engines/hydrascope-engine.js",
+    "./git-alignment": "./src/engines/git-alignment-engine.js",
+    "./tool-graph": "./src/engines/tool-graph-engine.js",
+    "./polyglot-audit": "./src/engines/polyglot-audit-engine.js"
   },
   "engines": {
     "node": ">=22.0.0"
@@ -34,6 +40,7 @@
     "docker-compose.yml",
     ".env.example",
     "spec.md",
+    "INSTALL.md",
     "README.md",
     "LICENSE"
   ],
@@ -71,6 +78,9 @@
     "brick-exchange",
     "brick-ontology",
     "hydrascope",
+    "tool-graph",
+    "git-alignment",
+    "polyglot-audit",
     "hexagonal-architecture",
     "blast-radius"
   ],
@@ -86,9 +96,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2"
-  },
-  "optionalDependencies": {
-    "pg": "^8.20.0"
   },
   "overrides": {
     "fast-uri": "^4.2.3",

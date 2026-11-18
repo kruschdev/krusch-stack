@@ -1,6 +1,7 @@
 node_modules/
 .krusch-stack/
 .agent/context.db*
+.agent/audit/
 .env
 *.log
 .DS_Store

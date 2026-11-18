@@ -10,7 +10,7 @@ test('krusch-stack canonical Lego starter templates obey INV-STACK-02, INV-STACK
   const engine = createFrontendEngine({});
   const listed = engine.listCanonicalTemplates();
   assert.equal(listed.ok, true);
-  assert.ok(listed.data.count >= 10);
+  assert.equal(listed.data.count, 16);
 
   const tplTool = ALL_STACK_TOOLS.find((t) => t.name === 'get_canonical_template');
   assert.ok(tplTool, 'Missing get_canonical_template in ALL_STACK_TOOLS');
@@ -20,11 +20,15 @@ test('krusch-stack canonical Lego starter templates obey INV-STACK-02, INV-STACK
   assert.deepEqual([...schemaEnum].sort(), [...ids].sort(), 'MCP schema enum must match frontend-engine template IDs');
 
   for (const id of [
+    'site-header',
     'lego-node-api',
     'lego-mcp-server',
     'lego-sse-route',
     'lego-react-shell',
-    'lego-fastapi-app'
+    'lego-fastapi-app',
+    'lego-vercel-nextjs-shell',
+    'lego-vercel-edge-sse',
+    'lego-vercel-json'
   ]) {
     assert.ok(ids.includes(id), `Expected canonical Lego template ${id}`);
     assert.ok(schemaEnum.includes(id), `Expected ${id} in ALL_STACK_TOOLS enum`);

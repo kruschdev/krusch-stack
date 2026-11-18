@@ -78,12 +78,14 @@ function buildUnifiedDiff(relPath, beforeText, afterText, existedBefore) {
 }
 
 /**
- * Resolve a relative file path safely within workspaceRoot, throwing on traversal outside root.
+ * Resolve a relative file path safely within workspaceRoot, blocking lexical traversal,
+ * symlink escapes outside workspaceRoot, and intermediate/target symlinks.
  * @param {string} workspaceRoot
  * @param {string} candidatePath
+ * @param {typeof fs} [fsOps=fs]
  * @returns {{ absPath: string, relPath: string }}
  */
-function resolveSafeWorkspacePath(workspaceRoot, candidatePath) {
+export function resolveSafeWorkspacePath(workspaceRoot, candidatePath, fsOps = fs) {
   const root = path.resolve(workspaceRoot);
   const raw = String(candidatePath || '').trim();
   if (!raw) {
@@ -91,9 +93,66 @@ function resolveSafeWorkspacePath(workspaceRoot, candidatePath) {
   }
   const absPath = path.resolve(root, raw);
   const relPath = path.relative(root, absPath);
-  if (relPath.startsWith('..') || path.isAbsolute(relPath)) {
+  if (!relPath || relPath === '.' || relPath.startsWith('..') || path.isAbsolute(relPath)) {
     throw new Error(`Path traversal outside workspaceRoot is forbidden: ${raw}`);
   }
+
+  const existsFn = typeof fsOps?.existsSync === 'function' ? fsOps.existsSync : fs.existsSync;
+  const realpathFn = typeof fsOps?.realpathSync === 'function' ? fsOps.realpathSync : fs.realpathSync;
+  const lstatFn = typeof fsOps?.lstatSync === 'function' ? fsOps.lstatSync : fs.lstatSync;
+  const readlinkFn = typeof fsOps?.readlinkSync === 'function' ? fsOps.readlinkSync : fs.readlinkSync;
+
+  if (existsFn(root)) {
+    const realRoot = realpathFn(root);
+
+    let ancestor = absPath;
+    while (ancestor !== root && !existsFn(ancestor)) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+    if (existsFn(ancestor)) {
+      const realAncestor = realpathFn(ancestor);
+      if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + path.sep)) {
+        throw new Error(`Path escapes workspaceRoot via symlink: ${raw}`);
+      }
+    }
+
+    const relSegments = relPath.split(path.sep).filter(Boolean);
+    let cur = root;
+    for (const seg of relSegments) {
+      cur = path.join(cur, seg);
+      let st;
+      try {
+        st = lstatFn(cur);
+      } catch (err) {
+        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+          break;
+        }
+        throw err;
+      }
+      if (st.isSymbolicLink()) {
+        try {
+          const linkTarget = readlinkFn(cur);
+          const resolvedLink = path.resolve(path.dirname(cur), linkTarget);
+          if (
+            resolvedLink !== root &&
+            !resolvedLink.startsWith(root + path.sep) &&
+            resolvedLink !== realRoot &&
+            !resolvedLink.startsWith(realRoot + path.sep)
+          ) {
+            throw new Error(`Path escapes workspaceRoot via symlink: ${raw}`);
+          }
+        } catch (linkErr) {
+          if (String(linkErr?.message || '').startsWith('Path escapes workspaceRoot via symlink')) {
+            throw linkErr;
+          }
+        }
+        throw new Error(`Symbolic links are forbidden in workspace mutations: ${raw}`);
+      }
+    }
+  }
+
   return { absPath, relPath: relPath.replace(/\\/g, '/') };
 }
 
@@ -416,7 +475,7 @@ export function createHarnessEngine({
     try {
       normalizedEdits = normalizeStagedEdits(edits, files);
       for (const edit of normalizedEdits) {
-        const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, edit.file_path);
+        const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, edit.file_path, fsImpl);
         const { exists: existed, content: rawBeforeText } = readTextIfExists(absPath, fsImpl);
         const beforeText = existed ? rawBeforeText : '';
         const afterText = edit.hasContent ? edit.content : beforeText;
@@ -619,7 +678,7 @@ export function createHarnessEngine({
         const inspected = [];
         for (const entry of contentEntries) {
           const targetRel = entry.file_path || entry.rel_path;
-          const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, targetRel);
+          const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, targetRel, fsImpl);
           cleanOrphanedTempFiles(absPath, fsImpl);
 
           const { exists: diskExists, content: diskText } = readTextIfExists(absPath, fsImpl);
@@ -906,7 +965,7 @@ export function createHarnessEngine({
           item !== null &&
           item.has_content !== false &&
           typeof item.content === 'string';
-        const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, filePath);
+        const { absPath, relPath } = resolveSafeWorkspacePath(rootDir, filePath, fsImpl);
 
         if (hasContent) {
           cleanOrphanedTempFiles(absPath, fsImpl);
@@ -1023,10 +1082,15 @@ export function createHarnessEngine({
     const renamedSoFar = [];
     try {
       for (const target of contentTargets) {
-        fsImpl.renameSync(target.tempPath, target.absPath);
+        const { absPath: verifiedTargetAbs } = resolveSafeWorkspacePath(
+          rootDir,
+          target.relPath,
+          fsImpl
+        );
+        fsImpl.renameSync(target.tempPath, verifiedTargetAbs);
         target.tempPath = null;
         renamedSoFar.push(target);
-        fsyncDirectory(path.dirname(target.absPath), fsImpl);
+        fsyncDirectory(path.dirname(verifiedTargetAbs), fsImpl);
 
         if (
           allowHooks &&

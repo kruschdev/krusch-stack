@@ -1,0 +1,12 @@
+node_modules
+.git
+.github
+.krusch-stack
+.agent
+.env
+.env.*
+!.env.example
+*.corrupt.*
+coverage
+docs/video
+tests

@@ -61,7 +61,7 @@ function makeTempWorkspace() {
   return dir;
 }
 
-describe('KruschStack Unified Ecosystem Suite (v1.1.0)', () => {
+describe('KruschStack Unified Ecosystem Suite (v1.2.0)', () => {
   test('INV-STACK-03: All 39 MCP tools declare explicit 4-boolean annotations and MIT LICENSE exists', () => {
     assert.equal(ALL_STACK_TOOLS.length, 39, 'Expected 39 total tools across the 7 stack pillars');
     const licensePath = path.join(REPO_ROOT, 'LICENSE');
@@ -674,9 +674,10 @@ describe('KruschStack Unified Ecosystem Suite (v1.1.0)', () => {
 
       const rRun = await dispatchStackTool(coverageStack, 'krusch_run', {
         goal: 'Update sample',
-        diffs: [{ file_path: 'sample.js', new_content: 'export function sampleFn() { return 2; }\n' }]
+        edits: [{ file_path: 'src/math.js', content: 'export function add(a, b) { return a + b + 0; }\n' }]
       });
       assert.equal(rRun.ok, true);
+      assert.ok(rRun.data.unified_diff.includes('export function add'), 'krusch_run must stage real edits');
       const taskId = rRun.data.task_id;
       assert.equal((await dispatchStackTool(coverageStack, 'krusch_task_status', { task_id: taskId })).ok, true);
       assert.equal((await dispatchStackTool(coverageStack, 'krusch_diff', { task_id: taskId })).ok, true);

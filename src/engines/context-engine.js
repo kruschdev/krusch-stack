@@ -40,6 +40,15 @@ import {
   prunePostRetrieval,
   prunePreSynthesis
 } from './context-prune.js';
+import {
+  isUnifiedDiffText,
+  extractMemoryCoChangeRules,
+  evaluateCoChangeRules,
+  findBlamedDiffMemories,
+  scanSupersededStaleCode,
+  detectLegoBoilerplateViolations,
+  recordExplicitProvenanceReanchor
+} from './git-alignment-engine.js';
 
 const VALID_CATEGORIES = new Set(['decision', 'invariant', 'bug', 'lesson', 'blocker']);
 const VALID_REVISE_ACTIONS = new Set(['supersede', 'invalidate']);
@@ -116,7 +125,7 @@ function computeProvenanceAnchorHash(provenance, workspaceRoot) {
   }
 
   const quoted = typeof provenance.quoted_sentence === 'string'
-    ? provenance.quoted_sentence.trim()
+    ? provenance.quoted_sentence.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
     : '';
   const relFile = typeof provenance.file === 'string' ? provenance.file.trim() : '';
   const locator = typeof provenance.locator === 'string' ? provenance.locator.trim() : '';
@@ -952,7 +961,8 @@ export function evaluateSpanDrift(row, workspaceRoot, db = null) {
   }
 
   if (quoted && anchorHash) {
-    return sha256(quoted) === anchorHash
+    const normalizedQuoted = quoted.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    return sha256(normalizedQuoted) === anchorHash
       ? { status: 'VALID' }
       : { status: 'STALE_DRIFT' };
   }
@@ -974,7 +984,12 @@ function extractForbiddenPatterns(ruleText) {
     const backtickMatches = text.matchAll(/`([^`]{2,64})`/g);
     for (const match of backtickMatches) {
       const token = match[1].trim();
-      if (token) patterns.add(token);
+      if (
+        token &&
+        !/^(?:@krusch\/toolkit|krusch_toolkit|INV-)/i.test(token)
+      ) {
+        patterns.add(token);
+      }
     }
 
     const verbMatches = text.matchAll(/\b(?:never\s+use|do\s+not\s+use|don't\s+use|forbid|prohibit|disallow|avoid|no)\s+([a-zA-Z0-9_.:/()-]{3,40})/gi);
@@ -2583,6 +2598,9 @@ export function createContextEngine({
         );
         newId = Number(insertResult.lastInsertRowid);
         markSupersededStmt.run(newId, revocationReason, numericId);
+        if (hasProvenanceUpdate) {
+          recordExplicitProvenanceReanchor(db, newId);
+        }
         db.exec('COMMIT');
       } catch (err) {
         try {
@@ -2643,25 +2661,88 @@ export function createContextEngine({
    * @param {object} [params]
    * @param {string} [params.trigger='pre_commit']
    * @param {string} [params.code='']
+   * @param {string} [params.file_path='']
+   * @param {boolean} [params.enable_lego_guard=false]
    */
-  function nudge({ trigger = 'pre_commit', code = '' } = {}) {
+  function nudge({
+    trigger = 'pre_commit',
+    code = '',
+    file_path = '',
+    enable_lego_guard = false
+  } = {}) {
     const codeText = String(code ?? '');
+    const filePathText = String(file_path ?? '').trim();
     const activeRows = selectActivePoolStmt
       .all(maxScanLimit)
-      .filter((row) => row.category === 'invariant' || row.category === 'decision');
+      .filter(
+        (row) =>
+          row.category === 'invariant' ||
+          row.category === 'decision' ||
+          row.category === 'blocker'
+      );
 
     const findings = [];
+    const { rules: coChangeRules, malformedRules } = extractMemoryCoChangeRules(activeRows);
+    const coChangeRowIds = new Set(
+      [
+        ...coChangeRules.map((r) => Number(r.id)),
+        ...malformedRules.map((r) => Number(r.id))
+      ].filter(Number.isFinite)
+    );
+
+    let cochangeViolationsCount = 0;
+    if (trigger !== 'pre_edit' && isUnifiedDiffText(codeText)) {
+      for (const bad of malformedRules) {
+        cochangeViolationsCount += 1;
+        findings.push({
+          memory_id: bad.memory_id ?? null,
+          category: bad.category || 'invariant',
+          severity: 'error',
+          matched_token: bad.id !== undefined ? String(bad.id) : '--when/--require',
+          rule: bad.rule || bad.error,
+          message: `Invalid co-change rule syntax in memory #${bad.id}: ${bad.error}`
+        });
+      }
+
+      if (coChangeRules.length > 0) {
+        const coChangeEval = evaluateCoChangeRules({
+          diff: codeText,
+          changedFiles: filePathText ? [filePathText] : [],
+          rules: coChangeRules
+        });
+        for (const v of coChangeEval.violations) {
+          cochangeViolationsCount += 1;
+          findings.push({
+            memory_id: v.memory_id ?? null,
+            category: v.category || 'invariant',
+            severity: 'error',
+            matched_token: v.triggeredBy[0] || '',
+            rule: v.rule || v.description,
+            message: `${v.description} (triggered by ${v.triggeredBy.join(', ')}; missing companion update in ${v.missingAnyOf.join(' or ')}).`
+          });
+        }
+      }
+    }
+
+    const isDiff = isUnifiedDiffText(codeText);
+    const inspectTextForForbidden = isDiff
+      ? codeText
+          .split(/\r?\n/)
+          .filter((ln) => !ln.startsWith('-') || ln.startsWith('---'))
+          .join('\n')
+      : codeText;
 
     for (const row of activeRows) {
       if (findings.length >= 3) break;
+      if (coChangeRowIds.has(Number(row.id))) continue;
 
       const forbiddenTokens = extractForbiddenPatterns(row.content);
       for (const token of forbiddenTokens) {
-        if (codeText.includes(token)) {
+        if (inspectTextForForbidden.includes(token)) {
           findings.push({
             memory_id: Number(row.id),
             category: row.category,
-            severity: row.category === 'invariant' ? 'error' : 'warning',
+            severity: row.category === 'invariant' || row.category === 'blocker' ? 'error' : 'warning',
             matched_token: token,
             rule: row.content,
             message: `Violation of ${row.category} #${row.id}: found forbidden pattern "${token}".`
@@ -2672,11 +2753,11 @@ export function createContextEngine({
     }
 
     // Built-in sanitization check if code contains RFC1918 / CGNAT IP literals when invariant rules exist
-    if (findings.length < 3 && codeText) {
+    if (findings.length < 3 && inspectTextForForbidden) {
       const privateIpRegex = new RegExp(
         '\\b(?:192\\.168\\.\\d{1,3}\\.\\d{1,3}|10\\.10\\.10\\.\\d{1,3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.\\d{1,3}\\.\\d{1,3})\\b'
       );
-      const ipMatch = codeText.match(privateIpRegex);
+      const ipMatch = inspectTextForForbidden.match(privateIpRegex);
       if (ipMatch) {
         findings.push({
           memory_id: null,
@@ -2685,6 +2766,60 @@ export function createContextEngine({
           matched_token: ipMatch[0],
           rule: 'INV-STACK-04: Public Sanitization (no private LAN or mesh IP literals).',
           message: `Found private IP literal "${ipMatch[0]}" violating INV-STACK-04.`
+        });
+      }
+    }
+
+    let blameMatchesCount = 0;
+    if (findings.length < 3 && (codeText || filePathText)) {
+      const blameMatches = findBlamedDiffMemories(codeText, {
+        filePath: filePathText,
+        workspaceRoot: root,
+        db
+      });
+      blameMatchesCount = blameMatches.length;
+      const seenMemoryIds = new Set(
+        findings.map((f) => f.memory_id).filter((id) => id !== null && id !== undefined)
+      );
+      for (const bm of blameMatches) {
+        if (findings.length >= 3) break;
+        if (bm.memory_id !== null && bm.memory_id !== undefined && seenMemoryIds.has(bm.memory_id)) {
+          continue;
+        }
+        if (bm.memory_id !== null && bm.memory_id !== undefined) {
+          seenMemoryIds.add(bm.memory_id);
+        }
+        findings.push({
+          memory_id: bm.memory_id ?? null,
+          category: bm.category || 'decision',
+          severity: bm.severity || (bm.category === 'invariant' ? 'error' : 'warning'),
+          matched_token: bm.matched_token || bm.commit || bm.citation || '',
+          rule: bm.rule || bm.content,
+          message: bm.message,
+          ...(bm.citation ? { citation: bm.citation } : {}),
+          ...(bm.commit ? { commit: bm.commit } : {})
+        });
+      }
+    }
+
+    const legoInvariantRow = activeRows.find(
+      (row) =>
+        row.category === 'invariant' &&
+        (/\bINV-LEGO-01\b/i.test(String(row.content || '')) ||
+          /@krusch\/toolkit\b/i.test(String(row.content || '')))
+    );
+    if (findings.length < 3 && codeText && (enable_lego_guard === true || Boolean(legoInvariantRow))) {
+      const legoViolations = detectLegoBoilerplateViolations(codeText);
+      for (const lv of legoViolations) {
+        if (findings.length >= 3) break;
+        if (findings.some((f) => f.matched_token === lv.matched_token)) continue;
+        findings.push({
+          memory_id: legoInvariantRow ? Number(legoInvariantRow.id) : null,
+          category: 'invariant',
+          severity: 'error',
+          matched_token: lv.matched_token,
+          rule: lv.rule,
+          message: lv.message
         });
       }
     }
@@ -2701,6 +2836,9 @@ export function createContextEngine({
         trigger,
         passed,
         rules_checked: activeRows.length,
+        active_rules_checked: activeRows.length,
+        cochange_violations_count: cochangeViolationsCount,
+        blame_matches_count: blameMatchesCount,
         findings: cappedFindings
       },
       true
@@ -2708,7 +2846,7 @@ export function createContextEngine({
   }
 
   /**
-   * Return store health counts and INV-12 drift statistics.
+   * Return store health counts, INV-12 drift statistics, and superseded stale-code scan telemetry.
    */
   function health() {
     const countsRows = db
@@ -2731,6 +2869,19 @@ export function createContextEngine({
       }
     }
 
+    const byCategory = {
+      decision: 0,
+      invariant: 0,
+      bug: 0,
+      lesson: 0,
+      blocker: 0
+    };
+    for (const catRow of selectActiveCountsByCatStmt.all()) {
+      if (catRow.category in byCategory) {
+        byCategory[catRow.category] = Number(catRow.cnt) || 0;
+      }
+    }
+
     const activeRows = selectActiveStmt.all();
     let driftedCount = 0;
     let relocatedCandidatesCount = 0;
@@ -2749,6 +2900,11 @@ export function createContextEngine({
       }
     }
 
+    const staleScan =
+      counts.superseded > 0
+        ? scanSupersededStaleCode({ workspaceRoot: root, db })
+        : { findings: [], totalStaleLines: 0 };
+
     return okEnvelope(
       'krusch_context_health',
       `Context store healthy: ${counts.active} active, ${counts.superseded} superseded, ${counts.invalidated} invalidated, ${driftedCount} drifted.`,
@@ -2758,9 +2914,14 @@ export function createContextEngine({
         invalidated: counts.invalidated,
         embedded_count: embeddedCount,
         drifted_count: driftedCount,
+        drifted: driftedCount,
         relocated_candidates_count: relocatedCandidatesCount,
         healed_count: healedCount,
-        total: counts.active + counts.superseded + counts.invalidated
+        by_category: byCategory,
+        total: counts.active + counts.superseded + counts.invalidated,
+        stale_code_findings: staleScan.findings.length,
+        stale_code_lines: staleScan.totalStaleLines,
+        stale_code_items: staleScan.findings
       },
       true
     );

@@ -4,10 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { STACK_SCHEMA_SQL } from '../src/db/sqlite.js';
+import { openStackDatabase, STACK_SCHEMA_SQL } from '../src/db/sqlite.js';
 import { RESILIENCE_SCHEMA_SQL } from '../src/engines/resilience-engine.js';
+import { ACTION_HARNESS_SCHEMA_SQL } from '../src/engines/action-harness-engine.js';
 import { GROUNDED_HARNESS_SCHEMA_SQL } from '../src/engines/grounded-harness-engine.js';
 import { BRICK_EXCHANGE_SCHEMA_SQL } from '../src/engines/brick-exchange-engine.js';
+import { HYDRASCOPE_SCHEMA_SQL } from '../src/engines/hydrascope-engine.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,7 +35,9 @@ const REQUIRED_POSTGRES_TABLES = [
   'grounded_events',
   'brick_exchange_bricks',
   'brick_exchange_grants',
-  'brick_exchange_adoptions'
+  'brick_exchange_adoptions',
+  'hydrascope_nodes',
+  'hydrascope_edges'
 ];
 
 /**
@@ -304,7 +308,7 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
     }
   });
 
-  test('All 19 core, journal, resilience, INV-STACK-10 action-harness, INV-STACK-11 grounded-harness, and INV-STACK-12 brick-exchange tables and indexes match SQLite parity', () => {
+  test('All 21 core, journal, resilience, INV-STACK-10 action-harness, INV-STACK-11 grounded-harness, INV-STACK-12 brick-exchange, and INV-STACK-13 hydrascope tables and indexes match SQLite parity', () => {
     for (const tableName of REQUIRED_POSTGRES_TABLES) {
       assert.ok(pgTables.has(tableName), `Missing required PostgreSQL table: ${tableName}`);
     }
@@ -357,7 +361,35 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
     assert.equal(shadowCols.get('cost_delta_usd'), 'DOUBLE PRECISION NOT NULL');
     assert.equal(shadowCols.get('created_at_ms'), 'BIGINT NOT NULL');
 
-    // 3. Verify INV-STACK-10 2PC Tool-Action Harness tables & indexes
+    // 3. Cross-check ACTION_HARNESS_SCHEMA_SQL dynamically against db/init.sql + standalone openStackDatabase()
+    const sqliteActionTables = extractTableColumns(ACTION_HARNESS_SCHEMA_SQL);
+    for (const [tableName, sqliteCols] of sqliteActionTables.entries()) {
+      const pgCols = pgTables.get(tableName);
+      assert.ok(pgCols, `Action harness table ${tableName} missing from db/init.sql`);
+      assert.deepEqual([...pgCols.keys()], [...sqliteCols.keys()]);
+    }
+
+    const standaloneDb = openStackDatabase({ ephemeral: true });
+    try {
+      const liveTables = new Set(
+        standaloneDb
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all()
+          .map((r) => r.name)
+      );
+      for (const reqTbl of REQUIRED_POSTGRES_TABLES) {
+        assert.ok(liveTables.has(reqTbl), `openStackDatabase() must provision ${reqTbl}`);
+      }
+      const cmCols = new Set(
+        standaloneDb.prepare('PRAGMA table_info(context_memories)').all().map((c) => c.name)
+      );
+      assert.ok(cmCols.has('provenance_reanchored'));
+      assert.ok(pgTables.get('context_memories').has('provenance_reanchored'));
+    } finally {
+      standaloneDb.close();
+    }
+
+    // Verify INV-STACK-10 2PC Tool-Action Harness exact column definitions
     const sessionCols = pgTables.get('action_harness_sessions');
     assert.deepEqual(
       [...sessionCols.entries()],
@@ -432,6 +464,14 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
       assert.deepEqual([...pgCols.keys()], [...sqliteCols.keys()]);
     }
 
+    // 6. Cross-check INV-STACK-13 HydraScope tables & types
+    const sqliteHydraTables = extractTableColumns(HYDRASCOPE_SCHEMA_SQL);
+    for (const [tableName, sqliteCols] of sqliteHydraTables.entries()) {
+      const pgCols = pgTables.get(tableName);
+      assert.ok(pgCols, `HydraScope table ${tableName} missing from db/init.sql`);
+      assert.deepEqual([...pgCols.keys()], [...sqliteCols.keys()]);
+    }
+
     const requiredIndexes = [
       ['idx_stack_hitl_gates_task_status', 'stack_hitl_gates', '(task_id, status)'],
       ['idx_stack_shadow_runs_request', 'stack_shadow_runs', '(request_id, created_at_ms)'],
@@ -441,7 +481,11 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
       ['idx_grounded_events_session_time', 'grounded_events', '(session_id, created_at_ms)'],
       ['idx_brick_exchange_bricks_org', 'brick_exchange_bricks', '(org_id, brick_id)'],
       ['idx_brick_exchange_grants_brick', 'brick_exchange_grants', '(brick_id, source_hash)'],
-      ['idx_brick_exchange_adoptions_brick', 'brick_exchange_adoptions', '(brick_id, created_at_ms)']
+      ['idx_brick_exchange_adoptions_brick', 'brick_exchange_adoptions', '(brick_id, created_at_ms)'],
+      ['idx_hydrascope_nodes_ws_kind', 'hydrascope_nodes', '(workspace_name, kind, is_current)'],
+      ['idx_hydrascope_nodes_ws_id', 'hydrascope_nodes', '(workspace_name, node_id)'],
+      ['idx_hydrascope_edges_from', 'hydrascope_edges', '(workspace_name, from_id, edge_type)'],
+      ['idx_hydrascope_edges_to', 'hydrascope_edges', '(workspace_name, to_id, edge_type)']
     ];
 
     for (const [idxName, tblName, colTuple] of requiredIndexes) {

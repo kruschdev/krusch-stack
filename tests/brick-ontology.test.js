@@ -1113,7 +1113,7 @@ test('SEC-01/02/03 & ARCH-01: seal verification, malicious brickId breakout, uns
   }
 });
 
-test('P2 Parity: package.json ./brick-ontology subpath, openStackDatabase, runStackDoctor & stack.status() recognize brick_exchange_* tables on v1.1.0', async () => {
+test('P2 Parity: package.json ./brick-ontology subpath, openStackDatabase, runStackDoctor & stack.status() recognize brick_exchange_* and hydrascope_* tables on v1.2.0', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kruschstack-p2-parity-'));
   try {
     const pkgRaw = JSON.parse(
@@ -1132,9 +1132,11 @@ test('P2 Parity: package.json ./brick-ontology subpath, openStackDatabase, runSt
 
       const status = stack.status();
       assert.equal(status.ok, true);
-      assert.equal(status.data.version, '1.1.0');
+      assert.equal(status.data.version, '1.2.0');
       assert.equal(status.data.brick_exchange_tables_ready, true);
+      assert.equal(status.data.hydrascope_tables_ready, true);
       assert.equal(status.data.auxiliary_engines.brickExchange.ready, true);
+      assert.equal(status.data.auxiliary_engines.hydrascope.ready, true);
     } finally {
       stack.db.close();
     }

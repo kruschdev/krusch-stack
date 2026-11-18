@@ -2,7 +2,7 @@
 
 These are instructions for a coding agent (Claude Code, Codex, Cursor, Windsurf, or Antigravity) that a person asked to install and configure `krusch-stack` on their machine or inside their repository.
 
-`krusch-stack` packages all 7 pillars of the Krusch agent infrastructure ecosystem (Working Memory, Git & AST Symbol Graph, OS Page Memory, 2PC Staged Execution Harness, Turn-0 Grounded Harness, Validated Brick Exchange & 4-Axis Ontology, Frontend Design MCP, Google Workspace Hub, and the `<25µs` Cascade Router) into a single `npx` command and unified 39-tool MCP server.
+`krusch-stack` packages the entire Krusch agent infrastructure ecosystem (Working Memory & Git Alignment, Git & AST Symbol Graph, OS Page Memory, HydraScope Structural Context & Temporal Ontology, Validated Brick Exchange & 4-Axis Ontology, 2PC Staged Execution Harness, Turn-0 Grounded Harness, Frontend Design MCP with 16 Lego/Vercel templates, Google Workspace Hub, Sovereign ToolGraph, Polyglot Audit, and the `<25µs` Cascade Router) into a single `npx` command and unified MCP server.
 
 ## 1. Check Prerequisites First (All at Once)
 
@@ -20,13 +20,13 @@ ollama --version 2>/dev/null || echo "OPTIONAL_MISSING: ollama"
 Evaluate the results:
 1. **User check**: If `id -u` prints `0` (root), stop and ask the person to run you as a standard non-root user.
 2. **Node.js `>= 22.0.0` (Required)**: `krusch-stack` relies on Node 22's built-in `node:sqlite` (`DatabaseSync`) so zero native C++ compilation or Docker containers are required. If `node -v` is missing or below `v22.0.0`, ask the person before installing/switching to Node 22 (`nvm install 22` or `fnm use 22`).
-3. **Docker & Ollama (Strictly Optional)**: Neither is needed for the default local setup. Only use Docker if the person explicitly requests the PostgreSQL 16 + `pgvector` HTTP Gateway (`:3780`).
+3. **Docker & Ollama (Strictly Optional)**: Neither is needed for the default local setup. Only use Docker if the person explicitly requests the containerized HTTP Gateway (`127.0.0.1:3780`) and companion PostgreSQL 16 + `pgvector` schema (`db/init.sql`).
 
 ## 2. Choose the Right Setup Mode
 
-- **Mode A: Zero-Docker Local SQLite + IDE MCP Setup (Recommended Default)**: Runs `npx krusch-stack init` in the person's target workspace, initializes `.krusch-stack/stack.db` in WAL mode, writes non-destructive IDE MCP configurations, and runs `npx krusch-stack doctor`.
-- **Mode B: Source Checkout + Full Test & Crash-Recovery Verification**: Clones `https://github.com/kruschdev/krusch-stack.git`, runs all `78` automated unit/integration tests and the 2-process `SIGKILL` crash-recovery drill, and links the local binary into MCP clients.
-- **Mode C: Docker Compose PostgreSQL 16 + `pgvector` Stack (Only if requested)**: Starts `pgvector/pgvector:pg16` and the HTTP gateway on `127.0.0.1:3780`.
+- **Mode A: Zero-Docker Local SQLite + IDE MCP Setup (Recommended Default)**: Runs `npx krusch-stack init` in the person's target workspace, initializes `.krusch-stack/stack.db` in WAL mode (`21` SQLite tables across all `10` stack pillars), writes non-destructive IDE MCP configurations, and runs `npx krusch-stack doctor`.
+- **Mode B: Source Checkout + Full Test & Crash-Recovery Verification**: Clones `https://github.com/kruschdev/krusch-stack.git`, runs the automated unit/integration test suite and the 2-process `SIGKILL` crash-recovery drill, and links the local binary into MCP clients.
+- **Mode C: Docker Compose Stack (Only if requested)**: Starts companion `pgvector/pgvector:pg16` (`db/init.sql` 21-table DDL parity) and the `krusch-stack` HTTP gateway (`node:sqlite` runtime) bound on `127.0.0.1:3780`.
 
 ## 3. Install & Verify
 
@@ -38,7 +38,7 @@ Inside the project directory where the person wants persistent memory, AST searc
 # Initialize .krusch-stack/stack.db and generate IDE MCP configs (enable --defer-tools if the client has tight prompt budgets)
 npx -y krusch-stack init --ide all --defer-tools
 
-# Verify Node 22, all 13 SQLite tables, and all 7 stack pillars
+# Verify Node 22, all 21 SQLite tables, and all 10 active stack pillars
 npx -y krusch-stack doctor
 
 # Optional: Run the 2-process SIGKILL mid-apply journal rollback self-test
@@ -56,7 +56,7 @@ npm test
 node ./bin/krusch-stack.js doctor --crash-drill
 ```
 
-### Mode C: Optional Docker Compose Stack (PostgreSQL 16 + `pgvector` on `:3780`)
+### Mode C: Optional Docker Compose Stack (HTTP Gateway on `127.0.0.1:3780` + Companion PostgreSQL 16 `db/init.sql`)
 
 Only run this if Docker is active and the person asked for shared PostgreSQL or HTTP gateway mode. Check whether port `3780` or `5432` is already bound first (`ss -ltnp | grep -E ':(3780|5432)\b' || true`):
 
@@ -107,7 +107,7 @@ curl -fsS http://127.0.0.1:3780/health
 ## Tell the Person After
 
 Share a concise status report:
-1. **Setup mode & storage path** (for example, Zero-Docker `node:sqlite` at `.krusch-stack/stack.db` or Docker PostgreSQL on `http://127.0.0.1:3780`).
+1. **Setup mode & storage path** (for example, Zero-Docker `node:sqlite` at `.krusch-stack/stack.db`, or Docker Compose HTTP gateway on `http://127.0.0.1:3780` with `node:sqlite` volume `/app/.krusch-stack/stack.db` and companion PostgreSQL 16 schema on `127.0.0.1:5432`).
 2. **Verification status**: Confirm `krusch-stack doctor` (and `--crash-drill` / `npm test` if run) passed cleanly.
 3. **Configured IDEs**: List the exact MCP config files updated and remind the person to reload MCP servers or open a new agent session so the 39 tools appear.
 4. **First-turn test prompt**: Suggest asking in their next session: `"Run krusch_stack_status and krusch_context_retrieve to verify KruschStack is connected."`

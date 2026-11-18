@@ -324,29 +324,76 @@ function classifyFileCategory(filePath) {
  * @returns {RegExp}
  */
 function globToRegExp(pattern) {
-  const trimmed = String(pattern || '*').trim();
-  if (!trimmed || trimmed === '*') {
+  const trimmed = String(pattern || '*').trim().slice(0, 256).toLowerCase();
+  if (!trimmed || trimmed === '*' || trimmed === '**') {
     return /^.*$/i;
   }
-  let regexStr = '';
+
+  // Tokenize for deterministic O(M * L) unanchored case-insensitive DP glob evaluation (zero ReDoS).
+  const tokens = [];
   for (let i = 0; i < trimmed.length; i += 1) {
     const ch = trimmed[i];
     if (ch === '*') {
       if (trimmed[i + 1] === '*') {
-        regexStr += '.*';
-        i += 1;
-      } else {
-        regexStr += '[^/]*';
+        while (trimmed[i + 1] === '*') i += 1;
+        if (tokens.length === 0 || tokens[tokens.length - 1].kind !== 'GLOBSTAR') {
+          tokens.push({ kind: 'GLOBSTAR' });
+        }
+      } else if (tokens.length === 0 || (tokens[tokens.length - 1].kind !== 'STAR' && tokens[tokens.length - 1].kind !== 'GLOBSTAR')) {
+        tokens.push({ kind: 'STAR' });
       }
     } else if (ch === '?') {
-      regexStr += '.';
-    } else if ('+^$()[]{}|\\'.includes(ch)) {
-      regexStr += `\\${ch}`;
+      tokens.push({ kind: 'QMARK' });
     } else {
-      regexStr += ch;
+      tokens.push({ kind: 'CHAR', ch });
     }
   }
-  return new RegExp(regexStr, 'i');
+
+  const linearSubstringTest = (rawCandidate) => {
+    const candidate = String(rawCandidate || '').slice(0, 1024).toLowerCase();
+    const len = candidate.length;
+    let dp = new Uint8Array(len + 1);
+    dp.fill(1); // unanchored substring match may start at any position
+
+    for (let t = 0; t < tokens.length; t += 1) {
+      const tok = tokens[t];
+      const next = new Uint8Array(len + 1);
+      if (tok.kind === 'CHAR') {
+        for (let j = 1; j <= len; j += 1) {
+          if (dp[j - 1] && candidate[j - 1] === tok.ch) next[j] = 1;
+        }
+      } else if (tok.kind === 'QMARK') {
+        for (let j = 1; j <= len; j += 1) {
+          if (dp[j - 1]) next[j] = 1;
+        }
+      } else if (tok.kind === 'STAR') {
+        next[0] = dp[0];
+        for (let j = 1; j <= len; j += 1) {
+          if (dp[j] || (candidate[j - 1] !== '/' && next[j - 1])) next[j] = 1;
+        }
+      } else if (tok.kind === 'GLOBSTAR') {
+        let seen = 0;
+        for (let j = 0; j <= len; j += 1) {
+          if (dp[j]) seen = 1;
+          next[j] = seen;
+        }
+      }
+      dp = next;
+    }
+
+    for (let j = 0; j <= len; j += 1) {
+      if (dp[j]) return true;
+    }
+    return false;
+  };
+
+  const safeRe = new RegExp('^$', 'i');
+  Object.defineProperty(safeRe, 'test', {
+    value: linearSubstringTest,
+    writable: false,
+    configurable: true
+  });
+  return safeRe;
 }
 
 /**

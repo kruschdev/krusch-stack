@@ -8,7 +8,7 @@
 
 import { okEnvelope } from '../db/sqlite.js';
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 const TIER_CATALOG = {
   L1_FAST_LOCAL: {
@@ -176,7 +176,11 @@ export function createRouterEngine({ config = {} } = {}) {
       resilience: { ready: Boolean(engines && engines.resilience) },
       actionHarness: { ready: Boolean(engines && engines.actionHarness) },
       groundedHarness: { ready: Boolean(engines && engines.groundedHarness) },
-      brickExchange: { ready: Boolean(engines && engines.brickExchange) }
+      brickExchange: { ready: Boolean(engines && engines.brickExchange) },
+      hydrascope: { ready: Boolean(engines && engines.hydrascope) },
+      gitAlignment: { ready: Boolean(engines && engines.gitAlignment) },
+      toolGraph: { ready: Boolean(engines && engines.toolGraph) },
+      polyglotAudit: { ready: Boolean(engines && engines.polyglotAudit) }
     };
 
     const brickExchangeTables = [
@@ -184,18 +188,22 @@ export function createRouterEngine({ config = {} } = {}) {
       'brick_exchange_grants',
       'brick_exchange_adoptions'
     ];
+    const hydrascopeTables = ['hydrascope_nodes', 'hydrascope_edges'];
     let brickExchangeTablesReady = Boolean(engines && engines.brickExchange);
+    let hydrascopeTablesReady = Boolean(engines && engines.hydrascope);
     if (db && typeof db.prepare === 'function') {
       try {
         const rows = db
           .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'brick_exchange_%'"
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND (name LIKE 'brick_exchange_%' OR name LIKE 'hydrascope_%')"
           )
           .all();
         const found = new Set(rows.map((r) => r.name));
         brickExchangeTablesReady = brickExchangeTables.every((t) => found.has(t));
+        hydrascopeTablesReady = hydrascopeTables.every((t) => found.has(t));
       } catch {
         brickExchangeTablesReady = false;
+        hydrascopeTablesReady = false;
       }
     }
 
@@ -212,6 +220,7 @@ export function createRouterEngine({ config = {} } = {}) {
         engines: engineStates,
         auxiliary_engines: auxiliaryEngines,
         brick_exchange_tables_ready: brickExchangeTablesReady,
+        hydrascope_tables_ready: hydrascopeTablesReady,
         router_metrics: {
           total_routed: totalRouted,
           avg_latency_us: avgLatencyUs,

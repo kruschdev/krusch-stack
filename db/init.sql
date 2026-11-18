@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS context_memories (
   provenance_locator TEXT,
   quoted_sentence TEXT,
   anchor_hash TEXT,
+  provenance_reanchored INTEGER NOT NULL DEFAULT 0,
   embedding vector(1024),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -330,3 +331,49 @@ CREATE TABLE IF NOT EXISTS brick_exchange_adoptions (
 
 CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
   ON brick_exchange_adoptions(brick_id, created_at_ms);
+
+-- INV-STACK-13: Tier 2C HydraScope Structural Context & Temporal Ontology Graph
+CREATE TABLE IF NOT EXISTS hydrascope_nodes (
+  node_key TEXT PRIMARY KEY,
+  workspace_name TEXT NOT NULL DEFAULT 'fintech-core',
+  node_id TEXT NOT NULL,
+  surrogate_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  file_path TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  tokens INTEGER NOT NULL DEFAULT 0,
+  valid_from TEXT NOT NULL DEFAULT '2025-01-01',
+  retired_at TEXT,
+  is_current INTEGER NOT NULL DEFAULT 1,
+  superseded_by TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  embedding vector(1024),
+  updated_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hydrascope_nodes_ws_kind
+  ON hydrascope_nodes(workspace_name, kind, is_current);
+
+CREATE INDEX IF NOT EXISTS idx_hydrascope_nodes_ws_id
+  ON hydrascope_nodes(workspace_name, node_id);
+
+CREATE INDEX IF NOT EXISTS idx_hydrascope_nodes_embedding_hnsw ON hydrascope_nodes USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE IF NOT EXISTS hydrascope_edges (
+  edge_key TEXT PRIMARY KEY,
+  workspace_name TEXT NOT NULL DEFAULT 'fintech-core',
+  from_id TEXT NOT NULL,
+  to_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL,
+  weight DOUBLE PRECISION NOT NULL DEFAULT 1,
+  valid_from TEXT NOT NULL DEFAULT '2025-01-01',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hydrascope_edges_from
+  ON hydrascope_edges(workspace_name, from_id, edge_type);
+
+CREATE INDEX IF NOT EXISTS idx_hydrascope_edges_to
+  ON hydrascope_edges(workspace_name, to_id, edge_type);

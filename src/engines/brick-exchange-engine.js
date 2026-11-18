@@ -3700,16 +3700,18 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     );
   }
 
-  function issueGrant({
-    brickId,
-    sourceHash,
-    issuerId,
-    issuerOrgId,
-    scope = 'federated',
-    recipients = [],
-    expiresAtMs
-  } = {}) {
+  function issueGrant(options = {}) {
     const tool = 'krusch_brick_grant';
+    const rawOpts = isPlainObject(options) ? options : {};
+    const brickId = rawOpts.brickId;
+    const sourceHash = rawOpts.sourceHash;
+    const issuerId = rawOpts.issuerId ?? rawOpts.actorId;
+    const issuerOrgId = rawOpts.issuerOrgId;
+    const scope = rawOpts.scope ?? 'federated';
+    const recipients = rawOpts.recipients ?? [];
+    const expiresAtMs = rawOpts.expiresAtMs;
+    const ttlMs = rawOpts.ttlMs;
+
     if (typeof brickId !== 'string' || !BRICK_ID_RE.test(brickId)) {
       return failEnvelope(tool, 'INVALID_BRICK_ID', 'Valid brickId is required to issue a grant');
     }
@@ -3754,10 +3756,30 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     }
 
     const createdAtMs = Date.now();
-    const resolvedExpiresAtMs =
-      expiresAtMs === undefined || expiresAtMs === null
-        ? createdAtMs + DEFAULT_GRANT_TTL_MS
-        : Math.trunc(Number(expiresAtMs));
+    let resolvedExpiresAtMs;
+    if (expiresAtMs === undefined && ttlMs !== undefined && ttlMs !== null) {
+      const numericTtl =
+        typeof ttlMs === 'boolean' || (typeof ttlMs === 'string' && ttlMs.trim() === '')
+          ? NaN
+          : Number(ttlMs);
+      const truncTtl = Math.trunc(numericTtl);
+      if (!Number.isFinite(numericTtl) || numericTtl <= 0 || truncTtl <= 0) {
+        return failEnvelope(
+          tool,
+          'INVALID_GRANT_EXPIRY',
+          'ttlMs must be a positive finite duration in milliseconds'
+        );
+      }
+      resolvedExpiresAtMs = createdAtMs + truncTtl;
+    } else if (expiresAtMs === undefined || expiresAtMs === null) {
+      resolvedExpiresAtMs = createdAtMs + DEFAULT_GRANT_TTL_MS;
+    } else {
+      resolvedExpiresAtMs =
+        typeof expiresAtMs === 'boolean' ||
+        (typeof expiresAtMs === 'string' && expiresAtMs.trim() === '')
+          ? NaN
+          : Math.trunc(Number(expiresAtMs));
+    }
 
     if (!Number.isFinite(resolvedExpiresAtMs) || resolvedExpiresAtMs <= 0) {
       return failEnvelope(
@@ -3973,14 +3995,67 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     );
   }
 
-  async function tryBrick({
-    bundle,
-    sampleInput,
-    binding = {},
-    timeoutMs = DEFAULT_SANDBOX_TIMEOUT_MS,
-    maxMemoryMb = DEFAULT_SANDBOX_MAX_MEMORY_MB
-  } = {}) {
+  async function tryBrick(options = {}) {
     const tool = 'krusch_brick_try';
+    const rawOpts = isPlainObject(options) ? options : {};
+    let bundle = rawOpts.bundle;
+    const sampleInput = rawOpts.sampleInput;
+    const binding = rawOpts.binding ?? {};
+    const timeoutMs = rawOpts.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS;
+    const maxMemoryMb = rawOpts.maxMemoryMb ?? DEFAULT_SANDBOX_MAX_MEMORY_MB;
+
+    if (!bundle && rawOpts.brickId) {
+      const targetBrickId = typeof rawOpts.brickId === 'string' ? rawOpts.brickId.trim() : '';
+      const targetHash =
+        typeof rawOpts.sourceHash === 'string' && rawOpts.sourceHash.trim()
+          ? rawOpts.sourceHash.trim().toLowerCase()
+          : '';
+      const viewerId =
+        typeof (rawOpts.viewerId || rawOpts.userId) === 'string'
+          ? String(rawOpts.viewerId || rawOpts.userId).trim()
+          : '';
+      const viewerOrgId =
+        typeof (rawOpts.viewerOrgId || rawOpts.orgId) === 'string'
+          ? String(rawOpts.viewerOrgId || rawOpts.orgId).trim()
+          : '';
+
+      if (!viewerId && !viewerOrgId) {
+        return failEnvelope(
+          tool,
+          'VIEWER_AUTH_REQUIRED',
+          'viewerId or viewerOrgId is required when resolving brickId from store'
+        );
+      }
+
+      const inboxRes = listInbox({
+        viewerId,
+        viewerOrgId,
+        nowMs: rawOpts.nowMs
+      });
+      if (!inboxRes.ok) {
+        return failEnvelope(
+          tool,
+          'VIEWER_AUTH_REQUIRED',
+          inboxRes.error?.message || 'viewerId or viewerOrgId is required'
+        );
+      }
+
+      const matched = (inboxRes.data?.bricks || []).find(
+        (item) =>
+          item.brickId === targetBrickId &&
+          (!targetHash || String(item.sourceHash || '').toLowerCase() === targetHash)
+      );
+      if (!matched || !matched.bundle) {
+        return failEnvelope(
+          tool,
+          'BRICK_NOT_FOUND',
+          `Authorized brick "${targetBrickId}" not found for viewer`,
+          { brickId: targetBrickId, sourceHash: targetHash || null }
+        );
+      }
+      bundle = matched.bundle;
+    }
+
     const sealCheck = verifySealedBrickBundle(bundle);
     if (!sealCheck.ok) {
       return failEnvelope(tool, sealCheck.error.code, sealCheck.error.message, sealCheck.error.details);
@@ -4054,20 +4129,96 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     );
   }
 
-  async function adoptBrick({
-    bundle,
-    targetRepoDir = defaultRoot,
-    bindingSource = null,
-    adapterFileName = null,
-    targetStack = null,
-    grantId = '',
-    userId = 'local-dev',
-    orgId = 'local-team'
-  } = {}) {
+  async function adoptBrick(options = {}) {
     const tool = 'krusch_brick_adopt';
+    const rawOpts = isPlainObject(options) ? options : {};
+    let bundle = rawOpts.bundle;
+    const targetRepoDir = rawOpts.targetRepoDir ?? defaultRoot;
+    let bindingSource = rawOpts.bindingSource ?? null;
+    let adapterFileName = rawOpts.adapterFileName ?? null;
+    const targetStack = rawOpts.targetStack ?? null;
+    let grantId = rawOpts.grantId ?? '';
+    const userId = rawOpts.userId ?? rawOpts.viewerId ?? 'local-dev';
+    const orgId = rawOpts.orgId ?? rawOpts.viewerOrgId ?? 'local-team';
+
+    if (!bundle && rawOpts.brickId) {
+      const targetBrickId = typeof rawOpts.brickId === 'string' ? rawOpts.brickId.trim() : '';
+      const targetHash =
+        typeof rawOpts.sourceHash === 'string' && rawOpts.sourceHash.trim()
+          ? rawOpts.sourceHash.trim().toLowerCase()
+          : '';
+      const viewerId =
+        typeof (rawOpts.viewerId || rawOpts.userId) === 'string'
+          ? String(rawOpts.viewerId || rawOpts.userId).trim()
+          : '';
+      const viewerOrgId =
+        typeof (rawOpts.viewerOrgId || rawOpts.orgId) === 'string'
+          ? String(rawOpts.viewerOrgId || rawOpts.orgId).trim()
+          : '';
+
+      if (!viewerId && !viewerOrgId) {
+        return failEnvelope(
+          tool,
+          'VIEWER_AUTH_REQUIRED',
+          'viewerId or viewerOrgId is required when adopting a brick by brickId'
+        );
+      }
+
+      const inboxRes = listInbox({
+        viewerId,
+        viewerOrgId,
+        nowMs: rawOpts.nowMs
+      });
+      if (!inboxRes.ok) {
+        return failEnvelope(
+          tool,
+          'VIEWER_AUTH_REQUIRED',
+          inboxRes.error?.message || 'viewerId or viewerOrgId is required'
+        );
+      }
+
+      const matched = (inboxRes.data?.bricks || []).find(
+        (item) =>
+          item.brickId === targetBrickId &&
+          (!targetHash || String(item.sourceHash || '').toLowerCase() === targetHash)
+      );
+      if (!matched || !matched.bundle) {
+        return failEnvelope(
+          tool,
+          'BRICK_NOT_FOUND',
+          `Authorized brick "${targetBrickId}" not found for viewer`,
+          { brickId: targetBrickId, sourceHash: targetHash || null }
+        );
+      }
+
+      bundle = matched.bundle;
+      grantId = rawOpts.grantId || matched.grantId || '';
+    }
+
     const sealCheck = verifySealedBrickBundle(bundle);
     if (!sealCheck.ok) {
       return failEnvelope(tool, sealCheck.error.code, sealCheck.error.message, sealCheck.error.details);
+    }
+
+    if (
+      !rawOpts.bindingSource &&
+      (rawOpts.localSample !== undefined ||
+        (rawOpts.fieldMap &&
+          typeof rawOpts.fieldMap === 'object' &&
+          !Array.isArray(rawOpts.fieldMap) &&
+          Object.keys(rawOpts.fieldMap).length > 0))
+    ) {
+      const synthRes = await ontologyEngine.synthesizeBinding({
+        bundle,
+        targetStack: rawOpts.targetStack || 'node-esm',
+        localSample: rawOpts.localSample,
+        fieldMap: rawOpts.fieldMap
+      });
+      if (!synthRes.ok) {
+        return synthRes;
+      }
+      bindingSource = synthRes.data.adapterSource;
+      adapterFileName = rawOpts.adapterFileName || synthRes.data.adapterFileName;
     }
 
     const ALLOWED_ADAPTER_FILENAMES = new Set(['binding.js', 'binding.ts', 'binding_adapter.py']);
@@ -4100,11 +4251,19 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       return failEnvelope(tool, 'INVALID_TARGET_REPO', 'targetRepoDir must be a non-empty directory path');
     }
 
-    const resolvedTarget = path.resolve(targetRepoDir);
+    const isSymbolicLinkAny = (p) => {
+      try {
+        return fs.lstatSync(p).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    };
+
+    const resolvedTarget = path.resolve(defaultRoot, targetRepoDir);
     if (isSensitiveHostDirectory(resolvedTarget)) {
       return failEnvelope(tool, 'BRICK_PATH_ESCAPE', 'Refusing to vendor brick into sensitive system directory');
     }
-    if (fs.existsSync(resolvedTarget) && fs.lstatSync(resolvedTarget).isSymbolicLink()) {
+    if (isSymbolicLinkAny(resolvedTarget)) {
       return failEnvelope(
         tool,
         'BRICK_PATH_ESCAPE',
@@ -4119,13 +4278,13 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     }
 
     const bricksRootDir = path.join(realRepoDir, 'bricks');
-    if (fs.existsSync(bricksRootDir) && fs.lstatSync(bricksRootDir).isSymbolicLink()) {
+    if (isSymbolicLinkAny(bricksRootDir)) {
       return failEnvelope(tool, 'BRICK_PATH_ESCAPE', 'Refusing to vendor into symbolic link bricks/');
     }
     fs.mkdirSync(bricksRootDir, { recursive: true });
 
     const brickDir = path.join(bricksRootDir, bundle.brickId);
-    if (fs.existsSync(brickDir) && fs.lstatSync(brickDir).isSymbolicLink()) {
+    if (isSymbolicLinkAny(brickDir)) {
       return failEnvelope(
         tool,
         'BRICK_PATH_ESCAPE',
@@ -4146,7 +4305,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     const lockfilePath = path.join(realRepoDir, '.brick-lock.json');
 
     for (const candidateFile of [entryPath, bundleSealPath, bindingPath, lockfilePath]) {
-      if (fs.existsSync(candidateFile) && fs.lstatSync(candidateFile).isSymbolicLink()) {
+      if (isSymbolicLinkAny(candidateFile)) {
         return failEnvelope(
           tool,
           'BRICK_PATH_ESCAPE',
@@ -4271,7 +4430,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       return failEnvelope(tool, 'INVALID_TARGET_REPO', 'targetRepoDir must be a non-empty path');
     }
 
-    const resolvedInput = path.resolve(targetRepoDir);
+    const resolvedInput = path.resolve(defaultRoot, targetRepoDir);
     if (!fs.existsSync(resolvedInput)) {
       return okEnvelope(tool, 'No .brick-lock.json present (0 vendored bricks)', {
         lockfilePresent: false,
@@ -4519,17 +4678,17 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     );
   }
 
-  function analyzeBlastRadius({
-    repoDir = defaultRoot,
-    changedFiles = [],
-    protectedFiles = []
-  } = {}) {
+  function analyzeBlastRadius(options = {}) {
     const tool = 'krusch_brick_blast_radius';
+    const rawOpts = isPlainObject(options) ? options : {};
+    const repoDir = rawOpts.repoDir ?? rawOpts.repoRoot ?? defaultRoot;
+    const changedFiles = rawOpts.changedFiles ?? rawOpts.targetFiles ?? [];
+    const protectedFiles = rawOpts.protectedFiles ?? rawOpts.policyFloorFiles ?? [];
     if (!repoDir || typeof repoDir !== 'string') {
       return failEnvelope(tool, 'INVALID_REPO_DIR', 'repoDir is required to analyze AST blast radius');
     }
 
-    const resolvedDir = path.resolve(repoDir);
+    const resolvedDir = path.resolve(defaultRoot, repoDir);
     if (isSensitiveHostDirectory(resolvedDir)) {
       return failEnvelope(tool, 'PATH_BLOCKED', 'Scanning sensitive host directories is forbidden');
     }
@@ -4578,12 +4737,12 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     );
   }
 
-  function planFanOut({
-    repoDir = defaultRoot,
-    tasks = [],
-    protectedFiles = []
-  } = {}) {
+  function planFanOut(options = {}) {
     const tool = 'krusch_brick_fanout_plan';
+    const rawOpts = isPlainObject(options) ? options : {};
+    const repoDir = rawOpts.repoDir ?? rawOpts.repoRoot ?? defaultRoot;
+    const tasks = rawOpts.tasks ?? [];
+    const protectedFiles = rawOpts.protectedFiles ?? rawOpts.policyFloorFiles ?? [];
     if (!Array.isArray(tasks) || tasks.length === 0) {
       return failEnvelope(tool, 'EMPTY_TASKS', 'At least one subagent or engineer task is required');
     }
@@ -4675,7 +4834,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     timeoutMs = 5000
   } = {}) {
     const tool = 'krusch_brick_verify_blast_radius';
-    if (!repoDir || typeof repoDir !== 'string' || !fs.existsSync(path.resolve(repoDir))) {
+    if (!repoDir || typeof repoDir !== 'string' || !fs.existsSync(path.resolve(defaultRoot, repoDir))) {
       return failEnvelope(tool, 'INVALID_REPO_DIR', 'Existing repoDir is required');
     }
     if (!isPlainObject(candidateEdits) || Object.keys(candidateEdits).length === 0) {
@@ -4686,7 +4845,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       );
     }
 
-    const realRepoDir = fs.realpathSync(path.resolve(repoDir));
+    const realRepoDir = fs.realpathSync(path.resolve(defaultRoot, repoDir));
     if (isSensitiveHostDirectory(realRepoDir)) {
       return failEnvelope(tool, 'PATH_BLOCKED', 'Sensitive host directory blocked');
     }

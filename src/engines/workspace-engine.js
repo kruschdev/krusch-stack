@@ -46,21 +46,97 @@ export function resolveWorkspaceMimeType(filePath, explicitMime) {
 }
 
 /**
- * Normalize a workspace-relative path and prevent directory traversal outside .krusch-stack/workspace/.
+ * Normalize a workspace-relative path and prevent lexical traversal, realpath symlink escape,
+ * and symbolic link mutations outside .krusch-stack/workspace/.
  * @param {string} mirrorRoot
  * @param {string} candidatePath
+ * @param {string | null} [workspaceRoot=null]
  * @returns {{ relPath: string, diskPath: string }}
  */
-function resolveSafeWorkspaceMirror(mirrorRoot, candidatePath) {
+export function resolveSafeWorkspaceMirror(mirrorRoot, candidatePath, workspaceRoot = null) {
+  const resolvedMirror = path.resolve(mirrorRoot);
   const raw = String(candidatePath || '').trim().replace(/^[/\\]+/, '');
   if (!raw) {
     throw new Error('Workspace file path cannot be empty');
   }
-  const diskPath = path.resolve(mirrorRoot, raw);
-  const relPath = path.relative(mirrorRoot, diskPath);
-  if (relPath.startsWith('..') || path.isAbsolute(relPath)) {
+  const diskPath = path.resolve(resolvedMirror, raw);
+  const relPath = path.relative(resolvedMirror, diskPath);
+  if (!relPath || relPath === '.' || relPath.startsWith('..') || path.isAbsolute(relPath)) {
     throw new Error(`Workspace path traversal outside mirror directory is forbidden: ${candidatePath}`);
   }
+
+  const boundaryRoot = workspaceRoot ? path.resolve(workspaceRoot) : resolvedMirror;
+  const baseRoot = fs.existsSync(boundaryRoot) ? boundaryRoot : resolvedMirror;
+
+  if (fs.existsSync(baseRoot)) {
+    const realBaseRoot = fs.realpathSync(baseRoot);
+    const mirrorExists = fs.existsSync(resolvedMirror);
+    const realMirror = mirrorExists ? fs.realpathSync(resolvedMirror) : null;
+
+    if (
+      realMirror &&
+      realMirror !== realBaseRoot &&
+      !realMirror.startsWith(realBaseRoot + path.sep)
+    ) {
+      throw new Error(`Path escapes workspaceRoot via symlink: ${candidatePath}`);
+    }
+
+    let ancestor = diskPath;
+    while (ancestor !== baseRoot && !fs.existsSync(ancestor)) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+    if (fs.existsSync(ancestor)) {
+      const realAncestor = fs.realpathSync(ancestor);
+      const allowedRoot = realMirror || realBaseRoot;
+      if (realAncestor !== allowedRoot && !realAncestor.startsWith(allowedRoot + path.sep)) {
+        throw new Error(`Path escapes workspaceRoot via symlink: ${candidatePath}`);
+      }
+    }
+
+    const walkRel = path.relative(baseRoot, diskPath);
+    const segments = walkRel.split(path.sep).filter(Boolean);
+    let cur = baseRoot;
+    for (const seg of segments) {
+      cur = path.join(cur, seg);
+      let st;
+      try {
+        st = fs.lstatSync(cur);
+      } catch (err) {
+        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+          break;
+        }
+        throw err;
+      }
+      if (st.isSymbolicLink()) {
+        try {
+          const linkTarget = fs.readlinkSync(cur);
+          const resolvedLink = path.resolve(path.dirname(cur), linkTarget);
+          const allowedLexical = cur.startsWith(resolvedMirror + path.sep)
+            ? resolvedMirror
+            : baseRoot;
+          const allowedReal = realMirror && cur.startsWith(resolvedMirror + path.sep)
+            ? realMirror
+            : realBaseRoot;
+          if (
+            resolvedLink !== allowedLexical &&
+            !resolvedLink.startsWith(allowedLexical + path.sep) &&
+            resolvedLink !== allowedReal &&
+            !resolvedLink.startsWith(allowedReal + path.sep)
+          ) {
+            throw new Error(`Path escapes workspaceRoot via symlink: ${candidatePath}`);
+          }
+        } catch (linkErr) {
+          if (String(linkErr?.message || '').startsWith('Path escapes workspaceRoot via symlink')) {
+            throw linkErr;
+          }
+        }
+        throw new Error(`Symbolic links are forbidden in workspace mutations: ${candidatePath}`);
+      }
+    }
+  }
+
   return {
     relPath: relPath.replace(/\\/g, '/'),
     diskPath
@@ -84,7 +160,18 @@ export function createWorkspaceEngine({ db, workspaceRoot = process.cwd() } = {}
   function persistAndMirror(relPath, content, mimeType) {
     const resolvedMime = resolveWorkspaceMimeType(relPath, mimeType);
     const textContent = String(content ?? '');
-    const { relPath: cleanRel, diskPath } = resolveSafeWorkspaceMirror(mirrorRoot, relPath);
+    const { relPath: cleanRel, diskPath } = resolveSafeWorkspaceMirror(
+      mirrorRoot,
+      relPath,
+      rootDir
+    );
+
+    fs.mkdirSync(path.dirname(diskPath), { recursive: true });
+    const { diskPath: verifiedDiskPath } = resolveSafeWorkspaceMirror(
+      mirrorRoot,
+      cleanRel,
+      rootDir
+    );
 
     db.prepare(`
       INSERT INTO workspace_files (path, mime_type, content, updated_at)
@@ -95,14 +182,13 @@ export function createWorkspaceEngine({ db, workspaceRoot = process.cwd() } = {}
         updated_at = datetime('now')
     `).run(cleanRel, resolvedMime, textContent);
 
-    fs.mkdirSync(path.dirname(diskPath), { recursive: true });
-    fs.writeFileSync(diskPath, textContent, 'utf8');
+    fs.writeFileSync(verifiedDiskPath, textContent, 'utf8');
 
     return {
       path: cleanRel,
       mime_type: resolvedMime,
       content: textContent,
-      mirror_path: diskPath,
+      mirror_path: verifiedDiskPath,
       bytes: Buffer.byteLength(textContent, 'utf8')
     };
   }
@@ -157,7 +243,7 @@ export function createWorkspaceEngine({ db, workspaceRoot = process.cwd() } = {}
    */
   function readDriveFile({ path: filePath } = {}) {
     try {
-      const { relPath, diskPath } = resolveSafeWorkspaceMirror(mirrorRoot, filePath);
+      const { relPath, diskPath } = resolveSafeWorkspaceMirror(mirrorRoot, filePath, rootDir);
       let row = db
         .prepare('SELECT path, mime_type, content, updated_at FROM workspace_files WHERE path = ?')
         .get(relPath);

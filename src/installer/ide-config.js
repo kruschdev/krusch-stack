@@ -21,7 +21,11 @@ const CORE_MODULAR_SERVERS = [
   'krusch-context-mcp',
   'krusch-git',
   'krusch-fs',
-  'krusch-harness'
+  'hydrascope',
+  'krusch-brick-exchange',
+  'krusch-harness',
+  'krusch-grounded-harness',
+  'krusch-cascade-router'
 ];
 
 const FULL_EXTRA_SERVERS = [
@@ -36,12 +40,16 @@ const FULL_EXTRA_SERVERS = [
  * @param {'unified'|'modular'} [options.mode='unified']
  * @param {'core'|'full'} [options.profile='full']
  * @param {string} [options.workspaceRoot=process.cwd()]
+ * @param {boolean} [options.deferTools=false]
+ * @param {boolean} [options.includeExtended=false]
  */
 export function generateIdeConfig({
   ide = 'claude',
   mode = 'unified',
   profile = 'full',
-  workspaceRoot = process.cwd()
+  workspaceRoot = process.cwd(),
+  deferTools = false,
+  includeExtended = false
 } = {}) {
   const normalizedProfile = profile === 'core' ? 'core' : 'full';
   const normalizedMode = mode === 'modular' ? 'modular' : 'unified';
@@ -50,9 +58,12 @@ export function generateIdeConfig({
   const mcpServers = {};
 
   if (normalizedMode === 'unified') {
+    const unifiedArgs = ['-y', 'krusch-stack', 'mcp', '--profile', normalizedProfile];
+    if (includeExtended) unifiedArgs.push('--include-extended');
+    if (deferTools) unifiedArgs.push('--defer-tools');
     mcpServers['krusch-stack'] = {
       command: 'npx',
-      args: ['-y', 'krusch-stack', 'mcp', '--profile', normalizedProfile],
+      args: unifiedArgs,
       env: {
         KRUSCH_WORKSPACE_ROOT: resolvedRoot
       }
@@ -64,9 +75,11 @@ export function generateIdeConfig({
         : [...CORE_MODULAR_SERVERS];
 
     for (const serverName of serverNames) {
+      const serverArgs = ['-y', 'krusch-stack', 'mcp', '--server', serverName];
+      if (deferTools) serverArgs.push('--defer-tools');
       mcpServers[serverName] = {
         command: 'npx',
-        args: ['-y', 'krusch-stack', 'mcp', '--server', serverName],
+        args: serverArgs,
         env: {
           KRUSCH_WORKSPACE_ROOT: resolvedRoot
         }
@@ -99,22 +112,31 @@ export function generateIdeConfig({
   return configObject;
 }
 
-const DEFAULT_AGENTS_MD = `# Agent Operating Manual (\`AGENTS.md\`)
+function buildDefaultAgentsMd({ mode = 'unified', includeExtended = false } = {}) {
+  const hasExtendedMcp = mode === 'modular' || Boolean(includeExtended);
+  const tier2Extra = hasExtendedMcp
+    ? '\n- Traverse multi-hop structural context and temporal `asOf` ADR lineage via `hydrascope_traverse_context`, and verify/compose sealed runtime bricks via `brick_inbox` / `brick_blast_radius`.'
+    : '\n- Enable `--modular` (or `--include-extended`) to also expose `hydrascope_*`, `brick_*`, and `krusch_grounded_*` MCP tools alongside the 39 core unified tools.';
+  const tier3Extra = hasExtendedMcp
+    ? '\n- Use `krusch_ground_workspace` and `krusch_grounded_verify_stop` for zero-LLM Turn-0 schema grounding and defect-only stop gating.'
+    : '';
+  return `# Agent Operating Manual (\`AGENTS.md\`)
 
-> Powered by **KruschStack** (\`krusch-stack\`) — Unified 3-Tier Coding Agent MCP Ecosystem.
+> Powered by **KruschStack** (\`krusch-stack\`): Unified 3-Tier+Ontology Coding Agent MCP Ecosystem.
 
-## 1. Session Start & Working Memory (Tier 1: \`krusch-context-mcp\`)
+## 1. Session Start, Working Memory & Git Alignment (Tier 1: \`krusch-context-mcp\`)
 - Call \`krusch_context_retrieve({ query: "*", include_state: true, limit_tokens: 4000 })\` on Turn 1 to hydrate active project invariants, decisions, and lessons.
 - Record durable architecture decisions and invariants with \`krusch_context_remember\`.
-- Audit staged code changes before committing via \`krusch_context_nudge({ trigger: "pre_commit", code: "<diff>" })\`.
+- Audit staged code changes and co-change/blame rules before committing via \`krusch_context_nudge({ trigger: "pre_commit", code: "<diff>" })\`.
 
-## 2. Codebase AST & Filesystem Exploration (Tier 2A & 2B: \`krusch-git\` & \`krusch-fs\`)
+## 2. Codebase AST & Filesystem Exploration (Tier 2)
 - Locate symbols with \`krusch_git_search_symbols\` and inspect callers/callees via \`krusch_git_dependency_graph\` before modifying public interfaces.
-- Use \`krusch_fs_locate\`, \`krusch_fs_page_tree\`, and \`krusch_fs_read_page\` for bounded structural file reads and page-anchored notes (\`krusch_fs_remember_on_page\`).
+- Use \`krusch_fs_locate\`, \`krusch_fs_page_tree\`, and \`krusch_fs_read_page\` for bounded structural file reads and page-anchored notes (\`krusch_fs_remember_on_page\`).${tier2Extra}
 
-## 3. Staged 2PC Verification Harness (Tier 3: \`krusch-harness\`)
-- Stage multi-file edits with \`krusch_run\`, inspect unified diffs with \`krusch_diff\`, and apply verified changes with \`krusch_apply_diff\`.
+## 3. Staged 2PC Verification Harness (Tier 3)
+- Stage multi-file edits with \`krusch_run\`, inspect unified diffs with \`krusch_diff\`, and apply verified changes with \`krusch_apply_diff\`.${tier3Extra}
 `;
+}
 
 /**
  * Safely write/merge IDE MCP configurations and scaffold `.agent/AGENTS.md` if missing.
@@ -123,12 +145,16 @@ const DEFAULT_AGENTS_MD = `# Agent Operating Manual (\`AGENTS.md\`)
  * @param {'claude'|'cursor'|'windsurf'|'antigravity'|'all'} [options.ide='all']
  * @param {'unified'|'modular'} [options.mode='unified']
  * @param {'core'|'full'} [options.profile='full']
+ * @param {boolean} [options.deferTools=false]
+ * @param {boolean} [options.includeExtended=false]
  */
 export function writeIdeConfigs({
   targetDir = process.cwd(),
   ide = 'all',
   mode = 'unified',
-  profile = 'full'
+  profile = 'full',
+  deferTools = false,
+  includeExtended = false
 } = {}) {
   const resolvedDir = path.resolve(targetDir);
   const selectedIdes =
@@ -142,7 +168,9 @@ export function writeIdeConfigs({
     ide,
     mode,
     profile,
-    workspaceRoot: resolvedDir
+    workspaceRoot: resolvedDir,
+    deferTools,
+    includeExtended
   });
 
   const filesWritten = [];
@@ -183,7 +211,11 @@ export function writeIdeConfigs({
   let agentsMdCreated = false;
   if (!fs.existsSync(agentsMdPath)) {
     fs.mkdirSync(path.dirname(agentsMdPath), { recursive: true });
-    fs.writeFileSync(agentsMdPath, DEFAULT_AGENTS_MD, 'utf8');
+    fs.writeFileSync(
+      agentsMdPath,
+      buildDefaultAgentsMd({ mode, includeExtended }),
+      'utf8'
+    );
     agentsMdCreated = true;
     filesWritten.push(agentsMdPath);
   }

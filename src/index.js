@@ -95,13 +95,198 @@ import {
   synthesizeHexagonalBinding,
   createBrickOntologyEngine
 } from './engines/brick-exchange-engine.js';
+import {
+  SENSITIVE_SCOPE_DOMAINS,
+  AUTH_DRIFT_REASON_CODES,
+  inferGoalAttestedScopes,
+  inspectAndRepairDartBoundaries,
+  evaluateAuthorizationDrift,
+  auditTrajectoryAuthorizationDrift
+} from './engines/grounded-auth-drift.js';
+import {
+  SYNTHESIZED_RULE_ACTIONS,
+  DEFAULT_EVOLVED_HARNESS_RULES,
+  compileSafeRuleRegex,
+  compileExecutableRules,
+  extractShellCommandsFromTrajectory,
+  mineFailureTrajectories,
+  verifyCandidateRulesOnTraces,
+  synthesizeRulesWithTeacher,
+  evolveRulesFromTraces
+} from './engines/grounded-trace-synthesizer.js';
+import {
+  HYDRASCOPE_SCHEMA_SQL,
+  FINTECH_BENCHMARK_CORPUS,
+  HYDRASCOPE_BENCHMARK_SCENARIOS,
+  compileArtifactsToHydraGraph,
+  compileDirectoryToHydraGraph,
+  createHydraScopeEngine
+} from './engines/hydrascope-engine.js';
+import {
+  DEFAULT_COCHANGE_RULES,
+  isUnifiedDiffText,
+  parseUnifiedDiffFiles,
+  compileSafeCoChangeGlob,
+  parseCoChangeRuleDirective,
+  extractMemoryCoChangeRules,
+  evaluateCoChangeRules,
+  findBlamedDiffMemories,
+  scanSupersededStaleCode,
+  detectLegoBoilerplateViolations,
+  recordExplicitProvenanceReanchor,
+  createGitAlignmentEngine
+} from './engines/git-alignment-engine.js';
+import {
+  TOOL_GRAPH_SHARED_TYPES,
+  DEFAULT_TOOL_GRAPH_OPTIONS,
+  maskTaskEntities,
+  extractGivenTypesFromTask,
+  inferToolGraphSchema,
+  compileToolGraph,
+  buildToolPrerequisiteGraph,
+  createToolGraph,
+  createToolGraphRouter,
+  createToolGraphEngine
+} from './engines/tool-graph-engine.js';
+import {
+  POLYGLOT_HAZARD_RULES,
+  SLOP_BREAKER_RULES,
+  auditBoilerplateText,
+  scoreLegoBrickCoverage,
+  normalizeGitHubRepoInput,
+  auditPolyglotSource,
+  auditPolyglotRepository,
+  createPolyglotAuditEngine
+} from './engines/polyglot-audit-engine.js';
 import { generateIdeConfig, writeIdeConfigs, IDE_CONFIG_PATHS } from './installer/ide-config.js';
 import { runStackDoctor, runStackCrashRecoveryDrill } from './installer/doctor.js';
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
+
+const DEFAULT_STACK_TOOL_GRAPH_SPINE = Object.freeze([
+  {
+    name: 'krusch_context_retrieve',
+    description: 'Retrieve working memory invariants, recent decisions, and state briefings.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit_tokens: { type: 'number' } }, required: ['query'] },
+    outputSchema: { type: 'object', properties: { memory_id: { type: 'number' } } }
+  },
+  {
+    name: 'krusch_context_remember',
+    description: 'Persist durable project decisions, invariants, bugs, and lessons.',
+    inputSchema: { type: 'object', properties: { category: { type: 'string' }, content: { type: 'string' } }, required: ['category', 'content'] },
+    outputSchema: { type: 'object', properties: { memory_id: { type: 'number' } } }
+  },
+  {
+    name: 'krusch_context_revise',
+    description: 'Supersede or invalidate an existing working memory entry by target_id.',
+    inputSchema: { type: 'object', properties: { action: { type: 'string' }, target_id: { type: 'number' }, reason: { type: 'string' } }, required: ['action', 'target_id', 'reason'] }
+  },
+  {
+    name: 'krusch_context_nudge',
+    description: 'Audit staged code diffs against project invariants and co-change rules.',
+    inputSchema: { type: 'object', properties: { trigger: { type: 'string' }, code: { type: 'string' } }, required: ['code'] }
+  },
+  {
+    name: 'krusch_context_health',
+    description: 'Inspect working memory store health, span drift, and superseded stale code.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'krusch_git_list_repos',
+    description: 'List indexed Git repositories in the stack.',
+    inputSchema: { type: 'object', properties: {} },
+    outputSchema: { type: 'object', properties: { repo_path: { type: 'string' } } }
+  },
+  {
+    name: 'krusch_git_search_symbols',
+    description: 'Search AST symbols across indexed Git repositories.',
+    inputSchema: { type: 'object', properties: { repo: { type: 'string' }, query: { type: 'string' } }, required: ['query'] },
+    outputSchema: { type: 'object', properties: { symbol: { type: 'string' }, file_path: { type: 'string' } } }
+  },
+  {
+    name: 'krusch_git_file_symbols',
+    description: 'List AST symbols declared in a file path.',
+    inputSchema: { type: 'object', properties: { repo: { type: 'string' }, file_path: { type: 'string' } }, required: ['file_path'] },
+    outputSchema: { type: 'object', properties: { symbol: { type: 'string' } } }
+  },
+  {
+    name: 'krusch_git_dependency_graph',
+    description: 'Trace inbound callers and outbound callees of an AST symbol.',
+    inputSchema: { type: 'object', properties: { repo: { type: 'string' }, symbol: { type: 'string' } }, required: ['symbol'] }
+  },
+  {
+    name: 'krusch_git_semantic_search',
+    description: 'Hybrid BM25 and dense vector semantic search across codebase symbols.',
+    inputSchema: { type: 'object', properties: { repo: { type: 'string' }, query: { type: 'string' } }, required: ['query'] },
+    outputSchema: { type: 'object', properties: { file_path: { type: 'string' }, symbol: { type: 'string' } } }
+  },
+  {
+    name: 'krusch_fs_locate',
+    description: 'Locate workspace files by glob pattern and metadata.',
+    inputSchema: { type: 'object', properties: { pattern: { type: 'string' } } },
+    outputSchema: { type: 'object', properties: { file_path: { type: 'string' } } }
+  },
+  {
+    name: 'krusch_fs_search',
+    description: 'Hybrid BM25 search across OS file pages and PageMemory annotations.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+    outputSchema: { type: 'object', properties: { file_path: { type: 'string' } } }
+  },
+  {
+    name: 'krusch_fs_page_tree',
+    description: 'Inspect structural page table-of-contents and SHA-256 hashes for a file.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+  },
+  {
+    name: 'krusch_fs_read_page',
+    description: 'Read a bounded file page with anchored memories and drift status.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, page_number: { type: 'number' } }, required: ['path'] }
+  },
+  {
+    name: 'hydrascope_traverse_context',
+    description: 'Traverse structural graph context, temporal SUPERSEDES lineage, and 4-axis ontology.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, asOf: { type: 'string' } }, required: ['query'] }
+  },
+  {
+    name: 'hydrascope_check_answerable',
+    description: 'Verify zero-LLM structural answerability before invoking a generator.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
+  },
+  {
+    name: 'krusch_run',
+    description: 'Stage file edits as unified diffs through the 2PC invariant harness.',
+    inputSchema: { type: 'object', properties: { goal: { type: 'string' }, edits: { type: 'array' } }, required: ['goal'] },
+    outputSchema: { type: 'object', properties: { task_id: { type: 'string' } } }
+  },
+  {
+    name: 'krusch_task_status',
+    description: 'Check the status of a staged 2PC harness task.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] }
+  },
+  {
+    name: 'krusch_diff',
+    description: 'Inspect the staged unified diff for a 2PC harness task.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] }
+  },
+  {
+    name: 'krusch_apply_diff',
+    description: 'Atomically apply a STAGED 2PC harness diff to disk.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] }
+  },
+  {
+    name: 'krusch_route_task',
+    description: 'Classify a coding or reasoning prompt via the <25us L1-L3 Cascade Router.',
+    inputSchema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] }
+  },
+  {
+    name: 'krusch_stack_status',
+    description: 'Inspect unified health and row telemetry across all 10 KruschStack pillars.',
+    inputSchema: { type: 'object', properties: {} }
+  }
+]);
 
 /**
- * Create a unified KruschStack instance with all 7 component engines + production resilience, 2PC action-harness, and Turn-0 grounded-harness engines wired to a shared SQLite/Postgres substrate.
+ * Create a unified KruschStack instance with all 10 stack pillars + production resilience, 2PC action-harness, Turn-0 grounded-harness, Sovereign ToolGraph, and Polyglot Audit engines wired to a shared SQLite substrate (with 21-table PostgreSQL DDL parity in db/init.sql).
  * @param {object} [options]
  * @param {string} [options.workspaceRoot]
  * @param {string} [options.dbPath]
@@ -118,15 +303,17 @@ export function createKruschStack(options = {}) {
     options.workspaceRoot || process.env.KRUSCH_WORKSPACE_ROOT || process.cwd()
   );
   const profile = (options.profile || process.env.KRUSCH_STACK_PROFILE || 'full') === 'core' ? 'core' : 'full';
-  const hasExplicitFileDb = Boolean(options.dbPath && options.dbPath !== ':memory:');
+  const envDbPath = typeof process.env.DB_PATH === 'string' ? process.env.DB_PATH.trim() : '';
+  const effectiveDbPath = options.dbPath || envDbPath || undefined;
+  const hasExplicitFileDb = Boolean(effectiveDbPath && effectiveDbPath !== ':memory:');
   const ephemeral =
     options.ephemeral === true ||
-    options.dbPath === ':memory:' ||
+    effectiveDbPath === ':memory:' ||
     (options.ephemeral !== false && !hasExplicitFileDb && process.env.KRUSCH_EPHEMERAL === '1');
   const recoverOnStartup = Boolean(options.recoverOnStartup ?? !ephemeral);
   const db = options.db || openStackDatabase({
     workspaceRoot,
-    dbPath: options.dbPath,
+    dbPath: effectiveDbPath,
     ephemeral
   });
   if (options.db) {
@@ -152,11 +339,87 @@ export function createKruschStack(options = {}) {
   const actionHarness = createActionHarnessEngine({ db, contextEngine: context });
   const groundedHarness = createGroundedHarnessEngine({ db, workspaceRoot });
   const brickExchange = createBrickExchangeEngine({ db, workspaceRoot });
+  const hydrascope = createHydraScopeEngine({
+    db,
+    workspaceRoot,
+    brickExchange,
+    hydraUrl: options.hydraUrl,
+    hydraToken: options.hydraToken,
+    hydraGraphId: options.hydraGraphId,
+    namespace: options.hydraNamespace
+  });
+  const gitAlignment = createGitAlignmentEngine({ db, workspaceRoot });
+  const polyglotAudit = createPolyglotAuditEngine({ workspaceRoot });
+
+  const defaultToolGraphDispatcher = async (toolName, toolArgs = {}) => {
+    switch (toolName) {
+      case 'krusch_context_retrieve':
+        return context.retrieveAsync(toolArgs);
+      case 'krusch_context_remember':
+        return context.rememberAsync(toolArgs);
+      case 'krusch_context_revise':
+        return context.reviseAsync(toolArgs);
+      case 'krusch_context_nudge':
+        return context.nudge(toolArgs);
+      case 'krusch_context_health':
+        return context.health(toolArgs);
+      case 'krusch_git_list_repos':
+        return git.listRepos(toolArgs);
+      case 'krusch_git_search_symbols':
+        return git.searchSymbols(toolArgs);
+      case 'krusch_git_file_symbols':
+        return git.fileSymbols(toolArgs);
+      case 'krusch_git_dependency_graph':
+        return git.dependencyGraph(toolArgs);
+      case 'krusch_git_semantic_search':
+        return git.semanticSearch(toolArgs);
+      case 'krusch_fs_locate':
+        return fs.locate(toolArgs);
+      case 'krusch_fs_search':
+        return fs.search(toolArgs);
+      case 'krusch_fs_page_tree':
+        return fs.pageTree(toolArgs);
+      case 'krusch_fs_read_page':
+        return fs.readPage(toolArgs);
+      case 'hydrascope_traverse_context':
+        return hydrascope.traverseContext(toolArgs);
+      case 'hydrascope_check_answerable':
+        return hydrascope.checkAnswerable(toolArgs);
+      case 'krusch_run':
+        return harness.run(toolArgs);
+      case 'krusch_task_status':
+        return harness.taskStatus(toolArgs);
+      case 'krusch_diff':
+        return harness.diff(toolArgs);
+      case 'krusch_apply_diff':
+        return harness.applyDiff(toolArgs);
+      case 'krusch_route_task':
+        return router.routeTask(toolArgs);
+      case 'krusch_stack_status':
+        return router.getStackStatus({ engines, db });
+      default:
+        return okEnvelope(
+          toolName || 'krusch_tool_graph_call',
+          `Unknown default spine tool: ${toolName}`,
+          { error: `Unknown default spine tool: ${toolName}` },
+          false
+        );
+    }
+  };
+
+  const toolGraph = createToolGraphEngine(
+    Array.isArray(options.toolGraphTools) ? options.toolGraphTools : DEFAULT_STACK_TOOL_GRAPH_SPINE,
+    {
+      dispatcher: defaultToolGraphDispatcher,
+      ...(options.toolGraphOptions || {})
+    }
+  );
 
   const engines = {
     context,
     git,
     fs,
+    hydrascope,
     harness,
     frontend,
     workspace,
@@ -164,7 +427,10 @@ export function createKruschStack(options = {}) {
     resilience,
     actionHarness,
     groundedHarness,
-    brickExchange
+    brickExchange,
+    gitAlignment,
+    toolGraph,
+    polyglotAudit
   };
 
   return {
@@ -177,6 +443,7 @@ export function createKruschStack(options = {}) {
     context,
     git,
     fs,
+    hydrascope,
     harness,
     frontend,
     workspace,
@@ -185,6 +452,9 @@ export function createKruschStack(options = {}) {
     actionHarness,
     groundedHarness,
     brickExchange,
+    gitAlignment,
+    toolGraph,
+    polyglotAudit,
     doctor: () => runStackDoctor({ workspaceRoot, db, profile }),
     status: () => router.getStackStatus({ engines, db })
   };
@@ -263,6 +533,57 @@ export {
   composeCrossStackBricks,
   synthesizeHexagonalBinding,
   createBrickOntologyEngine,
+  SENSITIVE_SCOPE_DOMAINS,
+  AUTH_DRIFT_REASON_CODES,
+  inferGoalAttestedScopes,
+  inspectAndRepairDartBoundaries,
+  evaluateAuthorizationDrift,
+  auditTrajectoryAuthorizationDrift,
+  SYNTHESIZED_RULE_ACTIONS,
+  DEFAULT_EVOLVED_HARNESS_RULES,
+  compileSafeRuleRegex,
+  compileExecutableRules,
+  extractShellCommandsFromTrajectory,
+  mineFailureTrajectories,
+  verifyCandidateRulesOnTraces,
+  synthesizeRulesWithTeacher,
+  evolveRulesFromTraces,
+  HYDRASCOPE_SCHEMA_SQL,
+  FINTECH_BENCHMARK_CORPUS,
+  HYDRASCOPE_BENCHMARK_SCENARIOS,
+  compileArtifactsToHydraGraph,
+  compileDirectoryToHydraGraph,
+  createHydraScopeEngine,
+  DEFAULT_COCHANGE_RULES,
+  isUnifiedDiffText,
+  parseUnifiedDiffFiles,
+  compileSafeCoChangeGlob,
+  parseCoChangeRuleDirective,
+  extractMemoryCoChangeRules,
+  evaluateCoChangeRules,
+  findBlamedDiffMemories,
+  scanSupersededStaleCode,
+  detectLegoBoilerplateViolations,
+  recordExplicitProvenanceReanchor,
+  createGitAlignmentEngine,
+  TOOL_GRAPH_SHARED_TYPES,
+  DEFAULT_TOOL_GRAPH_OPTIONS,
+  maskTaskEntities,
+  extractGivenTypesFromTask,
+  inferToolGraphSchema,
+  compileToolGraph,
+  buildToolPrerequisiteGraph,
+  createToolGraph,
+  createToolGraphRouter,
+  createToolGraphEngine,
+  POLYGLOT_HAZARD_RULES,
+  SLOP_BREAKER_RULES,
+  auditBoilerplateText,
+  scoreLegoBrickCoverage,
+  normalizeGitHubRepoInput,
+  auditPolyglotSource,
+  auditPolyglotRepository,
+  createPolyglotAuditEngine,
   generateIdeConfig,
   writeIdeConfigs,
   IDE_CONFIG_PATHS,

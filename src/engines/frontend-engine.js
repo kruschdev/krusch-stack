@@ -68,10 +68,37 @@ const CANONICAL_TEMPLATES = {
     html: `<footer class="border-t border-cyan-500/20 bg-[#070a12] py-6 px-4 text-xs font-mono text-slate-400">
   <div class="max-w-6xl mx-auto flex items-center justify-between gap-4">
     <span class="flex items-center gap-2 text-cyan-400">DEADBOLT VERIFIED // INV-STACK-02</span>
-    <span>KruschStack v1.0.0</span>
+    <span>KruschStack v1.2.0</span>
   </div>
 </footer>`,
     css: '.footer-deadbolt { border-top: 1px solid rgba(0, 229, 255, 0.2); }'
+  },
+  'site-header': {
+    template_id: 'site-header',
+    title: 'Site Navigation Header',
+    category: 'navigation',
+    description: 'Standardized krusch.dev sticky top navigation header with 13-point dead-bolt SVG and 4 top-level links.',
+    html: `<header class="site-header">
+  <nav class="site-nav" aria-label="Primary Navigation">
+    <a href="/" class="site-brand">
+      <svg class="dead-bolt" viewBox="0 -2 132 218" width="16" height="26" aria-label="13-point lightning bolt">
+        <defs>
+          <linearGradient id="boltGrad-hdr" x1="78%" y1="4%" x2="18%" y2="96%"><stop offset="0%" stop-color="#6ff1fe"/><stop offset="24%" stop-color="#37e1ff"/><stop offset="48%" stop-color="#7be8ff"/><stop offset="72%" stop-color="#8b6eff"/><stop offset="90%" stop-color="#9d4edd"/><stop offset="100%" stop-color="#d946ef"/></linearGradient>
+          <linearGradient id="boltRim-hdr" x1="80%" y1="0%" x2="15%" y2="100%"><stop offset="0%" stop-color="#bef8ff"/><stop offset="45%" stop-color="#ffffff"/><stop offset="80%" stop-color="#f5d0fe"/><stop offset="100%" stop-color="#fae8ff"/></linearGradient>
+        </defs>
+        <polygon points="121,2 79,25 93,28 48,50 78,53 19,89 58,85 5,128 44,124 5,158 34,155 4,212 47,191 35,186 70,171 52,168 105,139 66,140 123,103 74,105 128,69 86,69 126,35 102,36" fill="url(#boltGrad-hdr) #37e1ff" stroke="url(#boltRim-hdr)" stroke-width="2.6" stroke-linejoin="round" />
+      </svg>
+      <span class="site-brand-text">KRUSCH<span>.DEV</span></span>
+    </a>
+    <div class="site-nav-links">
+      <a href="/articles/" class="site-nav-link">Publications</a>
+      <a href="/sovereign/" class="site-nav-link">On-Prem Specs</a>
+      <a href="/resume.html" class="site-nav-link">Resume</a>
+      <a href="/contact.html" class="site-nav-cta">Engage →</a>
+    </div>
+  </nav>
+</header>`,
+    css: '.site-header { position: sticky; top: 0; z-index: 50; backdrop-filter: blur(12px); }'
   },
   'cyber-grid': {
     template_id: 'cyber-grid',
@@ -254,6 +281,124 @@ export function handleGithubWebhook({ req, rawBody, sendJson }) {
   sendJson(200, okEnvelope('webhooks.github', 'Accepted GitHub event', { verified: true }));
 }`,
     css: ''
+  },
+  'lego-vercel-nextjs-shell': {
+    template_id: 'lego-vercel-nextjs-shell',
+    title: 'Vercel Next.js App Router Live Shell Brick',
+    category: 'lego-frontend',
+    description: 'Vercel Next.js App Router live dashboard shell with SSR-safe @krusch/toolkit/react hooks (useMounted, useAesthetics, useApiQuery, useSSEStream) and 13-point Deadbolt SVG.',
+    html: `'use client';
+
+import React from 'react';
+import {
+  AppShell,
+  MetricCard,
+  StatusPill,
+  useAesthetics,
+  useMounted,
+  useApiQuery,
+  useSSEStream
+} from '@krusch/toolkit/react';
+
+export default function VercelCockpitPage() {
+  const mounted = useMounted();
+  const theme = useAesthetics('cyber');
+  const { data, loading, reload } = useApiQuery('/api/status');
+  const stream = useSSEStream('/api/stream');
+
+  if (!mounted) {
+    return <div className={theme.bg} />;
+  }
+
+  return (
+    <AppShell
+      title="Krusch Live Cockpit"
+      subtitle="Vercel App Router + Sealed Lego Bricks"
+      status={loading ? 'streaming' : 'healthy'}
+    >
+      <div className="grid gap-4 md:grid-cols-3">
+        <MetricCard title="Service" value={data?.service || 'online'} status="healthy" />
+        <MetricCard title="Latency" value={data?.latency || '<1ms'} status="healthy" />
+        <div className={theme.card}>
+          <div className="flex items-center justify-between">
+            <button
+              type="button"
+              className={theme.buttonPrimary}
+              onClick={() => stream.start({ prompt: 'verify' }).then(reload)}
+            >
+              Run Check
+            </button>
+            <StatusPill status={stream.status === 'streaming' ? 'streaming' : 'healthy'} />
+          </div>
+          <pre className="mt-3 text-xs text-zinc-300">{stream.text}</pre>
+        </div>
+      </div>
+    </AppShell>
+  );
+}`,
+    css: ''
+  },
+  'lego-vercel-edge-sse': {
+    template_id: 'lego-vercel-edge-sse',
+    title: 'Vercel Edge SSE & Envelope Route Handler Brick',
+    category: 'lego-edge',
+    description: 'Zero-node:* Vercel Edge / App Router Route Handler (app/api/stream/route.js) with Web-Standards SSE streaming and INV-LEGO-01 JSON envelopes via @krusch/toolkit/edge.',
+    html: `import { edgeSseResponse, edgeOkResponse, edgeCorsHeaders } from '@krusch/toolkit/edge';
+
+export const runtime = 'edge';
+export const dynamic = 'force-dynamic';
+
+export async function GET(request) {
+  const corsHeaders = edgeCorsHeaders(request);
+  return edgeOkResponse(
+    'vercel.edge.status',
+    'Vercel Edge route online',
+    { runtime: 'edge', ready: true },
+    { corsHeaders }
+  );
+}
+
+export async function POST(request) {
+  const corsHeaders = edgeCorsHeaders(request);
+  return edgeSseResponse(
+    async (sse) => {
+      sse.sendToken('Edge stream connected');
+      sse.done('Stream complete', { runtime: 'edge' });
+    },
+    { request, tool: 'vercel.edge.stream', corsHeaders }
+  );
+}`,
+    css: ''
+  },
+  'lego-vercel-json': {
+    template_id: 'lego-vercel-json',
+    title: 'Hardened vercel.json Security & SSE Config Brick',
+    category: 'lego-edge',
+    description: 'Hardened vercel.json deployment configuration with security headers (nosniff, DENY, strict-origin), zero-buffer SSE streaming headers, and clean URL routing.',
+    html: `{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "cleanUrls": true,
+  "trailingSlash": false,
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Cache-Control", "value": "no-store, no-transform" },
+        { "key": "X-Accel-Buffering", "value": "no" }
+      ]
+    },
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+      ]
+    }
+  ]
+}`,
+    css: ''
   }
 };
 
@@ -409,6 +554,58 @@ function stripCssComments(cssText) {
     idx = closeIdx + 2;
   }
   return out;
+}
+
+function extractCssDeclarationBodies(commentFree) {
+  if (!commentFree.includes('{')) {
+    return commentFree;
+  }
+  const bodies = [];
+  let depth = 0;
+  let current = '';
+  let quote = '';
+  const len = commentFree.length;
+  for (let i = 0; i < len; i++) {
+    const ch = commentFree[i];
+    if (quote) {
+      if (ch === '\\' && i + 1 < len) {
+        if (depth > 0) current += ch + commentFree[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === quote || ch === '\n' || ch === '\r') {
+        quote = '';
+      }
+      if (depth > 0) current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      if (depth > 0) current += ch;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth > 0 && current.trim()) {
+        bodies.push(current);
+      }
+      current = '';
+      depth += 1;
+    } else if (ch === '}') {
+      if (depth > 0) {
+        if (current.trim()) {
+          bodies.push(current);
+        }
+        current = '';
+        depth -= 1;
+      }
+    } else if (depth > 0) {
+      current += ch;
+    }
+  }
+  if (depth > 0 && current.trim()) {
+    bodies.push(current);
+  }
+  return bodies.length > 0 ? bodies.join('; ') : '';
 }
 
 function formatTailwindArbitraryValue(val) {
@@ -713,11 +910,7 @@ export function createFrontendEngine({ db } = {}) {
     const fullCss = String(css || '');
     const rawCss = fullCss.length > MAX_CSS_INPUT_CHARS ? fullCss.slice(0, MAX_CSS_INPUT_CHARS) : fullCss;
     const commentFree = stripCssComments(rawCss);
-    const openBraceIdx = commentFree.indexOf('{');
-    const closeBraceIdx = openBraceIdx !== -1 ? commentFree.lastIndexOf('}') : -1;
-    const stripped = openBraceIdx !== -1
-      ? commentFree.slice(openBraceIdx + 1, closeBraceIdx > openBraceIdx ? closeBraceIdx : commentFree.length)
-      : commentFree;
+    const stripped = extractCssDeclarationBodies(commentFree);
 
     const declarations = stripped
       .split(';')

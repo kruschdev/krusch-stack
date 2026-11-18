@@ -29,9 +29,17 @@ const REQUIRED_TABLES = [
   'harness_apply_journal',
   'frontend_design_rules',
   'workspace_files',
+  'stack_hitl_gates',
+  'stack_shadow_runs',
+  'action_harness_sessions',
+  'action_harness_events',
+  'grounded_sessions',
+  'grounded_events',
   'brick_exchange_bricks',
   'brick_exchange_grants',
-  'brick_exchange_adoptions'
+  'brick_exchange_adoptions',
+  'hydrascope_nodes',
+  'hydrascope_edges'
 ];
 
 const ALL_COMPONENTS = [
@@ -39,7 +47,7 @@ const ALL_COMPONENTS = [
     id: 'context',
     name: 'krusch-context-mcp',
     tier: 'Tier 1',
-    description: 'Working Memory, Invariants & Span-Grounded Drift Detection',
+    description: 'Working Memory, Invariants, Drift Detection & Git Alignment Guards',
     core: true
   },
   {
@@ -57,24 +65,45 @@ const ALL_COMPONENTS = [
     core: true
   },
   {
+    id: 'hydrascope',
+    name: 'hydrascope',
+    tier: 'Tier 2C',
+    description: 'Structural Graph Context, Temporal asOf Lineage & 4-Axis Ontology',
+    core: true
+  },
+  {
+    id: 'brick-exchange',
+    name: 'krusch-brick-exchange',
+    tier: 'Tier 2D',
+    description: 'Ed25519 Sealed Brick Exchange, Scoped Grants & 2-Hop AST Fan-Out',
+    core: true
+  },
+  {
     id: 'harness',
     name: 'krusch-harness',
-    tier: 'Tier 3',
-    description: '2PC Staged Execution Harness & Invariant Gate',
+    tier: 'Tier 3A',
+    description: '2PC Staged Execution Harness & Tool-Action Gate',
+    core: true
+  },
+  {
+    id: 'grounded-harness',
+    name: 'krusch-grounded-harness',
+    tier: 'Tier 3B',
+    description: 'Turn-0 Grounded, Scale-Aware & Defect-Only Agent Harness',
     core: true
   },
   {
     id: 'router',
     name: 'krusch-cascade-router',
     tier: 'Router',
-    description: 'Cognitive L1-L3 Task & Model Cascade Router',
+    description: 'Cognitive L1-L3 Cascade Router, Sovereign ToolGraph & Polyglot Audit',
     core: true
   },
   {
     id: 'frontend',
     name: 'krusch-frontend-mcp',
     tier: 'Tier 4',
-    description: 'Frontend Design Rules, Color Palettes & Canonical Templates',
+    description: 'Frontend Design Rules, Color Palettes & 16 Canonical Lego/Vercel Templates',
     core: false
   },
   {
@@ -107,6 +136,7 @@ export function runStackDoctor({
   const nodeSupported = majorVersion >= 22;
 
   let sqliteReady = false;
+  let sqliteError = null;
   let tablesVerified = [];
   let ownedDb = null;
 
@@ -119,8 +149,9 @@ export function runStackDoctor({
     const existingSet = new Set(rows.map((r) => r.name));
     tablesVerified = REQUIRED_TABLES.filter((t) => existingSet.has(t));
     sqliteReady = Boolean(ping && ping.ok === 1 && tablesVerified.length === REQUIRED_TABLES.length);
-  } catch {
+  } catch (err) {
     sqliteReady = false;
+    sqliteError = err instanceof Error ? err.message : String(err);
   } finally {
     if (ownedDb) {
       try {
@@ -148,7 +179,7 @@ export function runStackDoctor({
   }));
 
   const ok = nodeSupported && sqliteReady;
-  const summary = `KruschStack Doctor: ${ok ? 'HEALTHY' : 'DEGRADED'} (Node v${nodeVersion}, SQLite=${sqliteReady ? 'ready' : 'error'}, Postgres=${postgresConfigured ? 'configured' : 'optional-unconfigured'}, profile=${normalizedProfile}, components=${selectedComponents.length}).`;
+  const summary = `KruschStack Doctor: ${ok ? 'HEALTHY' : 'DEGRADED'} (Node v${nodeVersion}, SQLite=${sqliteReady ? 'ready' : 'error'}, PostgresSchema=${postgresConfigured ? 'companion-url-set (runtime uses node:sqlite)' : 'sqlite-default'}, profile=${normalizedProfile}, components=${selectedComponents.length}).`;
 
   const data = {
     node_version: nodeVersion,
@@ -157,7 +188,9 @@ export function runStackDoctor({
     nodeSupported,
     sqlite_ready: sqliteReady,
     sqliteReady,
+    sqlite_error: sqliteError,
     tables_verified: tablesVerified,
+    storage_engine: 'node:sqlite',
     postgres_configured: postgresConfigured,
     postgresConfigured,
     ollama_host: ollamaHost,

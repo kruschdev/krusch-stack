@@ -5,6 +5,8 @@
  * and INV-STACK-05 (profile & component filtering: --profile core|full, --components <csv>, --server <name>).
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -33,11 +35,91 @@ const SERVER_TO_COMPONENT = {
   'krusch-context-mcp': 'context',
   'krusch-git': 'git',
   'krusch-fs': 'fs',
+  hydrascope: 'hydrascope',
+  'hydrascope-mcp': 'hydrascope',
+  'krusch-brick-exchange': 'brick-exchange',
   'krusch-harness': 'harness',
+  'krusch-grounded-harness': 'grounded-harness',
   'krusch-frontend-mcp': 'frontend',
   'g-krusch': 'workspace',
   'krusch-cascade-router': 'router'
 };
+
+const MODULAR_EXTENSION_COMPONENTS = new Set([
+  'hydrascope',
+  'brick-exchange',
+  'grounded-harness'
+]);
+
+const MODULAR_SERVER_PINNED_DEFAULTS = Object.freeze({
+  hydrascope: ['hydrascope_traverse_context', 'hydrascope_check_answerable'],
+  'hydrascope-mcp': ['hydrascope_traverse_context', 'hydrascope_check_answerable'],
+  'krusch-brick-exchange': ['brick_inbox', 'brick_blast_radius'],
+  'krusch-grounded-harness': ['krusch_ground_workspace', 'krusch_grounded_verify_stop']
+});
+
+export function assertPathWithinWorkspace(candidatePath, workspaceRoot, { allowReset = false } = {}) {
+  const raw = typeof candidatePath === 'string' ? candidatePath.trim() : '';
+  if (!raw) return raw;
+  if (allowReset && raw === 'reset') return 'reset';
+
+  const makeEscapeErr = (msg) => {
+    const err = new Error(msg);
+    err.code = 'PATH_OUTSIDE_WORKSPACE';
+    err.statusCode = 403;
+    return err;
+  };
+
+  const resolvedRoot = path.resolve(workspaceRoot || process.cwd());
+  let realRoot = resolvedRoot;
+  if (fs.existsSync(resolvedRoot)) {
+    realRoot = fs.realpathSync(resolvedRoot);
+  }
+  const absCandidate = path.resolve(resolvedRoot, raw);
+  const relLexical = path.relative(resolvedRoot, absCandidate);
+  if (relLexical.startsWith('..') || path.isAbsolute(relLexical)) {
+    throw makeEscapeErr(`Path escapes workspaceRoot: ${raw}`);
+  }
+
+  // Walk every path segment with lstatSync (without existsSync) so dangling symlinks are caught too.
+  const segments = relLexical.split(path.sep).filter(Boolean);
+  let walkCur = resolvedRoot;
+  for (const seg of segments) {
+    walkCur = path.join(walkCur, seg);
+    let st;
+    try {
+      st = fs.lstatSync(walkCur);
+    } catch (err) {
+      if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+        break;
+      }
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      let realTarget;
+      try {
+        realTarget = fs.realpathSync(walkCur);
+      } catch {
+        throw makeEscapeErr(`Dangling symbolic link is forbidden at workspace boundary: ${raw}`);
+      }
+      if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+        throw makeEscapeErr(`Symlink escapes workspaceRoot: ${raw}`);
+      }
+    }
+  }
+
+  let cur = absCandidate;
+  while (cur && cur !== path.dirname(cur) && !fs.existsSync(cur)) {
+    cur = path.dirname(cur);
+  }
+  if (fs.existsSync(cur)) {
+    const realAncestor = fs.realpathSync(cur);
+    if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + path.sep)) {
+      throw makeEscapeErr(`Path resolves outside workspaceRoot via symlink: ${raw}`);
+    }
+  }
+  return absCandidate;
+}
 
 const CORE_COMPONENTS = new Set(['context', 'git', 'fs', 'harness', 'router']);
 const FULL_COMPONENTS = new Set(['context', 'git', 'fs', 'harness', 'frontend', 'workspace', 'router']);
@@ -138,7 +220,15 @@ export const ALL_STACK_TOOLS = [
         action: { type: 'string', enum: ['supersede', 'invalidate'] },
         target_id: { type: 'number', description: 'ID of memory record to revise' },
         new_content: { type: 'string', description: 'Replacement content when action is supersede' },
-        reason: { type: 'string', description: 'Reason for revision or revocation' }
+        reason: { type: 'string', description: 'Reason for revision or revocation' },
+        provenance: {
+          type: 'object',
+          properties: {
+            file: { type: 'string' },
+            locator: { type: 'string' },
+            quoted_sentence: { type: 'string' }
+          }
+        }
       },
       required: ['action', 'target_id']
     }
@@ -156,7 +246,9 @@ export const ALL_STACK_TOOLS = [
       type: 'object',
       properties: {
         trigger: { type: 'string', default: 'pre_commit' },
-        code: { type: 'string', description: 'Code or unified diff to audit' }
+        code: { type: 'string', description: 'Code or unified diff to audit' },
+        file_path: { type: 'string', description: 'Optional target file path for git blame attribution' },
+        enable_lego_guard: { type: 'boolean', description: 'Optional flag to force INV-LEGO-01 boilerplate check' }
       }
     }
   }),
@@ -615,7 +707,7 @@ export const ALL_STACK_TOOLS = [
     name: 'get_canonical_template',
     component: 'frontend',
     title: 'Get Canonical HTML/SVG or Lego Starter Template',
-    description: 'Retrieve a canonical HTML/SVG or @krusch/toolkit & krusch_toolkit Lego starter template (article-shell, footer-deadbolt, cyber-grid, deadbolt-svg, nav-back, lego-node-api, lego-mcp-server, lego-sse-route, lego-react-shell, lego-fastapi-app, lego-cloudflare-worker, lego-webhook-route).',
+    description: 'Retrieve a canonical HTML/SVG, Vercel, or @krusch/toolkit & krusch_toolkit Lego starter template (article-shell, site-header, footer-deadbolt, cyber-grid, deadbolt-svg, nav-back, lego-node-api, lego-mcp-server, lego-sse-route, lego-react-shell, lego-fastapi-app, lego-cloudflare-worker, lego-webhook-route, lego-vercel-nextjs-shell, lego-vercel-edge-sse, lego-vercel-json).',
     readOnlyHint: true,
     destructiveHint: false,
     idempotentHint: true,
@@ -627,6 +719,7 @@ export const ALL_STACK_TOOLS = [
           type: 'string',
           enum: [
             'article-shell',
+            'site-header',
             'footer-deadbolt',
             'cyber-grid',
             'deadbolt-svg',
@@ -637,7 +730,10 @@ export const ALL_STACK_TOOLS = [
             'lego-react-shell',
             'lego-fastapi-app',
             'lego-cloudflare-worker',
-            'lego-webhook-route'
+            'lego-webhook-route',
+            'lego-vercel-nextjs-shell',
+            'lego-vercel-edge-sse',
+            'lego-vercel-json'
           ]
         }
       },
@@ -803,7 +899,7 @@ export const ALL_STACK_TOOLS = [
     name: 'krusch_stack_status',
     component: 'router',
     title: 'Inspect Full KruschStack Status',
-    description: 'Return aggregate readiness and telemetry across all 7 KruschStack engines.',
+    description: 'Return aggregate readiness and telemetry across all KruschStack engines.',
     readOnlyHint: true,
     destructiveHint: false,
     idempotentHint: true,
@@ -814,6 +910,533 @@ export const ALL_STACK_TOOLS = [
     }
   })
 ];
+
+/**
+ * Modular extension MCP tools exposed when running per-server (`--server hydrascope`,
+ * `--server krusch-brick-exchange`, `--server krusch-grounded-harness`) or explicit `--components`
+ * while keeping default unified `ALL_STACK_TOOLS.length === 39` strictly intact.
+ */
+export const MODULAR_EXTENSION_TOOLS = [
+  // ============================================================================
+  // Tier 2C: hydrascope (6 tools)
+  // ============================================================================
+  defineTool({
+    name: 'hydrascope_traverse_context',
+    component: 'hydrascope',
+    title: 'Traverse Structural Agent Context & Temporal Ontology',
+    description:
+      'Walk multi-hop AST call/import/env edges and temporal SUPERSEDES lineage (plus optional 4-Axis Brick Ontology) to assemble a bounded context slice.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Engineering task or question to ground structurally.' },
+        asOf: { type: 'string', description: 'Optional ISO date (YYYY-MM-DD) for point-in-time historical graph replay.' },
+        tokenBudget: { type: 'integer', default: 900, description: 'Maximum context token budget.' },
+        maxHops: { type: 'integer', default: 3, description: 'Maximum structural hops (1 to 6).' },
+        includeBrickOntology: { type: 'boolean', description: 'Also query the authorized 4-Axis Brick Ontology when true.' },
+        viewerId: { type: 'string', description: 'Authorized viewer member ID for scoped 4-Axis Brick Ontology hydration.' },
+        viewerOrgId: { type: 'string', description: 'Authorized viewer organization slug for 4-Axis Brick Ontology hydration.' },
+        targetStack: { type: 'string', description: 'Optional 4-Axis runtime stack filter (node-esm, typescript-node, python-fastapi, react-vite, cloudflare-edge).' },
+        targetChannel: { type: 'string', description: 'Optional 4-Axis channel filter (e.g. webhook:stripe, workspace:gmail).' },
+        requiredPorts: { type: 'array', items: { type: 'string' }, description: 'Optional canonical or namespaced data ports.' }
+      },
+      required: ['query']
+    }
+  }),
+  defineTool({
+    name: 'hydrascope_check_answerable',
+    component: 'hydrascope',
+    title: 'Check Pre-Flight Ontology Answerability',
+    description:
+      'Verify at zero LLM token cost whether every queried technical subsystem or identifier is grounded in the HydraScope ontology before calling a model.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Candidate user or agent question.' }
+      },
+      required: ['query']
+    }
+  }),
+  defineTool({
+    name: 'hydrascope_compare_vector_vs_graph',
+    component: 'hydrascope',
+    title: 'Compare Dense Vector Top-K vs Structural Traversal',
+    description:
+      'Run a head-to-head comparison between dense cosine top-K retrieval and HydraScope structural traversal, reporting missed multi-hop dependencies, superseded ADR poisoning, and token savings.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Engineering task or question to compare.' },
+        asOf: { type: 'string', description: 'Optional ISO date (YYYY-MM-DD) for temporal evaluation.' },
+        tokenBudget: { type: 'integer', default: 900 },
+        topK: { type: 'integer', default: 4 }
+      },
+      required: ['query']
+    }
+  }),
+  defineTool({
+    name: 'hydrascope_run_benchmark',
+    component: 'hydrascope',
+    title: 'Run 8-Task Proof-Over-Vectors Benchmark Suite',
+    description:
+      'Execute the 8-scenario evaluation suite comparing Full-Repo Stuffing, Dense Vector Store Top-K, and HydraScope Structural Traversal.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  }),
+  defineTool({
+    name: 'hydrascope_supersede_decision',
+    component: 'hydrascope',
+    title: 'Supersede Architecture Decision in HydraScope',
+    description:
+      'Write a new Architecture Decision Record with a directed SUPERSEDES edge, retiring the superseded rule from active context while preserving asOf history.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        oldId: { type: 'string' },
+        newId: { type: 'string' },
+        title: { type: 'string' },
+        content: { type: 'string' },
+        governsIds: { type: 'array', items: { type: 'string' } },
+        effectiveAt: { type: 'string' }
+      },
+      required: ['oldId', 'newId', 'title', 'content']
+    }
+  }),
+  defineTool({
+    name: 'hydrascope_ingest_directory',
+    component: 'hydrascope',
+    title: 'Compile Local Repository Directory into HydraScope',
+    description:
+      'Parse 10-language AST symbols, relative imports, environment variable reads, and ADR markdown files from a workspace directory (or "reset" to restore the FinTech benchmark graph).',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetDir: { type: 'string' }
+      },
+      required: ['targetDir']
+    }
+  }),
+
+  // ============================================================================
+  // Tier 2D: krusch-brick-exchange (10 tools)
+  // ============================================================================
+  defineTool({
+    name: 'brick_seal',
+    component: 'brick-exchange',
+    title: 'Verify & Seal Brick',
+    description:
+      'Run 4-gate sandbox verification (zero-ambient-I/O safety, schema contract, positive + adversarial fault checks, and Ed25519 signature) to produce a sealed brick bundle.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        blueprint: { type: 'object' },
+        source: { type: 'string' },
+        positiveChecks: { type: 'array', items: { type: 'object' } },
+        faultChecks: { type: 'array', items: { type: 'object' } },
+        authorId: { type: 'string' },
+        orgId: { type: 'string' },
+        ontology: { type: 'object' },
+        publish: { type: 'boolean' }
+      },
+      required: ['blueprint', 'source', 'positiveChecks', 'faultChecks']
+    }
+  }),
+  defineTool({
+    name: 'brick_verify',
+    component: 'brick-exchange',
+    title: 'Verify Sealed Brick Bundle',
+    description: 'Verify canonical SHA-256 digests, fault-challenge coverage, and Ed25519 signature of a sealed brick bundle.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bundle: { type: 'object' },
+        trustedPublicKeyPem: { type: 'string' }
+      },
+      required: ['bundle']
+    }
+  }),
+  defineTool({
+    name: 'brick_suggest',
+    component: 'brick-exchange',
+    title: 'Suggest Eligible Bricks & Recipients',
+    description: 'Recommend authorized sealed bricks and polyglot/boilerplate candidates for an actor or workspace.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        actorId: { type: 'string' },
+        viewerId: { type: 'string' },
+        viewerOrgId: { type: 'string' },
+        brickId: { type: 'string' },
+        repoRoot: { type: 'string' }
+      }
+    }
+  }),
+  defineTool({
+    name: 'brick_share',
+    component: 'brick-exchange',
+    title: 'Issue Scoped Brick Grant',
+    description: 'Issue a scoped federated or recipient-bound Common Ground grant for a verified brick.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        brickId: { type: 'string' },
+        sourceHash: { type: 'string' },
+        issuerId: { type: 'string' },
+        actorId: { type: 'string' },
+        issuerOrgId: { type: 'string' },
+        scope: { type: 'string' },
+        recipients: { type: 'array', items: { type: 'string' } },
+        ttlMs: { type: 'number' },
+        expiresAtMs: { type: 'number' }
+      },
+      required: ['brickId', 'issuerOrgId']
+    }
+  }),
+  defineTool({
+    name: 'brick_inbox',
+    component: 'brick-exchange',
+    title: 'List Authorized Brick Inbox & 4-Axis Compositions',
+    description: 'List sealed bricks authorized for a viewer via org membership or active grants, with optional 4-axis cross-stack composition.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        viewerId: { type: 'string' },
+        viewerOrgId: { type: 'string' },
+        targetStack: { type: 'string' },
+        targetChannel: { type: 'string' },
+        requiredPorts: { type: 'array', items: { type: 'string' } }
+      }
+    }
+  }),
+  defineTool({
+    name: 'brick_try_local',
+    component: 'brick-exchange',
+    title: 'Try Sealed Brick Locally in Sandbox',
+    description: 'Execute a sealed brick in the isolated local sandbox against recipient sampleInput with zero remote upload.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bundle: { type: 'object' },
+        viewerId: { type: 'string' },
+        brickId: { type: 'string' },
+        sourceHash: { type: 'string' },
+        sampleInput: {},
+        binding: { type: 'object' }
+      },
+      required: ['sampleInput']
+    }
+  }),
+  defineTool({
+    name: 'brick_adopt',
+    component: 'brick-exchange',
+    title: 'Adopt & Vendor Sealed Brick into Repo',
+    description: 'Vendor a verified sealed brick into bricks/<brickId>/, synthesize hexagonal binding adapter if requested, and update .brick-lock.json.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bundle: { type: 'object' },
+        userId: { type: 'string' },
+        viewerId: { type: 'string' },
+        brickId: { type: 'string' },
+        targetRepoDir: { type: 'string' },
+        targetStack: { type: 'string' },
+        localSample: {},
+        fieldMap: { type: 'object' }
+      },
+      required: ['targetRepoDir']
+    }
+  }),
+  defineTool({
+    name: 'brick_revoke',
+    component: 'brick-exchange',
+    title: 'Revoke Scoped Brick Grant',
+    description: 'Immediately revoke a previously issued brick grant so future cross-org discovery and adoptions fail closed.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        actorId: { type: 'string' },
+        grantId: { type: 'string' }
+      },
+      required: ['actorId', 'grantId']
+    }
+  }),
+  defineTool({
+    name: 'brick_blast_radius',
+    component: 'brick-exchange',
+    title: 'Analyze 2-Hop AST Blast Radius',
+    description: 'Compute Deadbolt 2-hop AST dependency cones (hop0 -> hop1 -> hop2) and Policy Floor status for target files.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repoRoot: { type: 'string' },
+        repoDir: { type: 'string' },
+        targetFiles: { type: 'array', items: { type: 'string' } },
+        changedFiles: { type: 'array', items: { type: 'string' } },
+        policyFloorFiles: { type: 'array', items: { type: 'string' } },
+        protectedFiles: { type: 'array', items: { type: 'string' } }
+      },
+      required: ['targetFiles']
+    }
+  }),
+  defineTool({
+    name: 'brick_plan_fanout',
+    component: 'brick-exchange',
+    title: 'Plan Disjoint 2-Hop Subagent Waves',
+    description: 'Sequence multi-agent tasks into conflict-free 2-hop AST waves and serialize choke points.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repoRoot: { type: 'string' },
+        repoDir: { type: 'string' },
+        tasks: { type: 'array', items: { type: 'object' } },
+        policyFloorFiles: { type: 'array', items: { type: 'string' } },
+        protectedFiles: { type: 'array', items: { type: 'string' } }
+      },
+      required: ['tasks']
+    }
+  }),
+
+  // ============================================================================
+  // Tier 3B: krusch-grounded-harness (7 tools)
+  // ============================================================================
+  defineTool({
+    name: 'krusch_ground_workspace',
+    component: 'grounded-harness',
+    title: 'Compile Turn-0 Workspace Grounding',
+    description:
+      'Introspect workspace schemas (CSV/TSV, JSON/JSONL, read-only SQLite DDL, source symbols, and 256/32 Raw-RAG docs) with 0 LLM calls and emit a KV-cache-stable prompt bundle.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goal: { type: 'string' },
+        workspaceDir: { type: 'string' },
+        model: { type: 'string' },
+        tools: { type: 'array', items: { type: 'object' } },
+        pinnedToolNames: { type: 'array', items: { type: 'string' } },
+        maxGroundingTokens: { type: 'integer' }
+      }
+    }
+  }),
+  defineTool({
+    name: 'krusch_resolve_scale_profile',
+    component: 'grounded-harness',
+    title: 'Resolve Scale-Aware Harness Profile',
+    description:
+      'Deterministically map a model identifier and thinking hints into SMALL_MODEL, MID_MODEL, or FRONTIER_REASONING harness policy.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        model: { type: 'string' },
+        activeParamsB: { type: 'number' },
+        totalParamsB: { type: 'number' },
+        thinkingEnabled: { type: 'boolean' }
+      }
+    }
+  }),
+  defineTool({
+    name: 'krusch_grounded_session_start',
+    component: 'grounded-harness',
+    title: 'Start Grounded Harness Session',
+    description: 'Create or reset a SQLite-tracked grounded session seeded with Turn-0 chunk IDs, file digests, and scale profile.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' },
+        goal: { type: 'string' },
+        model: { type: 'string' },
+        anchor_date: { type: 'string' },
+        prefix_hash: { type: 'string' },
+        seen_chunk_ids: { type: 'array', items: { type: 'string' } },
+        file_digests: { type: 'object' },
+        allowed_scopes: { type: 'array', items: { type: 'string' } },
+        turn0_tokens: { type: 'integer' },
+        max_duplicate_writes: { type: 'integer' }
+      },
+      required: ['goal']
+    }
+  }),
+  defineTool({
+    name: 'krusch_grounded_intercept',
+    component: 'grounded-harness',
+    title: 'Intercept Tool Call With Passive Safety & Read Memoization',
+    description: 'Check a proposed tool call against the frozen policy floor, secret-leak guard, duplicate-write guard, and read memoization cache.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' },
+        step: { type: 'integer' },
+        tool_name: { type: 'string' },
+        args: { type: 'object' },
+        mutating: { type: 'boolean' },
+        suppress_turn0_reads: { type: 'boolean' },
+        block_spin_loop: { type: 'boolean' }
+      },
+      required: ['session_id', 'tool_name']
+    }
+  }),
+  defineTool({
+    name: 'krusch_grounded_outcome',
+    component: 'grounded-harness',
+    title: 'Record Tool Call Execution Outcome',
+    description: 'Commit or fail a pending intercepted tool call, memoizing read previews and preserving partial stdout on timeouts.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' },
+        event_id: { type: 'string' },
+        ok: { type: 'boolean' },
+        result_preview: { type: 'string' },
+        timed_out: { type: 'boolean' },
+        partial_stdout: { type: 'string' },
+        pending_diffs_delta: { type: 'integer' },
+        verification_passed: { type: 'boolean' }
+      },
+      required: ['session_id', 'event_id']
+    }
+  }),
+  defineTool({
+    name: 'krusch_grounded_verify_stop',
+    component: 'grounded-harness',
+    title: 'Verify Outer Loop Stop With Zero-Turn Defect-Only Gate',
+    description: 'Approve zero-overhead completion when pendingDiffsCount=0 and output has 0 objective defects.',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' },
+        assistant_text: { type: 'string' },
+        candidate_answer: {},
+        finish_reason: { type: 'string' },
+        expect_non_empty_answer: { type: 'boolean' },
+        pending_diffs_count: { type: 'integer' },
+        latest_verification_passed: { type: 'boolean' }
+      },
+      required: ['session_id']
+    }
+  }),
+  defineTool({
+    name: 'krusch_grounded_summary',
+    component: 'grounded-harness',
+    title: 'Get Grounded Session Telemetry Summary',
+    description: 'Retrieve session metrics including exploratory foraging ratio, memoized reads, spin loops blocked, and output defects caught.',
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' }
+      },
+      required: ['session_id']
+    }
+  })
+];
+
+function resolveRawToolCatalog(allowedSet, includeExtended = false) {
+  let needsExtended = Boolean(includeExtended);
+  if (!needsExtended) {
+    for (const extComp of MODULAR_EXTENSION_COMPONENTS) {
+      if (allowedSet.has(extComp)) {
+        needsExtended = true;
+        break;
+      }
+    }
+  }
+  const sourceCatalog = needsExtended
+    ? [...ALL_STACK_TOOLS, ...MODULAR_EXTENSION_TOOLS]
+    : ALL_STACK_TOOLS;
+  return sourceCatalog.filter((t) => allowedSet.has(t.component));
+}
 
 function resolveAllowedComponentSet({ profile = 'full', components, server } = {}) {
   if (server && Object.hasOwn(SERVER_TO_COMPONENT, server)) {
@@ -837,44 +1460,141 @@ function resolveAllowedComponentSet({ profile = 'full', components, server } = {
  * Filter tools by profile ('core' | 'full'), explicit component list, or single modular server name.
  * When `deferTools: true` is set, collapses the filtered catalog into pinned core tools + 3 BM25 bridge meta-tools.
  */
+function resolveEffectivePinnedTools(server, pinnedToolNames) {
+  if (Array.isArray(pinnedToolNames)) return pinnedToolNames;
+  if (server && Object.hasOwn(MODULAR_SERVER_PINNED_DEFAULTS, server)) {
+    return MODULAR_SERVER_PINNED_DEFAULTS[server];
+  }
+  return undefined;
+}
+
 export function getStackTools({
   profile = 'full',
   components,
   server,
   deferTools = false,
-  pinnedToolNames
+  pinnedToolNames,
+  includeExtended = false
 } = {}) {
   const allowed = resolveAllowedComponentSet({ profile, components, server });
-  const rawAllowed = ALL_STACK_TOOLS.filter((t) => allowed.has(t.component));
+  const rawAllowed = resolveRawToolCatalog(allowed, includeExtended);
   if (deferTools) {
-    const bridge = createStackDeferredBridge(rawAllowed, { pinnedToolNames });
+    const bridge = createStackDeferredBridge(rawAllowed, {
+      pinnedToolNames: resolveEffectivePinnedTools(server, pinnedToolNames)
+    });
     return [...bridge.exposedTools];
   }
   return rawAllowed.map(({ component: _c, ...toolDef }) => toolDef);
 }
 
+const HTTP_STRIPPED_ARG_KEYS = new Set([
+  'allowExternalPaths',
+  'authorizedBricks',
+  'tryBrickFn',
+  'getAuthorizedBricksFn',
+  'invariantScript',
+  'repairFn',
+  'assertFn',
+  'nowMs',
+  '__proto__',
+  'constructor',
+  'prototype'
+]);
+
 /**
  * Dispatch a tool call by name against a KruschStack instance.
  */
-export async function dispatchStackTool(stack, toolName, args = {}, options = {}) {
+export async function dispatchStackTool(stack, toolName, rawArgs = {}, options = {}) {
+  let args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
+
+  if (options.httpBoundary) {
+    const cleanArgs = {};
+    for (const key of Object.keys(args)) {
+      if (HTTP_STRIPPED_ARG_KEYS.has(key)) continue;
+      Object.defineProperty(cleanArgs, key, {
+        value: args[key],
+        enumerable: true,
+        writable: true,
+        configurable: true
+      });
+    }
+    try {
+      for (const pathKey of [
+        'targetDir',
+        'repoRoot',
+        'repoDir',
+        'targetRepoDir',
+        'workspaceDir',
+        'workspace_dir',
+        'file_path'
+      ]) {
+        if (typeof cleanArgs[pathKey] === 'string' && cleanArgs[pathKey].trim()) {
+          cleanArgs[pathKey] = assertPathWithinWorkspace(
+            cleanArgs[pathKey],
+            stack.workspaceRoot,
+            {
+              allowReset:
+                pathKey === 'targetDir' && toolName === 'hydrascope_ingest_directory'
+            }
+          );
+        }
+      }
+      if (
+        typeof cleanArgs.path === 'string' &&
+        cleanArgs.path.trim() &&
+        (String(toolName || '').startsWith('krusch_fs_') ||
+          String(toolName || '').startsWith('krusch_git_'))
+      ) {
+        cleanArgs.path = assertPathWithinWorkspace(cleanArgs.path, stack.workspaceRoot);
+      }
+      if (Array.isArray(cleanArgs.paths)) {
+        cleanArgs.paths = cleanArgs.paths.map((item) =>
+          typeof item === 'string' && item.trim()
+            ? assertPathWithinWorkspace(item, stack.workspaceRoot)
+            : item
+        );
+      }
+      if (
+        cleanArgs.provenance &&
+        typeof cleanArgs.provenance === 'object' &&
+        !Array.isArray(cleanArgs.provenance) &&
+        typeof cleanArgs.provenance.file === 'string' &&
+        cleanArgs.provenance.file.trim()
+      ) {
+        assertPathWithinWorkspace(cleanArgs.provenance.file, stack.workspaceRoot);
+      }
+    } catch (pathErr) {
+      return okEnvelope(
+        toolName || 'krusch_call',
+        pathErr.message,
+        { error: pathErr.message, code: 'PATH_OUTSIDE_WORKSPACE' },
+        false
+      );
+    }
+    args = cleanArgs;
+  }
+
   if (
     toolName === 'krusch_tool_search' ||
     toolName === 'krusch_tool_describe' ||
     toolName === 'krusch_tool_call'
   ) {
+    const allowedSet = resolveAllowedComponentSet({
+      profile: options.profile || stack.profile,
+      components: options.components,
+      server: options.server
+    });
     const bridge =
       options.deferredBridge ||
       createStackDeferredBridge(
-        ALL_STACK_TOOLS.filter((t) =>
-          resolveAllowedComponentSet({
-            profile: options.profile || stack.profile,
-            components: options.components,
-            server: options.server
-          }).has(t.component)
-        ),
+        resolveRawToolCatalog(allowedSet, options.includeExtended),
         {
-          pinnedToolNames: options.pinnedToolNames,
-          dispatcher: (innerToolName, innerArgs) => dispatchStackTool(stack, innerToolName, innerArgs)
+          pinnedToolNames: resolveEffectivePinnedTools(options.server, options.pinnedToolNames),
+          dispatcher: (innerToolName, innerArgs) =>
+            dispatchStackTool(stack, innerToolName, innerArgs, {
+              ...options,
+              deferTools: false
+            })
         }
       );
 
@@ -887,7 +1607,47 @@ export async function dispatchStackTool(stack, toolName, args = {}, options = {}
     return bridge.callTool(args);
   }
 
-  const { context, git, fs, harness, frontend, workspace, router } = stack.engines;
+  if (options.enforceProfile) {
+    const allowedSet = resolveAllowedComponentSet({
+      profile: options.profile || stack.profile,
+      components: options.components,
+      server: options.server
+    });
+    const allowedRaw = resolveRawToolCatalog(allowedSet, options.includeExtended);
+    const allowedNames = options.deferTools
+      ? new Set(
+          createStackDeferredBridge(allowedRaw, {
+            pinnedToolNames: resolveEffectivePinnedTools(options.server, options.pinnedToolNames)
+          }).exposedTools.map((t) => t.name)
+        )
+      : new Set(allowedRaw.map((t) => t.name));
+
+    if (!allowedNames.has(toolName)) {
+      return okEnvelope(
+        toolName || 'krusch_call',
+        `Tool '${toolName}' is not enabled in the active profile`,
+        {
+          error: `MethodNotFound: Tool '${toolName}' is unknown or disabled in the active KruschStack profile`,
+          code: 'TOOL_NOT_ENABLED'
+        },
+        false
+      );
+    }
+  }
+
+  const {
+    context,
+    git,
+    fs,
+    hydrascope,
+    brickExchange,
+    harness,
+    groundedHarness,
+    frontend,
+    workspace,
+    router,
+    polyglotAudit
+  } = stack.engines;
   switch (toolName) {
     // Tier 1: Context
     case 'krusch_context_retrieve':
@@ -975,11 +1735,118 @@ export async function dispatchStackTool(stack, toolName, args = {}, options = {}
     case 'get_workspace_status':
       return workspace.getWorkspaceStatus(args);
 
+    // Tier 2C: HydraScope
+    case 'hydrascope_traverse_context':
+      return hydrascope.traverseContext(args);
+    case 'hydrascope_check_answerable':
+      return hydrascope.checkAnswerable(args);
+    case 'hydrascope_compare_vector_vs_graph':
+      return hydrascope.compareVectorVsGraph(args);
+    case 'hydrascope_run_benchmark':
+      return hydrascope.runBenchmark(args);
+    case 'hydrascope_supersede_decision':
+      return hydrascope.supersedeDecision(args);
+    case 'hydrascope_ingest_directory':
+      return hydrascope.ingestDirectory({ ...args, allowExternalPaths: false });
+
+    // Tier 2D: Brick Exchange
+    case 'brick_seal':
+      return brickExchange.sealBrick(args);
+    case 'brick_verify':
+      return brickExchange.verifyBrick(args);
+    case 'brick_suggest': {
+      const inboxRes = brickExchange.listInbox({
+        viewerId: args.viewerId || args.actorId || 'anonymous',
+        viewerOrgId: args.viewerOrgId
+      });
+      const allBricks = inboxRes.data?.bricks || [];
+      const filteredBricks = args.brickId
+        ? allBricks.filter((b) => (b.brickId || b.blueprint?.id) === args.brickId)
+        : allBricks;
+      const repoScan =
+        args.repoRoot && polyglotAudit
+          ? polyglotAudit.auditRepository(args.repoRoot)
+          : null;
+      return okEnvelope(
+        'brick_suggest',
+        `Evaluated brick suggestions (${filteredBricks.length} authorized brick(s))`,
+        {
+          brickId: args.brickId || null,
+          authorizedBricks: filteredBricks,
+          repoCoverage: repoScan?.ok ? repoScan.data : null,
+          repoCoverageError: repoScan && !repoScan.ok ? repoScan.error || repoScan.summary : null
+        }
+      );
+    }
+    case 'brick_share':
+      return brickExchange.issueGrant({
+        ...args,
+        issuerId: args.issuerId || args.actorId
+      });
+    case 'brick_inbox': {
+      const { authorizedBricks: _ignoredAuthorized, ...safeInboxArgs } = args;
+      const inbox = brickExchange.listInbox(safeInboxArgs);
+      if (
+        inbox.ok &&
+        (safeInboxArgs.targetStack ||
+          safeInboxArgs.targetChannel ||
+          (Array.isArray(safeInboxArgs.requiredPorts) && safeInboxArgs.requiredPorts.length > 0))
+      ) {
+        const composed = brickExchange.composeCrossStack({
+          ...safeInboxArgs,
+          authorizedBricks: inbox.data?.bricks || []
+        });
+        if (!composed.ok) {
+          return composed;
+        }
+        return okEnvelope('brick_inbox', `${inbox.summary} | ${composed.summary}`, {
+          ...inbox.data,
+          composition: composed.data
+        });
+      }
+      return inbox;
+    }
+    case 'brick_try_local':
+      return brickExchange.tryBrick(args);
+    case 'brick_adopt':
+      return brickExchange.adoptBrick(args);
+    case 'brick_revoke':
+      return brickExchange.revokeGrant(args);
+    case 'brick_blast_radius':
+      return brickExchange.analyzeBlastRadius({
+        ...args,
+        repoDir: args.repoDir ?? args.repoRoot,
+        changedFiles: args.changedFiles ?? args.targetFiles,
+        protectedFiles: args.protectedFiles ?? args.policyFloorFiles
+      });
+    case 'brick_plan_fanout':
+      return brickExchange.planFanOut({
+        ...args,
+        repoDir: args.repoDir ?? args.repoRoot,
+        protectedFiles: args.protectedFiles ?? args.policyFloorFiles
+      });
+
+    // Tier 3B: Grounded Harness
+    case 'krusch_ground_workspace':
+      return groundedHarness.groundWorkspace(args);
+    case 'krusch_resolve_scale_profile':
+      return groundedHarness.resolveScale(args);
+    case 'krusch_grounded_session_start':
+      return groundedHarness.startSession(args);
+    case 'krusch_grounded_intercept':
+      return groundedHarness.interceptToolCall(args);
+    case 'krusch_grounded_outcome':
+      return groundedHarness.recordToolOutcome(args);
+    case 'krusch_grounded_verify_stop':
+      return groundedHarness.verifyStop(args);
+    case 'krusch_grounded_summary':
+      return groundedHarness.sessionSummary(args);
+
     // Router & Stack Status
     case 'krusch_route_task':
       return router.routeTask(args);
     case 'krusch_stack_status':
-      return router.getStackStatus({ engines: stack.engines });
+      return router.getStackStatus({ engines: stack.engines, db: stack.db });
 
     default:
       throw new McpError(ErrorCode.MethodNotFound, `Unknown KruschStack tool: ${toolName}`);
@@ -997,17 +1864,22 @@ export function createMcpServer(options = {}) {
       (process.env.KRUSCH_STACK_DEFER_TOOLS === '1' ||
         process.env.KRUSCH_STACK_DEFER_TOOLS === 'true')
   );
-  const rawAllowed = ALL_STACK_TOOLS.filter((t) =>
-    resolveAllowedComponentSet({
-      profile: effectiveProfile,
-      components: options.components,
-      server: options.server
-    }).has(t.component)
-  );
+  const allowedSet = resolveAllowedComponentSet({
+    profile: effectiveProfile,
+    components: options.components,
+    server: options.server
+  });
+  const rawAllowed = resolveRawToolCatalog(allowedSet, options.includeExtended);
   const deferredBridge = deferTools
     ? createStackDeferredBridge(rawAllowed, {
-        pinnedToolNames: options.pinnedToolNames,
-        dispatcher: (innerToolName, innerArgs) => dispatchStackTool(stack, innerToolName, innerArgs)
+        pinnedToolNames: resolveEffectivePinnedTools(options.server, options.pinnedToolNames),
+        dispatcher: (innerToolName, innerArgs) =>
+          dispatchStackTool(stack, innerToolName, innerArgs, {
+            profile: effectiveProfile,
+            components: options.components,
+            server: options.server,
+            includeExtended: options.includeExtended
+          })
       })
     : null;
   const tools = deferTools
@@ -1047,7 +1919,8 @@ export function createMcpServer(options = {}) {
         deferredBridge,
         profile: effectiveProfile,
         components: options.components,
-        server: options.server
+        server: options.server,
+        includeExtended: options.includeExtended
       });
       return {
         content: [

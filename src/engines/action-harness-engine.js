@@ -51,7 +51,7 @@ export const ACTION_HARNESS_SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_action_harness_events_sig
     ON action_harness_events(session_id, call_signature);
 
-  CREATE INDEX IF NOT EXISTS idx_action_harness_events_time
+  CREATE INDEX IF NOT EXISTS idx_action_harness_events_session_time
     ON action_harness_events(session_id, created_at_ms);
 `;
 

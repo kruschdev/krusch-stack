@@ -1360,9 +1360,14 @@ export function createGroundedHarnessEngine({
   }
 
   function groundWorkspace(params = {}) {
+    const rawDir = params.workspaceDir || params.workspace_dir;
+    const resolvedDir =
+      typeof rawDir === 'string' && rawDir.trim()
+        ? path.resolve(workspaceRoot, rawDir.trim())
+        : workspaceRoot;
     return compileTurnZeroGrounding({
       ...params,
-      workspaceDir: params.workspaceDir || params.workspace_dir || workspaceRoot
+      workspaceDir: resolvedDir
     });
   }
 

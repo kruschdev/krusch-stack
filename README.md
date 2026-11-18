@@ -8,9 +8,9 @@
 
 **The Unified Sovereign AI & Coding Agent Stack.**
 
-`krusch-stack` combines all 7 pillars of the Krusch developer ecosystem into a **single zero-setup `npx` command** (backed by Node 22 native `node:sqlite`, verified across `78/78` local unit & integration tests) and a **one-command `docker compose up -d` stack** (with 19-table `pgvector/pgvector:pg16` DDL schema/index parity in `db/init.sql`).
+`krusch-stack` (`v1.2.0`) combines the entire Krusch developer ecosystem into a **single zero-setup `npx` command** (backed by Node 22 native `node:sqlite`, verified across `87/87` local unit & integration tests) and a **one-command `docker compose up -d` stack** (with 21-table `pgvector/pgvector:pg16` DDL schema/index parity in `db/init.sql`).
 
-Instead of installing, configuring, and wiring 7 separate repositories across Claude Code, Cursor, Windsurf, or Antigravity, one command installs the entire stack.
+Instead of installing, configuring, and wiring 10 separate repositories across Claude Code, Cursor, Windsurf, or Antigravity, one command installs the entire stack.
 
 ## 🎬 100-Second Narrated Product Tour (`1080p`)
 
@@ -40,11 +40,11 @@ Read https://raw.githubusercontent.com/kruschdev/krusch-stack/main/INSTALL.md an
 # 1. Auto-configure Claude Code (.mcp.json), Cursor, Windsurf & Antigravity + initialize SQLite
 npx krusch-stack init
 
-# 2. Verify all 7 stack pillars
+# 2. Verify all 10 stack pillars and 21 SQLite tables
 npx krusch-stack doctor
 ```
 
-### Option B: Full Docker Stack (PostgreSQL 16 + `pgvector` + Gateway)
+### Option B: Full Docker Stack (HTTP Gateway on `127.0.0.1:3780` + Companion PostgreSQL 16 `db/init.sql`)
 
 ```bash
 git clone https://github.com/kruschdev/krusch-stack.git
@@ -55,48 +55,49 @@ curl http://127.0.0.1:3780/health
 
 ---
 
-## 🏗️ What's Inside `krusch-stack` (The 7 Unified Pillars)
+## 🏗️ What's Inside `krusch-stack` (The 10 Unified Pillars)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                        KRUSCH-STACK UNIFIED GATEWAY                        │
-│               `npx krusch-stack mcp`  (39 Annotated MCP Tools)             │
+│                     KRUSCH-STACK v1.2.0 UNIFIED GATEWAY                    │
+│     `npx krusch-stack mcp` (39 Unified + 23 Modular Extension Tools)       │
 ├──────────────────────┬───────────────────────────┬─────────────────────────┤
 │ 1. WORKING MEMORY    │ 2A. CODEBASE AST & GIT    │ 2B. OS PAGE MEMORY      │
 │ krusch-context-mcp   │ krusch-git                │ krusch-fs               │
 │ • retrieve / remember│ • search_symbols          │ • locate / search       │
 │ • revise / nudge     │ • dependency_graph        │ • page_tree / read_page │
-│ • INV-12 span drift  │ • read_tree / read_blob   │ • remember_on_page      │
+│ • blame & co-change  │ • read_tree / read_blob   │ • remember_on_page      │
 ├──────────────────────┼───────────────────────────┼─────────────────────────┤
-│ 3A. 2PC HARNESS      │ 4. FRONTEND DESIGN MCP    │ 5. WORKSPACE HUB        │
-│ krusch-harness       │ krusch-frontend-mcp       │ g-krusch                │
-│ • run (stages diff)  │ • generate_color_palette  │ • get_agent_steering    │
-│ • apply_diff (2PC)   │ • css_to_tailwind         │ • search_drive_rag      │
-│ • explain / reject   │ • canonical_templates     │ • write (.gdoc/.slides) │
+│ 2C. HYDRASCOPE       │ 2D. BRICK EXCHANGE        │ 3A. 2PC HARNESS         │
+│ hydrascope           │ krusch-brick-exchange     │ krusch-harness          │
+│ • traverse_context   │ • Ed25519 --permission    │ • run (stages diff)     │
+│ • check_answerable   │ • 2-hop AST fan-out waves │ • apply_diff (2PC)      │
+│ • asOf :SUPERSEDES   │ • 4-axis hexagonal bind   │ • action-harness gate   │
+├──────────────────────┼───────────────────────────┼─────────────────────────┤
+│ 3B. GROUNDED HARNESS │ 4. FRONTEND DESIGN MCP    │ 5. WORKSPACE HUB        │
+│ grounded-harness     │ krusch-frontend-mcp       │ g-krusch                │
+│ • Turn-0 schema scan │ • 16 Lego/Vercel templates│ • get_agent_steering    │
+│ • scale tiers & DART │ • css_to_tailwind / WCAG  │ • search_drive_rag      │
+│ • defect-only stop   │ • query_design_rules      │ • write (.gdoc/.slides) │
 ├──────────────────────┴───────────────────────────┴─────────────────────────┤
-│ 3B. GROUNDED HARNESS (INV-STACK-11)                                        │
-│ • Turn-0 schema/hazard grounding, scale tiers & defect-only stop gate      │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 3C. BRICK EXCHANGE & 4-AXIS ONTOLOGY (INV-STACK-12 / INV-LEGO-36)          │
-│ • Ed25519 --permission brick seals, 2-hop AST fan-out & HydraScope bind    │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 6. COGNITIVE CASCADE ROUTER (`krusch-cascade-router`)                      │
-│ • <25µs pure-CPU Stage-0 dispatch -> L2 Local MoE -> L2.5 120B -> L3 Ref.  │
+│ 6. CASCADE ROUTER, SOVEREIGN TOOLGRAPH & POLYGLOT AUDIT                    │
+│ • <25µs L1-L3 dispatch + <1ms CONSUMES->PRODUCED_BY closure + 28-rule scan │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-| Pillar | Standalone Repo | Tools Included | Storage Default |
-|--------|-----------------|----------------|-----------------|
-| **Tier 1: Working Memory** | [`krusch-context-mcp`](https://github.com/kruschdev/krusch-context-mcp) | `krusch_context_retrieve`, `krusch_context_remember`, `krusch_context_revise`, `krusch_context_nudge`, `krusch_context_health` | `node:sqlite` (`db/init.sql` PG DDL parity) |
+| Pillar | Standalone Repo | Tools & Surfaces Included | Storage Default |
+|--------|-----------------|---------------------------|-----------------|
+| **Tier 1: Working Memory & Git Alignment** | [`krusch-context-mcp`](https://github.com/kruschdev/krusch-context-mcp) | `krusch_context_retrieve`, `krusch_context_remember`, `krusch_context_revise`, `krusch_context_nudge` (`git blame -w -M` + `--when`/`--require` co-change), `krusch_context_health` (`INV-ALIGN-STALE-02` stale-code scan) | `node:sqlite` (`db/init.sql` PG DDL parity) |
 | **Tier 2A: Git & AST Graph** | [`krusch-git`](https://github.com/kruschdev/krusch-git) | `krusch_git_list_repos`, `krusch_git_read_tree`, `krusch_git_read_blob`, `krusch_git_search_symbols`, `krusch_git_file_symbols`, `krusch_git_dependency_graph`, `krusch_git_semantic_search` | `node:sqlite` (`db/init.sql` PG DDL parity) |
 | **Tier 2B: OS Page Memory** | [`krusch-fs-mcp`](https://github.com/kruschdev/krusch-fs-mcp) | `krusch_fs_locate`, `krusch_fs_search`, `krusch_fs_page_tree`, `krusch_fs_read_page`, `krusch_fs_remember_on_page`, `krusch_fs_sync` | `node:sqlite` (`db/init.sql` PG DDL parity) |
+| **Tier 2C: HydraScope Context & Ontology** | [`HydraScope`](https://github.com/kruschdev/HydraScope) | `stack.hydrascope` (`krusch-stack/hydrascope`), `POST /hydrascope/*`, & `--server hydrascope` (`hydrascope_traverse_context`, `hydrascope_check_answerable`, `hydrascope_compare_vector_vs_graph`, `hydrascope_run_benchmark`, `hydrascope_supersede_decision`, `hydrascope_ingest_directory`; `INV-STACK-13`) | `node:sqlite` (`db/init.sql` PG DDL parity + optional `HYDRADB_URL`) |
+| **Tier 2D: Brick Exchange & 4-Axis Ontology** | [`toolkit`](https://github.com/kruschdev/toolkit) · [`HydraScope`](https://github.com/kruschdev/HydraScope) | `stack.brickExchange` (`krusch-stack/brick-exchange`, `krusch-stack/brick-ontology`), `POST /brick-exchange/*`, & `--server krusch-brick-exchange` (10 `brick_*` MCP tools: 4-gate `--permission` Ed25519 seals, scoped grants, 2-hop AST fan-out & `$0` hexagonal binding synthesis; `INV-STACK-12` + `INV-LEGO-36`) | `node:sqlite` (`db/init.sql` PG DDL parity) |
 | **Tier 3A: 2PC Staged Harness** | [`krusch-coding-harness`](https://github.com/kruschdev/krusch-coding-harness) | `krusch_run`, `krusch_task_status`, `krusch_diff`, `krusch_apply_diff`, `krusch_explain`, `krusch_reject`, `krusch_abort` *(`<32ms` 2PC write-ahead journal + POSIX atomic rename + `stack.actionHarness` `INV-STACK-10`)* | `node:sqlite` (`db/init.sql` PG DDL parity) |
-| **Tier 3B: Grounded Harness** | [`grounded-harness`](https://github.com/kruschdev/grounded-harness) | `stack.groundedHarness` (`krusch-stack/grounded-harness`) & `POST /grounded-harness/*` (`INV-STACK-11`: zero-LLM Turn-0 schema/hazard grounding, scale-aware tiers, memoization & defect-only stop gate; `39` MCP tools preserved) | `node:sqlite` (`db/init.sql` PG DDL parity) |
-| **Tier 3C: Brick Exchange & 4-Axis Ontology** | [`toolkit`](https://github.com/kruschdev/toolkit) · [`HydraScope`](https://github.com/kruschdev/HydraScope) | `stack.brickExchange` (`krusch-stack/brick-exchange`, `krusch-stack/brick-ontology`) & `POST /brick-exchange/*` (`INV-STACK-12` + `INV-LEGO-36`: 4-gate `--permission` Ed25519 brick sealing, scoped grants, `.brick-lock.json` drift checks, Deadbolt 2-hop AST fan-out waves, HydraScope 48-bit surrogate graph & `$0` cross-stack hexagonal binding synthesis) | `node:sqlite` (`db/init.sql` PG DDL parity) |
-| **Tier 4: Frontend Design** | [`krusch-frontend-mcp`](https://github.com/kruschdev/krusch-frontend-mcp) | `generate_color_palette`, `css_to_tailwind`, `query_design_rules`, `get_canonical_template`, `list_canonical_templates`, `generate_responsive_breakpoints` | `node:sqlite` (`db/init.sql` PG DDL parity) |
+| **Tier 3B: Grounded Harness** | [`grounded-harness`](https://github.com/kruschdev/grounded-harness) | `stack.groundedHarness` (`krusch-stack/grounded-harness`, `./grounded-auth-drift`, `./grounded-trace-synthesizer`), `POST /grounded-harness/*`, & `--server krusch-grounded-harness` (7 `krusch_grounded_*` MCP tools; `INV-STACK-11` / `INV-GH-01..12`) | `node:sqlite` (`db/init.sql` PG DDL parity) |
+| **Tier 4: Frontend Design** | [`krusch-frontend-mcp`](https://github.com/kruschdev/krusch-frontend-mcp) | `generate_color_palette`, `css_to_tailwind`, `query_design_rules`, `get_canonical_template` (`16` templates incl. `site-header` & `lego-vercel-*`), `list_canonical_templates`, `generate_responsive_breakpoints` | `node:sqlite` (`db/init.sql` PG DDL parity) |
 | **Tier 5: Workspace Hub** | [`G-krusch`](https://github.com/kruschdev/G-krusch) | `get_agent_steering`, `search_drive_rag`, `read_drive_file`, `write_drive_file`, `list_drive_workspace`, `get_workspace_status` | `node:sqlite` (`db/init.sql` PG DDL parity) |
-| **Router & Diagnostics** | [`krusch-cascade-router`](https://github.com/kruschdev/krusch-cascade-router) | `krusch_route_task`, `krusch_stack_status` | In-Memory (`<15µs`–`<25µs` pure-CPU Stage-0 dispatch) |
-| **Companion Runtime Bricks** | [`toolkit` (`@krusch/toolkit` & `krusch_toolkit`)](https://github.com/kruschdev/toolkit) | 40 Node/TS/Workers & Python Lego bricks + `krusch-lego` CLI (`16` `<1ms` Slop-Breaker detectors) backing `get_canonical_template` (`lego-*`) & `INV-LEGO-01..36` | App Runtime (ESM / Py 3.11+) |
+| **Router, ToolGraph & Polyglot Audit** | [`krusch-cascade-router`](https://github.com/kruschdev/krusch-cascade-router) · [`toolkit`](https://github.com/kruschdev/toolkit) | `krusch_route_task`, `krusch_stack_status`, `stack.toolGraph` (`./tool-graph`, `POST /tool-graph/*`), & `stack.polyglotAudit` (`./polyglot-audit`, `POST /polyglot-audit/*`; `INV-STACK-14`) | In-Memory (`<15µs`–`<1ms` pure-CPU dispatch) |
+| **Companion Runtime Bricks** | [`toolkit` (`@krusch/toolkit` & `krusch_toolkit`)](https://github.com/kruschdev/toolkit) | 40 Node/TS/Workers & Python Lego bricks + `krusch-lego` CLI (`28` Slop-Breaker & Polyglot detectors) backing `get_canonical_template` (`lego-*`) & `INV-LEGO-01..36` | App Runtime (ESM / Py 3.11+) |
 
 ### 📊 External Benchmarks & 3-Category Verification Taxonomy Across Pillars
 
@@ -134,7 +135,7 @@ Registers **one** MCP server (`krusch-stack`) that exposes all 39 tools (or 27 c
 ```
 
 ### 2. Modular Multi-Server Mode (`npx krusch-stack init --modular`)
-Registers each pillar as its own dedicated MCP entry (`krusch-context-mcp`, `krusch-git`, `krusch-fs`, `krusch-harness`, `krusch-frontend-mcp`, `g-krusch`), all powered by the single `krusch-stack` installation:
+Registers each of the 10 pillars as its own dedicated MCP entry (`krusch-context-mcp`, `krusch-git`, `krusch-fs`, `hydrascope`, `krusch-brick-exchange`, `krusch-harness`, `krusch-grounded-harness`, `krusch-frontend-mcp`, `g-krusch`, `krusch-cascade-router`), all powered by the single `krusch-stack` installation:
 
 ```bash
 npx krusch-stack init --modular --profile full
@@ -258,13 +259,15 @@ const bound = await stack.brickExchange.synthesizeBinding({
 });
 ```
 
-### 🌐 HTTP Gateway Action-Harness, Grounded-Harness & Brick-Exchange Routes (`npx krusch-stack serve`, default `:3780`)
+### 🌐 HTTP Gateway Action-Harness, Grounded-Harness, HydraScope, Brick-Exchange & ToolGraph Routes (`npx krusch-stack serve`, default `:3780`)
 
-When running `npx krusch-stack serve` (or via Docker Compose on `http://127.0.0.1:3780`), the Generalized `2PC` Tool-Action Harness (`INV-STACK-10`), the Turn-0 Grounded Harness (`INV-STACK-11`), and the Collaborative Brick Exchange + 4-Axis Ontology (`INV-STACK-12` / `INV-LEGO-36`) are exposed over HTTP alongside `/health`, `/tools`, `/call`, and `/resilience/*` at the outer orchestration boundary so **`ALL_STACK_TOOLS.length === 39` remains strictly unchanged** (`node:sqlite` powers the active local storage engine across all `78/78` tests, while `db/init.sql` maintains 19-table PostgreSQL 16 + `pgvector` schema/index DDL parity):
+When running `npx krusch-stack serve` (or via Docker Compose on `http://127.0.0.1:3780`), the Generalized `2PC` Tool-Action Harness (`INV-STACK-10`), the Turn-0 Grounded Harness (`INV-STACK-11`), Tier 2C HydraScope (`INV-STACK-13`), Collaborative Brick Exchange + 4-Axis Ontology (`INV-STACK-12` / `INV-LEGO-36`), and Sovereign ToolGraph + Polyglot Audit (`INV-STACK-14`) are exposed over HTTP alongside `/health`, `/tools`, `/call`, and `/resilience/*` at the outer orchestration boundary so **`ALL_STACK_TOOLS.length === 39` remains strictly unchanged** (`node:sqlite` powers the active local storage engine across all `87/87` tests, while `db/init.sql` maintains 21-table PostgreSQL 16 + `pgvector` schema/index DDL parity):
 
 - `POST /action-harness/{start,intercept,outcome,verify-stop,summary}` → `stack.actionHarness.*` (`ALLOW_READ`, `ALLOW_MUTATION`, `BLOCK_SPIN_LOOP`, `BLOCK_READ_STREAK`, `BLOCK_DUPLICATE_WRITE`, `HOLD_FOR_REVISION`)
 - `POST /grounded-harness/{scale-profile,ground,ground-and-start,evaluate-turn,start,intercept,outcome,verify-stop,summary}` → `stack.groundedHarness.*` (`ALLOW`, `MEMOIZED`, `BLOCK_SPIN_LOOP`, `FORCE_VERIFY`, `REJECT_OUTPUT_DEFECT`, `ALLOW_STOP`)
+- `POST /hydrascope/{state,traverse,check-answerable,compare,benchmark,supersede,ingest}` → `stack.hydrascope.*` (enforces `allowExternalPaths: false` workspace containment on `ingest` and auto-hydrates `brick_exchange_bricks` 4-axis ontology)
 - `POST /brick-exchange/{keygen,seal,verify,publish,grant,revoke,inbox,try,adopt,audit-locks,blast-radius,fanout,verify-blast-radius,ontology-inspect,ontology-check,ontology-compose,ontology-bind,stats}` → `stack.brickExchange.*` (strips internal callback keys from HTTP JSON bodies, enforces authenticated `viewerId` on `ontology-compose`, verifies Ed25519 seals + signed `blueprint.ontology`, and blocks inline `invariantScript` over HTTP `verify-blast-radius`)
+- `POST /tool-graph/{find,describe,call,outcome,stats,reset}` & `POST /polyglot-audit/{source,repository,normalize-repo,score-coverage}` → `stack.toolGraph.*` & `stack.polyglotAudit.*` (`<1ms` `CONSUMES -> PRODUCED_BY` prerequisite closure and 28-rule 10-language brownfield hazard scanning)
 
 > 📖 **Architecture & Benchmark Whitepapers**: Read [**Paper #30: Uniting DEADBOLT, Common Ground, and HydraScope Through a HydraDB Graph Ontology**](https://krusch.dev/articles/ontological-brick-exchange-deadbolt-common-ground-hydrascope), [**Paper #29: Fusing Common Ground & DEADBOLT Under MIT**](https://krusch.dev/articles/mit-open-source-brick-exchange-common-ground-deadbolt), [**Paper #27: Return on Memory (Official DolphinBench `91.17%` Queued `UUID c047b063` & `90.67%` Clean-Room Grounded v0.3)**](https://krusch.dev/articles/return-on-memory-dolphinbench) ([**PDF**](https://krusch.dev/papers/return-on-memory-dolphinbench.pdf)), [**Paper #26: What DolphinBench Taught Me About Local AI (`57.33%` `gemma4-31b-sre-lora` Highest Open-Weights in 28-Run Reproduction / `56.67%` Stock+Grounded / `54.17%` Queued Stock `UUID 288671ad` @ `$0.00`)**](https://krusch.dev/articles/what-dolphinbench-taught-me-about-local-ai), and [**Paper #23: The 15 Production Agentic Systems**](https://krusch.dev/articles/fifteen-production-agent-systems).
 
@@ -272,7 +275,7 @@ When running `npx krusch-stack serve` (or via Docker Compose on `http://127.0.0.
 
 ## 🤗 Open-Weights Models, SFT+DPO Dataset & Benchmarks (Trained Through `krusch-stack`)
 
-I use `krusch-stack` (`78/78` tests) to generate AST-grounded 11-phase code audit trajectories, unit-test-verified (`npm test` / `pytest`, exit `0`) bug remediations, `@krusch/toolkit` Lego-First idioms, and multi-turn MCP/workspace tool-calling + DPO calibration pairs, then distill them back into open-weights Wave-4 / Wave-6 adapters across `L1.5`, `L2`, and `L2.5`:
+I use `krusch-stack` (`87/87` tests) to generate AST-grounded 11-phase code audit trajectories, unit-test-verified (`npm test` / `pytest`, exit `0`) bug remediations, `@krusch/toolkit` Lego-First idioms, and multi-turn MCP/workspace tool-calling + DPO calibration pairs, then distill them back into open-weights Wave-4 / Wave-6 adapters across `L1.5`, `L2`, and `L2.5`:
 
 | Resource | Hugging Face / GitHub | Cascade Role / Base Model |
 |----------|-----------------------|---------------------------|

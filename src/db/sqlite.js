@@ -25,6 +25,7 @@ export const STACK_SCHEMA_SQL = `
     provenance_locator TEXT,
     quoted_sentence TEXT,
     anchor_hash TEXT,
+    provenance_reanchored INTEGER NOT NULL DEFAULT 0,
     embedding TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -136,6 +137,144 @@ export const STACK_SCHEMA_SQL = `
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- Resilience Engine: Async HITL Lease Gates & Non-Blocking Shadow Runs
+  CREATE TABLE IF NOT EXISTS stack_hitl_gates (
+    gate_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    staged_payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    decided_at_ms INTEGER,
+    reviewer TEXT,
+    decision_reason TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_stack_hitl_gates_task_status
+    ON stack_hitl_gates(task_id, status);
+
+  CREATE TABLE IF NOT EXISTS stack_shadow_runs (
+    comparison_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    primary_model TEXT NOT NULL,
+    shadow_model TEXT NOT NULL,
+    sequence_similarity REAL NOT NULL,
+    exact_dag_match INTEGER NOT NULL,
+    latency_delta_ms REAL NOT NULL,
+    cost_delta_usd REAL NOT NULL,
+    created_at_ms INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_stack_shadow_runs_request
+    ON stack_shadow_runs(request_id, created_at_ms);
+
+  -- INV-STACK-10: 2PC Tool-Action Harness
+  CREATE TABLE IF NOT EXISTS action_harness_sessions (
+    session_id TEXT PRIMARY KEY,
+    persona TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL,
+    anchor_date TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    max_identical_reads INTEGER NOT NULL DEFAULT 1,
+    max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
+    max_read_streak INTEGER NOT NULL DEFAULT 6,
+    max_verify_nudges INTEGER NOT NULL DEFAULT 1,
+    enforce_context_nudge INTEGER NOT NULL DEFAULT 0,
+    consecutive_app_reads INTEGER NOT NULL DEFAULT 0,
+    committed_reads INTEGER NOT NULL DEFAULT 0,
+    committed_mutations INTEGER NOT NULL DEFAULT 0,
+    verify_nudges_used INTEGER NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS action_harness_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    step INTEGER NOT NULL DEFAULT 0,
+    tool_name TEXT NOT NULL,
+    is_mutating INTEGER NOT NULL DEFAULT 0,
+    is_memory_search INTEGER NOT NULL DEFAULT 0,
+    canonical_args_json TEXT NOT NULL,
+    call_signature TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    status TEXT NOT NULL,
+    issues_json TEXT NOT NULL DEFAULT '[]',
+    result_preview TEXT NOT NULL DEFAULT '',
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_action_harness_events_sig
+    ON action_harness_events(session_id, call_signature);
+
+  CREATE INDEX IF NOT EXISTS idx_action_harness_events_session_time
+    ON action_harness_events(session_id, created_at_ms);
+
+  -- INV-STACK-11: Turn-0 Grounded Harness
+  CREATE TABLE IF NOT EXISTS grounded_sessions (
+    session_id TEXT PRIMARY KEY,
+    goal TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    scale_tier TEXT NOT NULL,
+    scale_profile_json TEXT NOT NULL,
+    anchor_date TEXT NOT NULL DEFAULT '',
+    prefix_hash TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
+    seen_chunks_json TEXT NOT NULL DEFAULT '[]',
+    file_digests_json TEXT NOT NULL DEFAULT '{}',
+    allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
+    drift_state_json TEXT NOT NULL DEFAULT '{}',
+    schema_tokens_saved INTEGER NOT NULL DEFAULT 0,
+    schema_reduction_pct REAL NOT NULL DEFAULT 0,
+    turn0_tokens INTEGER NOT NULL DEFAULT 0,
+    exploratory_reads INTEGER NOT NULL DEFAULT 0,
+    committed_reads INTEGER NOT NULL DEFAULT 0,
+    committed_mutations INTEGER NOT NULL DEFAULT 0,
+    memoized_reads INTEGER NOT NULL DEFAULT 0,
+    spin_loops_blocked INTEGER NOT NULL DEFAULT 0,
+    output_defects_caught INTEGER NOT NULL DEFAULT 0,
+    timeouts_with_partial_stdout INTEGER NOT NULL DEFAULT 0,
+    turn0_duplicates_suppressed INTEGER NOT NULL DEFAULT 0,
+    duplicate_writes_blocked INTEGER NOT NULL DEFAULT 0,
+    policy_floor_blocks INTEGER NOT NULL DEFAULT 0,
+    auth_drift_holds INTEGER NOT NULL DEFAULT 0,
+    dart_repairs_applied INTEGER NOT NULL DEFAULT 0,
+    dart_holds INTEGER NOT NULL DEFAULT 0,
+    truncation_recoveries INTEGER NOT NULL DEFAULT 0,
+    verify_nudges_used INTEGER NOT NULL DEFAULT 0,
+    pending_diffs_count INTEGER NOT NULL DEFAULT 0,
+    latest_verification_passed INTEGER NOT NULL DEFAULT 1,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS grounded_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    step INTEGER NOT NULL DEFAULT 0,
+    tool_name TEXT NOT NULL,
+    is_mutating INTEGER NOT NULL DEFAULT 0,
+    is_foraging INTEGER NOT NULL DEFAULT 0,
+    canonical_args_json TEXT NOT NULL,
+    call_signature TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    status TEXT NOT NULL,
+    issues_json TEXT NOT NULL DEFAULT '[]',
+    result_preview TEXT NOT NULL DEFAULT '',
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_grounded_events_sig
+    ON grounded_events(session_id, call_signature);
+
+  CREATE INDEX IF NOT EXISTS idx_grounded_events_session_time
+    ON grounded_events(session_id, created_at_ms);
+
   -- INV-STACK-12: Collaborative Brick Exchange & 4-Axis Ontology
   CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
     brick_key TEXT PRIMARY KEY,
@@ -185,6 +324,50 @@ export const STACK_SCHEMA_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
     ON brick_exchange_adoptions(brick_id, created_at_ms);
+
+  -- INV-STACK-13: Tier 2C HydraScope Structural Context & Temporal Ontology Graph
+  CREATE TABLE IF NOT EXISTS hydrascope_nodes (
+    node_key TEXT PRIMARY KEY,
+    workspace_name TEXT NOT NULL DEFAULT 'fintech-core',
+    node_id TEXT NOT NULL,
+    surrogate_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    file_path TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    tokens INTEGER NOT NULL DEFAULT 0,
+    valid_from TEXT NOT NULL DEFAULT '2025-01-01',
+    retired_at TEXT,
+    is_current INTEGER NOT NULL DEFAULT 1,
+    superseded_by TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    embedding TEXT,
+    updated_at_ms INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_hydrascope_nodes_ws_kind
+    ON hydrascope_nodes(workspace_name, kind, is_current);
+
+  CREATE INDEX IF NOT EXISTS idx_hydrascope_nodes_ws_id
+    ON hydrascope_nodes(workspace_name, node_id);
+
+  CREATE TABLE IF NOT EXISTS hydrascope_edges (
+    edge_key TEXT PRIMARY KEY,
+    workspace_name TEXT NOT NULL DEFAULT 'fintech-core',
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1,
+    valid_from TEXT NOT NULL DEFAULT '2025-01-01',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at_ms INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_hydrascope_edges_from
+    ON hydrascope_edges(workspace_name, from_id, edge_type);
+
+  CREATE INDEX IF NOT EXISTS idx_hydrascope_edges_to
+    ON hydrascope_edges(workspace_name, to_id, edge_type);
 `;
 
 /**
@@ -198,6 +381,9 @@ export function ensureStackSchemaMigrations(db) {
   if (cols.length > 0 && !cols.some((c) => c.name === 'embedding')) {
     db.exec('ALTER TABLE context_memories ADD COLUMN embedding TEXT;');
   }
+  if (cols.length > 0 && !cols.some((c) => c.name === 'provenance_reanchored')) {
+    db.exec('ALTER TABLE context_memories ADD COLUMN provenance_reanchored INTEGER NOT NULL DEFAULT 0;');
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS harness_apply_journal (
@@ -208,6 +394,141 @@ export function ensureStackSchemaMigrations(db) {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS stack_hitl_gates (
+      gate_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      staged_payload TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      expires_at_ms INTEGER NOT NULL,
+      decided_at_ms INTEGER,
+      reviewer TEXT,
+      decision_reason TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_stack_hitl_gates_task_status
+      ON stack_hitl_gates(task_id, status);
+
+    CREATE TABLE IF NOT EXISTS stack_shadow_runs (
+      comparison_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      primary_model TEXT NOT NULL,
+      shadow_model TEXT NOT NULL,
+      sequence_similarity REAL NOT NULL,
+      exact_dag_match INTEGER NOT NULL,
+      latency_delta_ms REAL NOT NULL,
+      cost_delta_usd REAL NOT NULL,
+      created_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_stack_shadow_runs_request
+      ON stack_shadow_runs(request_id, created_at_ms);
+
+    CREATE TABLE IF NOT EXISTS action_harness_sessions (
+      session_id TEXT PRIMARY KEY,
+      persona TEXT NOT NULL DEFAULT '',
+      goal TEXT NOT NULL,
+      anchor_date TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'ACTIVE',
+      max_identical_reads INTEGER NOT NULL DEFAULT 1,
+      max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
+      max_read_streak INTEGER NOT NULL DEFAULT 6,
+      max_verify_nudges INTEGER NOT NULL DEFAULT 1,
+      enforce_context_nudge INTEGER NOT NULL DEFAULT 0,
+      consecutive_app_reads INTEGER NOT NULL DEFAULT 0,
+      committed_reads INTEGER NOT NULL DEFAULT 0,
+      committed_mutations INTEGER NOT NULL DEFAULT 0,
+      verify_nudges_used INTEGER NOT NULL DEFAULT 0,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS action_harness_events (
+      event_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      step INTEGER NOT NULL DEFAULT 0,
+      tool_name TEXT NOT NULL,
+      is_mutating INTEGER NOT NULL DEFAULT 0,
+      is_memory_search INTEGER NOT NULL DEFAULT 0,
+      canonical_args_json TEXT NOT NULL,
+      call_signature TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      status TEXT NOT NULL,
+      issues_json TEXT NOT NULL DEFAULT '[]',
+      result_preview TEXT NOT NULL DEFAULT '',
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_action_harness_events_sig
+      ON action_harness_events(session_id, call_signature);
+
+    CREATE INDEX IF NOT EXISTS idx_action_harness_events_session_time
+      ON action_harness_events(session_id, created_at_ms);
+
+    CREATE TABLE IF NOT EXISTS grounded_sessions (
+      session_id TEXT PRIMARY KEY,
+      goal TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      scale_tier TEXT NOT NULL,
+      scale_profile_json TEXT NOT NULL,
+      anchor_date TEXT NOT NULL DEFAULT '',
+      prefix_hash TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'ACTIVE',
+      max_duplicate_writes INTEGER NOT NULL DEFAULT 1,
+      seen_chunks_json TEXT NOT NULL DEFAULT '[]',
+      file_digests_json TEXT NOT NULL DEFAULT '{}',
+      allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
+      drift_state_json TEXT NOT NULL DEFAULT '{}',
+      schema_tokens_saved INTEGER NOT NULL DEFAULT 0,
+      schema_reduction_pct REAL NOT NULL DEFAULT 0,
+      turn0_tokens INTEGER NOT NULL DEFAULT 0,
+      exploratory_reads INTEGER NOT NULL DEFAULT 0,
+      committed_reads INTEGER NOT NULL DEFAULT 0,
+      committed_mutations INTEGER NOT NULL DEFAULT 0,
+      memoized_reads INTEGER NOT NULL DEFAULT 0,
+      spin_loops_blocked INTEGER NOT NULL DEFAULT 0,
+      output_defects_caught INTEGER NOT NULL DEFAULT 0,
+      timeouts_with_partial_stdout INTEGER NOT NULL DEFAULT 0,
+      turn0_duplicates_suppressed INTEGER NOT NULL DEFAULT 0,
+      duplicate_writes_blocked INTEGER NOT NULL DEFAULT 0,
+      policy_floor_blocks INTEGER NOT NULL DEFAULT 0,
+      auth_drift_holds INTEGER NOT NULL DEFAULT 0,
+      dart_repairs_applied INTEGER NOT NULL DEFAULT 0,
+      dart_holds INTEGER NOT NULL DEFAULT 0,
+      truncation_recoveries INTEGER NOT NULL DEFAULT 0,
+      verify_nudges_used INTEGER NOT NULL DEFAULT 0,
+      pending_diffs_count INTEGER NOT NULL DEFAULT 0,
+      latest_verification_passed INTEGER NOT NULL DEFAULT 1,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS grounded_events (
+      event_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      step INTEGER NOT NULL DEFAULT 0,
+      tool_name TEXT NOT NULL,
+      is_mutating INTEGER NOT NULL DEFAULT 0,
+      is_foraging INTEGER NOT NULL DEFAULT 0,
+      canonical_args_json TEXT NOT NULL,
+      call_signature TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      status TEXT NOT NULL,
+      issues_json TEXT NOT NULL DEFAULT '[]',
+      result_preview TEXT NOT NULL DEFAULT '',
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_grounded_events_sig
+      ON grounded_events(session_id, call_signature);
+
+    CREATE INDEX IF NOT EXISTS idx_grounded_events_session_time
+      ON grounded_events(session_id, created_at_ms);
 
     CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
       brick_key TEXT PRIMARY KEY,
@@ -257,7 +578,66 @@ export function ensureStackSchemaMigrations(db) {
 
     CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
       ON brick_exchange_adoptions(brick_id, created_at_ms);
+
+    CREATE TABLE IF NOT EXISTS hydrascope_nodes (
+      node_key TEXT PRIMARY KEY,
+      workspace_name TEXT NOT NULL DEFAULT 'fintech-core',
+      node_id TEXT NOT NULL,
+      surrogate_id TEXT NOT NULL DEFAULT '',
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      file_path TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL DEFAULT '',
+      tokens INTEGER NOT NULL DEFAULT 0,
+      valid_from TEXT NOT NULL DEFAULT '2025-01-01',
+      retired_at TEXT,
+      is_current INTEGER NOT NULL DEFAULT 1,
+      superseded_by TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      embedding TEXT,
+      updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_hydrascope_nodes_ws_kind
+      ON hydrascope_nodes(workspace_name, kind, is_current);
+
+    CREATE INDEX IF NOT EXISTS idx_hydrascope_nodes_ws_id
+      ON hydrascope_nodes(workspace_name, node_id);
+
+    CREATE TABLE IF NOT EXISTS hydrascope_edges (
+      edge_key TEXT PRIMARY KEY,
+      workspace_name TEXT NOT NULL DEFAULT 'fintech-core',
+      from_id TEXT NOT NULL,
+      to_id TEXT NOT NULL,
+      edge_type TEXT NOT NULL,
+      weight REAL NOT NULL DEFAULT 1,
+      valid_from TEXT NOT NULL DEFAULT '2025-01-01',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_hydrascope_edges_from
+      ON hydrascope_edges(workspace_name, from_id, edge_type);
+
+    CREATE INDEX IF NOT EXISTS idx_hydrascope_edges_to
+      ON hydrascope_edges(workspace_name, to_id, edge_type);
   `);
+
+  const groundedCols = db.prepare('PRAGMA table_info(grounded_sessions);').all();
+  if (groundedCols.length > 0) {
+    const groundedAdditions = [
+      ["allowed_scopes_json", "TEXT NOT NULL DEFAULT '[]'"],
+      ["drift_state_json", "TEXT NOT NULL DEFAULT '{}'"],
+      ["auth_drift_holds", "INTEGER NOT NULL DEFAULT 0"],
+      ["dart_repairs_applied", "INTEGER NOT NULL DEFAULT 0"],
+      ["dart_holds", "INTEGER NOT NULL DEFAULT 0"]
+    ];
+    for (const [colName, colDef] of groundedAdditions) {
+      if (!groundedCols.some((c) => c.name === colName)) {
+        db.exec(`ALTER TABLE grounded_sessions ADD COLUMN ${colName} ${colDef};`);
+      }
+    }
+  }
 
   const hasTable = (name) =>
     Boolean(
@@ -383,8 +763,11 @@ export function ensureStackSchemaMigrations(db) {
         db.exec("INSERT INTO fs_page_memories_fts(fs_page_memories_fts) VALUES('rebuild');");
       }
     }
-  } catch {
-    /* Graceful fallback if custom SQLite build omits FTS5 */
+  } catch (ftsErr) {
+    const msg = String(ftsErr?.message || '');
+    if (!/no such module:\s*fts5/i.test(msg)) {
+      throw ftsErr;
+    }
   }
 }
 
@@ -496,10 +879,15 @@ export function openStackDatabase(options = {}) {
       ? options._sqliteFactory
       : (filePath) => new DatabaseSync(filePath);
 
-  const hasExplicitFileDb = Boolean(options.dbPath && options.dbPath !== ':memory:');
+  const envDbPath =
+    typeof process.env.DB_PATH === 'string' && process.env.DB_PATH.trim()
+      ? process.env.DB_PATH.trim()
+      : '';
+  const effectiveDbPath = options.dbPath || envDbPath;
+  const hasExplicitFileDb = Boolean(effectiveDbPath && effectiveDbPath !== ':memory:');
   const ephemeral =
     options.ephemeral === true ||
-    options.dbPath === ':memory:' ||
+    effectiveDbPath === ':memory:' ||
     (options.ephemeral !== false && !hasExplicitFileDb && process.env.KRUSCH_EPHEMERAL === '1');
   if (ephemeral) {
     let memDb = null;
@@ -507,6 +895,7 @@ export function openStackDatabase(options = {}) {
       memDb = sqliteFactory(':memory:');
       memDb.exec('PRAGMA busy_timeout = 5000;');
       memDb.exec('PRAGMA foreign_keys = ON;');
+      memDb.exec('PRAGMA recursive_triggers = ON;');
       memDb.exec(STACK_SCHEMA_SQL);
       ensureStackSchemaMigrations(memDb);
       return memDb;
@@ -521,8 +910,8 @@ export function openStackDatabase(options = {}) {
   }
 
   const workspaceRoot = path.resolve(options.workspaceRoot || process.cwd());
-  const resolvedPath = options.dbPath
-    ? path.resolve(options.dbPath)
+  const resolvedPath = effectiveDbPath
+    ? path.resolve(workspaceRoot, effectiveDbPath)
     : path.join(workspaceRoot, '.krusch-stack', 'stack.db');
 
   fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
@@ -533,6 +922,7 @@ export function openStackDatabase(options = {}) {
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA synchronous = NORMAL;');
     db.exec('PRAGMA foreign_keys = ON;');
+    db.exec('PRAGMA recursive_triggers = ON;');
     const check = db.prepare('PRAGMA quick_check;').get();
     if (check && check.quick_check && check.quick_check !== 'ok') {
       throw new Error(`SQLite quick_check failed: ${check.quick_check}`);
@@ -567,6 +957,7 @@ export function openStackDatabase(options = {}) {
       db.exec('PRAGMA journal_mode = WAL;');
       db.exec('PRAGMA synchronous = NORMAL;');
       db.exec('PRAGMA foreign_keys = ON;');
+      db.exec('PRAGMA recursive_triggers = ON;');
       db.exec(STACK_SCHEMA_SQL);
       ensureStackSchemaMigrations(db);
     } catch (reinitErr) {
