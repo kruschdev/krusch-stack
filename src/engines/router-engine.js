@@ -8,7 +8,7 @@
 
 import { okEnvelope } from '../db/sqlite.js';
 
-export const VERSION = '1.3.0';
+export const VERSION = '1.3.1';
 
 const TIER_CATALOG = {
   L1_FAST_LOCAL: {

@@ -1,17 +1,18 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "dev.krusch/krusch-stack",
+  "title": "KruschStack",
   "description": "Local SQLite control plane for coding agents: persistent memory, Turn-0 grounding, and 2PC safety.",
   "repository": {
     "url": "https://github.com/kruschdev/krusch-stack",
     "source": "github"
   },
-  "version": "1.3.0",
+  "version": "1.3.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "krusch-stack",
-      "version": "1.3.0",
+      "version": "1.3.1",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

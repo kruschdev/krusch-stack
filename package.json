@@ -1,6 +1,7 @@
 {
   "name": "krusch-stack",
-  "version": "1.3.0",
+  "version": "1.3.1",
+  "mcpName": "dev.krusch/krusch-stack",
   "description": "The unified Sovereign AI & Coding Agent Stack: one-command installer and MCP gateway bundling Tier 1 Working Memory & Git Alignment (krusch-context-mcp), Tier 2A Git DAG & AST Graph (krusch-git), Tier 2B Page-Anchored OS Filesystem (krusch-fs), Tier 2C HydraScope Structural Context & Temporal Ontology, Tier 2D Collaborative Brick Exchange & 4-Axis Ontology, Tier 3 Staged 2PC & Turn-0 Grounded Harnesses (krusch-harness + grounded-harness), Frontend Design Engine (krusch-frontend-mcp), Google Workspace Hub (g-krusch), Sovereign ToolGraph, Polyglot Audit, and L1-L3 Cascade Router.",
   "type": "module",
   "main": "src/index.js",

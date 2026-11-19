@@ -61,7 +61,7 @@ function rawHttpGet({ port, urlPath = '/telemetry', headers = {} }) {
 
 describe('KruschStack v1.3.0 Progressive Onboarding, Demo, Observability & Clean-Room Repro (INV-STACK-05, INV-STACK-15)', () => {
   test('INV-STACK-05: Progressive profiles filter tools, modular servers, doctor pillars, and AGENTS.md while keeping 39 unified tools intact', () => {
-    assert.equal(VERSION, '1.3.0');
+    assert.equal(VERSION, '1.3.1');
     assert.equal(ALL_STACK_TOOLS.length, 39);
     assert.deepEqual([...VALID_STACK_PROFILES], ['memory-only', 'coding-agent', 'core', 'full']);
 
