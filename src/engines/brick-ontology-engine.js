@@ -12,10 +12,23 @@
 
 import crypto from 'node:crypto';
 import { okEnvelope } from '../db/sqlite.js';
-import { verifySealedBrickBundle } from './brick-exchange-engine.js';
+import {
+  FORBIDDEN_KEYS,
+  MAX_PAYLOAD_DEPTH,
+  isPlainObject,
+  defineSafeProp,
+  deepFreezePlain,
+  hasForbiddenKeyRecursive,
+  scrubOntologyString,
+  scanWebStandardPurity,
+  isWebStandardPureBrickSource
+} from './shared/js-code-scanner.js';
+import {
+  verifySealedBrickBundle,
+  registerDefaultOntologyNormalizer
+} from './brick-exchange/seal-crypto.js';
 
-const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const MAX_PAYLOAD_DEPTH = 24;
+export { hasForbiddenKeyRecursive, isWebStandardPureBrickSource };
 
 const BRICK_ID_RE = /^[a-z0-9][a-z0-9-_]{1,63}$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -46,142 +59,6 @@ export const CANONICAL_SHARED_TYPES = Object.freeze([
 
 const TOOL_GRAPH_SHARED_PORT_SET = new Set(CANONICAL_SHARED_TYPES);
 
-const NODE_BUILTIN_MODULES = new Set([
-  'assert',
-  'assert/strict',
-  'async_hooks',
-  'buffer',
-  'child_process',
-  'cluster',
-  'console',
-  'constants',
-  'crypto',
-  'dgram',
-  'diagnostics_channel',
-  'dns',
-  'dns/promises',
-  'domain',
-  'events',
-  'fs',
-  'fs/promises',
-  'http',
-  'http2',
-  'https',
-  'inspector',
-  'inspector/promises',
-  'module',
-  'net',
-  'os',
-  'path',
-  'path/posix',
-  'path/win32',
-  'perf_hooks',
-  'process',
-  'punycode',
-  'querystring',
-  'readline',
-  'readline/promises',
-  'repl',
-  'sqlite',
-  'stream',
-  'stream/consumers',
-  'stream/promises',
-  'stream/web',
-  'string_decoder',
-  'sys',
-  'timers',
-  'timers/promises',
-  'tls',
-  'trace_events',
-  'tty',
-  'url',
-  'util',
-  'util/types',
-  'v8',
-  'vm',
-  'wasi',
-  'worker_threads',
-  'zlib'
-]);
-
-const REGEX_PRECEDING_KEYWORDS = new Set([
-  'return',
-  'throw',
-  'case',
-  'delete',
-  'void',
-  'typeof',
-  'yield',
-  'await',
-  'in',
-  'instanceof',
-  'of',
-  'new',
-  'else',
-  'do'
-]);
-
-// Assembled dynamically so static repository leak scanners never match detector patterns.
-const SCRUB_PRIVATE_IPV4_RE = new RegExp(
-  [
-    `\\b${'10'}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b`,
-    `\\b${'192'}\\.${'168'}\\.\\d{1,3}\\.\\d{1,3}\\b`,
-    `\\b172\\.(?:1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}\\b`,
-    `\\b100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.\\d{1,3}\\.\\d{1,3}\\b`
-  ].join('|'),
-  'g'
-);
-
-const SCRUB_SECRET_TOKEN_RE = new RegExp(
-  [
-    `${'AIza' + 'Sy'}[A-Za-z0-9_-]{6,}`,
-    `\\b${'sk' + '-'}[A-Za-z0-9_-]{8,}`,
-    `\\b${'gh' + 'p_'}[A-Za-z0-9]{8,}`,
-    `\\bxox[baprs]-[A-Za-z0-9-]{8,}`
-  ].join('|'),
-  'g'
-);
-
-const SCRUB_LOCAL_HOME_PATH_RE = new RegExp(
-  `(?<![A-Za-z0-9._-])\\/(?:${['ho' + 'me', 'Us' + 'ers', 'm' + 'nt'].join('|')})\\/[A-Za-z0-9._/-]+`,
-  'g'
-);
-
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function defineSafeProp(target, key, value) {
-  if (FORBIDDEN_KEYS.has(key)) {
-    return;
-  }
-  Object.defineProperty(target, key, {
-    value,
-    enumerable: true,
-    writable: true,
-    configurable: true
-  });
-}
-
-function deepFreezePlain(value) {
-  if (value === null || typeof value !== 'object') {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return Object.freeze(value.map((item) => deepFreezePlain(item)));
-  }
-  const out = {};
-  for (const key of Object.keys(value)) {
-    if (FORBIDDEN_KEYS.has(key)) continue;
-    defineSafeProp(out, key, deepFreezePlain(value[key]));
-  }
-  return Object.freeze(out);
-}
-
 /**
  * Format a deterministic INV-STACK-02 failure envelope.
  * @param {string} tool
@@ -203,52 +80,6 @@ function failEnvelope(tool, code, message, details = null) {
     summary: error.message,
     error
   };
-}
-
-/**
- * Recursively scan an object/array graph for prototype-pollution keys (`__proto__`, `constructor`, `prototype`),
- * circular references (`WeakSet`), and nesting exceeding `depth > 24` (fail-closed `SEC-01`).
- *
- * @param {unknown} value
- * @param {number} [depth=0]
- * @param {WeakSet<object>} [seen=new WeakSet()]
- * @returns {string | null}
- */
-export function hasForbiddenKeyRecursive(value, depth = 0, seen = new WeakSet()) {
-  if (value === null || typeof value !== 'object') {
-    return null;
-  }
-  if (depth > MAX_PAYLOAD_DEPTH) {
-    return '__max_depth_exceeded__';
-  }
-  if (seen.has(value)) {
-    return '__circular_reference__';
-  }
-  seen.add(value);
-  try {
-    if (Array.isArray(value)) {
-      for (let i = 0; i < value.length; i += 1) {
-        const nested = hasForbiddenKeyRecursive(value[i], depth + 1, seen);
-        if (nested) return nested;
-      }
-      return null;
-    }
-    if (!isPlainObject(value)) {
-      return null;
-    }
-    const ownNames = Object.getOwnPropertyNames(value);
-    for (let i = 0; i < ownNames.length; i += 1) {
-      const key = ownNames[i];
-      if (FORBIDDEN_KEYS.has(key)) {
-        return key;
-      }
-      const nested = hasForbiddenKeyRecursive(value[key], depth + 1, seen);
-      if (nested) return nested;
-    }
-    return null;
-  } finally {
-    seen.delete(value);
-  }
 }
 
 /**
@@ -774,6 +605,46 @@ export const STACK_ONTOLOGY_CHANNELS = deepFreezePlain({
   }
 });
 
+const THREE_CHAIR_MODELS = {
+  L1_THIRD_CHAIR_FAST: 'gemma4:e2b',
+  L2_SECOND_CHAIR_CODER: 'qwen3-coder-30b-moe:latest',
+  L2_FIRST_CHAIR_INKLING: 'inkling-2-mini:ud-iq4_xs-dspark'
+};
+
+const TIMESERIES_CADENCE_INVARIANTS = {
+  cadenceMs: 60000,
+  requireMonotonicTimestamps: true,
+  preserveNegativeValues: true,
+  nanInfPolicy: 'reject',
+  anomalyMethod: 'mad-zscore'
+};
+
+const FINANCIAL_LEDGER_INVARIANTS = {
+  cadenceMs: null,
+  requireMonotonicTimestamps: false,
+  preserveNegativeValues: true,
+  rejectFloatCurrency: true,
+  nanInfPolicy: 'reject',
+  anomalyMethod: 'exact-conservation',
+  integerMinorUnitsOnly: true
+};
+
+const CROSS_STACK_ADAPTER_INVARIANTS = {
+  cadenceMs: null,
+  requireMonotonicTimestamps: false,
+  preserveNegativeValues: true,
+  nanInfPolicy: 'reject',
+  anomalyMethod: 'schema-contract'
+};
+
+const CHANNEL_SECURITY_INVARIANTS = {
+  cadenceMs: null,
+  requireMonotonicTimestamps: true,
+  preserveNegativeValues: false,
+  nanInfPolicy: 'reject',
+  anomalyMethod: 'replay-window-hmac'
+};
+
 /**
  * Axis 4: Canonical MoE & Numerical Specialist Profile Registry (`INV-LEGO-36`).
  */
@@ -781,77 +652,78 @@ export const STACK_ONTOLOGY_MOE_PROFILES = deepFreezePlain({
   'timeseries-cadence-moe': {
     id: 'timeseries-cadence-moe',
     category: 'timeseries',
+    domain: 'timeseries',
     description:
       'Time-series resampling, cadence alignment, and z-score/MAD anomaly windowing specialist',
-    invariants: {
-      cadenceMs: 60000,
-      requireMonotonicTimestamps: true,
-      preserveNegativeValues: true,
-      nanInfPolicy: 'reject',
-      anomalyMethod: 'mad-zscore'
-    },
+    summary:
+      'Time-series resampling, cadence alignment, and z-score/MAD anomaly windowing specialist',
+    invariants: TIMESERIES_CADENCE_INVARIANTS,
+    numericalInvariants: TIMESERIES_CADENCE_INVARIANTS,
     cascadeTiers: ['TIER_0_DETERMINISTIC', 'L1_FAST', 'L2_HEAVY_MOE'],
     preferredModels: {
       TIER_0_DETERMINISTIC: 'alias-ring-v1',
-      L1_FAST: 'gemma4:e4b',
-      L2_HEAVY_MOE: 'qwen3-coder-30b-moe:latest'
-    }
+      L1_FAST: 'gemma4:e2b',
+      L2_HEAVY_MOE: 'qwen3-coder-30b-moe:latest',
+      ...THREE_CHAIR_MODELS
+    },
+    threeChairModels: THREE_CHAIR_MODELS
   },
   'financial-integer-ledger': {
     id: 'financial-integer-ledger',
     category: 'finance',
+    domain: 'finance',
     description:
       'Exact integer minor-unit fee allocation, conservation-of-cents, and settlement reconciliation',
-    invariants: {
-      cadenceMs: null,
-      requireMonotonicTimestamps: false,
-      preserveNegativeValues: false,
-      nanInfPolicy: 'reject',
-      anomalyMethod: 'exact-conservation',
-      integerMinorUnitsOnly: true
-    },
+    summary:
+      'Exact integer minor-unit fee allocation, conservation-of-cents, and settlement reconciliation',
+    invariants: FINANCIAL_LEDGER_INVARIANTS,
+    numericalInvariants: FINANCIAL_LEDGER_INVARIANTS,
     cascadeTiers: ['TIER_0_DETERMINISTIC', 'L2_HEAVY_MOE'],
     preferredModels: {
       TIER_0_DETERMINISTIC: 'alias-ring-v1',
-      L2_HEAVY_MOE: 'qwen3-coder-30b-moe:latest'
-    }
+      L1_FAST: 'gemma4:e2b',
+      L2_HEAVY_MOE: 'qwen3-coder-30b-moe:latest',
+      ...THREE_CHAIR_MODELS
+    },
+    threeChairModels: THREE_CHAIR_MODELS
   },
   'cross-stack-schema-adapter': {
     id: 'cross-stack-schema-adapter',
     category: 'adapter',
+    domain: 'adapter',
     description:
       'Zero-upload hexagonal binding synthesis across Node ESM, TypeScript, Edge, and Python FastAPI',
-    invariants: {
-      cadenceMs: null,
-      requireMonotonicTimestamps: false,
-      preserveNegativeValues: true,
-      nanInfPolicy: 'reject',
-      anomalyMethod: 'schema-contract'
-    },
+    summary:
+      'Zero-upload hexagonal binding synthesis across Node ESM, TypeScript, Edge, and Python FastAPI',
+    invariants: CROSS_STACK_ADAPTER_INVARIANTS,
+    numericalInvariants: CROSS_STACK_ADAPTER_INVARIANTS,
     cascadeTiers: ['TIER_0_DETERMINISTIC', 'L1_FAST', 'L2_HEAVY_MOE'],
     preferredModels: {
       TIER_0_DETERMINISTIC: 'alias-ring-v1',
-      L1_FAST: 'gemma4:e4b',
-      L2_HEAVY_MOE: 'qwen3-coder-30b-moe:latest'
-    }
+      L1_FAST: 'gemma4:e2b',
+      L2_HEAVY_MOE: 'qwen3-coder-30b-moe:latest',
+      ...THREE_CHAIR_MODELS
+    },
+    threeChairModels: THREE_CHAIR_MODELS
   },
   'channel-security-normalizer': {
     id: 'channel-security-normalizer',
     category: 'security',
+    domain: 'security',
     description:
       'Inbound webhook/workspace HMAC verification, replay-window enforcement, and PII-safe normalization',
-    invariants: {
-      cadenceMs: null,
-      requireMonotonicTimestamps: true,
-      preserveNegativeValues: false,
-      nanInfPolicy: 'reject',
-      anomalyMethod: 'replay-window-hmac'
-    },
+    summary:
+      'Inbound webhook/workspace HMAC verification, replay-window enforcement, and PII-safe normalization',
+    invariants: CHANNEL_SECURITY_INVARIANTS,
+    numericalInvariants: CHANNEL_SECURITY_INVARIANTS,
     cascadeTiers: ['TIER_0_DETERMINISTIC', 'L1_FAST'],
     preferredModels: {
       TIER_0_DETERMINISTIC: 'alias-ring-v1',
-      L1_FAST: 'gemma4:e4b'
-    }
+      L1_FAST: 'gemma4:e2b',
+      L2_HEAVY_MOE: 'qwen3-coder-30b-moe:latest',
+      ...THREE_CHAIR_MODELS
+    },
+    threeChairModels: THREE_CHAIR_MODELS
   }
 });
 
@@ -872,412 +744,6 @@ const GLOBAL_FIELD_ALIAS_MAP = (() => {
   }
   return map;
 })();
-
-function isIdentStart(code) {
-  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 36;
-}
-
-function isIdentPart(code) {
-  return isIdentStart(code) || (code >= 48 && code <= 57);
-}
-
-function consumeTemplateBody(source, startIdx, out, templateBraceStack, currentBraceDepth) {
-  const len = source.length;
-  let i = startIdx;
-  while (i < len) {
-    const c = source[i];
-    if (c === '\\' && i + 1 < len) {
-      out.push(c, source[i + 1]);
-      i += 2;
-      continue;
-    }
-    if (c === '`') {
-      out.push(c);
-      return i + 1;
-    }
-    if (c === '$' && source[i + 1] === '{') {
-      out.push('$', '{');
-      templateBraceStack.push(currentBraceDepth);
-      return i + 2;
-    }
-    out.push(c);
-    i += 1;
-  }
-  return i;
-}
-
-/**
- * Strip JS/TS comments while tracking regex literals (`canStartRegex`) and nested `${...}` templates.
- * Matches `@krusch/toolkit/brick-exchange/ontology` lexical parity (`ARCH-01`).
- * @param {string} source
- * @returns {string}
- */
-function stripCommentsPreservingLiterals(source) {
-  const len = source.length;
-  const out = [];
-  let i = 0;
-  let canStartRegex = true;
-  let braceDepth = 0;
-  const templateBraceStack = [];
-
-  while (i < len) {
-    const ch = source[i];
-    const next = i + 1 < len ? source[i + 1] : '';
-
-    if (ch === '/' && next === '/') {
-      out.push(' ', ' ');
-      i += 2;
-      while (i < len && source[i] !== '\n') {
-        out.push(source[i] === '\r' ? '\r' : ' ');
-        i += 1;
-      }
-      continue;
-    }
-
-    if (ch === '/' && next === '*') {
-      out.push(' ', ' ');
-      i += 2;
-      while (i < len) {
-        if (source[i] === '*' && source[i + 1] === '/') {
-          out.push(' ', ' ');
-          i += 2;
-          break;
-        }
-        out.push(source[i] === '\n' || source[i] === '\r' ? source[i] : ' ');
-        i += 1;
-      }
-      continue;
-    }
-
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      out.push(ch);
-      i += 1;
-      while (i < len) {
-        const c = source[i];
-        out.push(c);
-        i += 1;
-        if (c === '\\' && i < len) {
-          out.push(source[i]);
-          i += 1;
-          continue;
-        }
-        if (c === quote) break;
-      }
-      canStartRegex = false;
-      continue;
-    }
-
-    if (ch === '`') {
-      out.push(ch);
-      i = consumeTemplateBody(source, i + 1, out, templateBraceStack, braceDepth);
-      canStartRegex = templateBraceStack.length > 0;
-      continue;
-    }
-
-    if (
-      ch === '}' &&
-      templateBraceStack.length > 0 &&
-      braceDepth === templateBraceStack[templateBraceStack.length - 1]
-    ) {
-      templateBraceStack.pop();
-      out.push(ch);
-      i = consumeTemplateBody(source, i + 1, out, templateBraceStack, braceDepth);
-      canStartRegex = templateBraceStack.length > 0;
-      continue;
-    }
-
-    if (ch === '/' && canStartRegex && next !== '/' && next !== '*') {
-      out.push(ch);
-      i += 1;
-      let inCharClass = false;
-      while (i < len) {
-        const c = source[i];
-        out.push(c);
-        i += 1;
-        if (c === '\\' && i < len) {
-          out.push(source[i]);
-          i += 1;
-          continue;
-        }
-        if (c === '[') inCharClass = true;
-        else if (c === ']') inCharClass = false;
-        else if (c === '/' && !inCharClass) {
-          while (i < len && isIdentPart(source.charCodeAt(i))) {
-            out.push(source[i]);
-            i += 1;
-          }
-          break;
-        } else if (c === '\n' || c === '\r') {
-          break;
-        }
-      }
-      canStartRegex = false;
-      continue;
-    }
-
-    if (isIdentStart(ch.charCodeAt(0))) {
-      const start = i;
-      while (i < len && isIdentPart(source.charCodeAt(i))) {
-        out.push(source[i]);
-        i += 1;
-      }
-      const word = source.slice(start, i);
-      canStartRegex = REGEX_PRECEDING_KEYWORDS.has(word);
-      continue;
-    }
-
-    if (ch >= '0' && ch <= '9') {
-      while (i < len && (isIdentPart(source.charCodeAt(i)) || source[i] === '.')) {
-        out.push(source[i]);
-        i += 1;
-      }
-      canStartRegex = false;
-      continue;
-    }
-
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') {
-      out.push(ch);
-      i += 1;
-      continue;
-    }
-
-    if (ch === '{') {
-      braceDepth += 1;
-      canStartRegex = true;
-    } else if (ch === '}') {
-      braceDepth = Math.max(0, braceDepth - 1);
-      canStartRegex = false;
-    } else if (ch === ')' || ch === ']') {
-      canStartRegex = false;
-    } else if ((ch === '+' && next === '+') || (ch === '-' && next === '-')) {
-      out.push(ch, next);
-      i += 2;
-      canStartRegex = false;
-      continue;
-    } else {
-      canStartRegex = true;
-    }
-
-    out.push(ch);
-    i += 1;
-  }
-
-  return out.join('');
-}
-
-/**
- * Mask string and template literal text while keeping `${...}` expressions intact.
- * @param {string} commentStrippedCode
- * @returns {string}
- */
-function maskStringAndTemplateBodies(commentStrippedCode) {
-  const len = commentStrippedCode.length;
-  const out = [];
-  let i = 0;
-
-  while (i < len) {
-    const ch = commentStrippedCode[i];
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      out.push(quote);
-      i += 1;
-      while (i < len) {
-        const c = commentStrippedCode[i];
-        if (c === '\\' && i + 1 < len) {
-          out.push(' ', ' ');
-          i += 2;
-          continue;
-        }
-        if (c === quote) {
-          out.push(quote);
-          i += 1;
-          break;
-        }
-        out.push(c === '\n' ? '\n' : ' ');
-        i += 1;
-      }
-      continue;
-    }
-    if (ch === '`') {
-      out.push('`');
-      i += 1;
-      while (i < len) {
-        const c = commentStrippedCode[i];
-        if (c === '\\' && i + 1 < len) {
-          out.push(' ', ' ');
-          i += 2;
-          continue;
-        }
-        if (c === '`') {
-          out.push('`');
-          i += 1;
-          break;
-        }
-        if (c === '$' && commentStrippedCode[i + 1] === '{') {
-          out.push('$', '{');
-          i += 2;
-          let depth = 1;
-          while (i < len && depth > 0) {
-            const inner = commentStrippedCode[i];
-            if (inner === '{') depth += 1;
-            else if (inner === '}') depth -= 1;
-            else if (inner === "'" || inner === '"' || inner === '`') {
-              // Recursively mask nested string literals inside ${...}
-              const subQuote = inner;
-              out.push(subQuote);
-              i += 1;
-              while (i < len) {
-                const sc = commentStrippedCode[i];
-                if (sc === '\\' && i + 1 < len) {
-                  out.push(' ', ' ');
-                  i += 2;
-                  continue;
-                }
-                if (sc === subQuote) {
-                  out.push(subQuote);
-                  i += 1;
-                  break;
-                }
-                if (subQuote === '`' && sc === '$' && commentStrippedCode[i + 1] === '{') {
-                  out.push('$', '{');
-                  depth += 1;
-                  i += 2;
-                  break;
-                }
-                out.push(sc === '\n' ? '\n' : ' ');
-                i += 1;
-              }
-              continue;
-            }
-            out.push(inner);
-            i += 1;
-          }
-          continue;
-        }
-        out.push(c === '\n' ? '\n' : ' ');
-        i += 1;
-      }
-      continue;
-    }
-    out.push(ch);
-    i += 1;
-  }
-
-  return out.join('');
-}
-
-/**
- * Scan JS/TS source code for Node-specific modules or host globals that violate Web-Standard Edge/Browser purity (`ARCH-01`).
- * @param {unknown} source
- * @returns {{ pure: boolean, violations: string[] }}
- */
-function scanWebStandardPurity(source) {
-  if (typeof source !== 'string' || !source.trim()) {
-    return { pure: false, violations: ['EMPTY_OR_NON_STRING_SOURCE'] };
-  }
-
-  const violations = [];
-  const pushViolation = (v) => {
-    if (!violations.includes(v)) violations.push(v);
-  };
-
-  const commentStripped = stripCommentsPreservingLiterals(source)
-    .replace(/\bimport\s+type\s+(?:[\s\S]*?\s+from\s+)?(['"`])[^'"`]+\1\s*;?/g, ' ')
-    .replace(/\bexport\s+type\s+\{[\s\S]*?\}(?:\s+from\s+(['"`])[^'"`]+\1)?\s*;?/g, ' ');
-
-  const inspectSpecifier = (rawSpec) => {
-    const spec = String(rawSpec || '').trim();
-    if (!spec) return;
-    if (spec.startsWith('node:')) {
-      pushViolation(`node-specifier:${spec}`);
-      return;
-    }
-    const baseMod = spec.split('/')[0];
-    if (NODE_BUILTIN_MODULES.has(spec) || NODE_BUILTIN_MODULES.has(baseMod)) {
-      pushViolation(`node-builtin:${spec}`);
-    }
-  };
-
-  let match;
-  const staticImportRe = /\bimport\s+(?!type\b)[\s\S]*?\bfrom\s*(['"`])([^'"`]+)\1/g;
-  while ((match = staticImportRe.exec(commentStripped)) !== null) {
-    inspectSpecifier(match[2]);
-  }
-
-  const sideEffectImportRe = /\bimport\s*(['"`])([^'"`]+)\1/g;
-  while ((match = sideEffectImportRe.exec(commentStripped)) !== null) {
-    inspectSpecifier(match[2]);
-  }
-
-  const reExportRe =
-    /\bexport\s+(?!type\b)(?:\*(?:\s+as\s+[A-Za-z_$][A-Za-z0-9_$]*)?|\{[\s\S]*?\})\s*from\s*(['"`])([^'"`]+)\1/g;
-  while ((match = reExportRe.exec(commentStripped)) !== null) {
-    inspectSpecifier(match[2]);
-  }
-
-  const dynImportRe = /(?<!(?:\.\s*|\?\.\s*|function\s+))\bimport\s*\(\s*(['"`])([^'"`$]+)\1\s*\)/g;
-  while ((match = dynImportRe.exec(commentStripped)) !== null) {
-    inspectSpecifier(match[2]);
-  }
-
-  if (/(?<!(?:\.\s*|\?\.\s*|function\s+))\bimport\s*\(\s*`node:/.test(commentStripped)) {
-    pushViolation('node-specifier:node:*');
-  }
-
-  const requireRe = /(?<!(?:\.\s*|\?\.\s*|function\s+))\brequire\s*\(\s*(['"`])([^'"`]+)\1\s*\)/g;
-  while ((match = requireRe.exec(commentStripped)) !== null) {
-    inspectSpecifier(match[2]);
-  }
-
-  const codeOnly = maskStringAndTemplateBodies(commentStripped);
-
-  if (
-    /(?<!(?:\.\s*|\?\.\s*))\bprocess\s*(?:\.|\[)/.test(codeOnly) ||
-    /\b(?:globalThis|global|window|self)\s*\.\s*process\b/.test(codeOnly) ||
-    /\b(?:globalThis|global|window|self)\s*\[\s*['"`]process['"`]\s*\]/.test(commentStripped) ||
-    /(?:=\s*|\(\s*|\[\s*|,\s*|return\s+)(?:(?:globalThis|global)\s*\.\s*)?process\b(?!\s*[:(])/.test(
-      codeOnly
-    )
-  ) {
-    pushViolation('node-global:process');
-  }
-
-  if (
-    /(?<!(?:\.\s*|\?\.\s*|interface\s+|type\s+|class\s+|function\s+))\bBuffer\s*(?:\.|\(|\[)/.test(
-      codeOnly
-    ) ||
-    /\bnew\s+Buffer\s*\(/.test(codeOnly) ||
-    /\b(?:globalThis|global|window|self)\s*\.\s*Buffer\b/.test(codeOnly) ||
-    /\b(?:globalThis|global|window|self)\s*\[\s*['"`]Buffer['"`]\s*\]/.test(commentStripped) ||
-    /(?:=\s*|\(\s*|\[\s*|,\s*|return\s+)Buffer\b(?!\s*:)/.test(codeOnly)
-  ) {
-    pushViolation('node-global:Buffer');
-  }
-
-  if (/(?<![.\w$])(?:__dirname|__filename)\b/.test(codeOnly)) {
-    pushViolation('node-global:__dirname/__filename');
-  }
-
-  if (/(?<!(?:\.\s*|\?\.\s*|function\s+))\brequire\s*\(/.test(codeOnly)) {
-    pushViolation('node-global:require');
-  }
-
-  return {
-    pure: violations.length === 0,
-    violations
-  };
-}
-
-/**
- * Check whether a brick's source uses pure Web-Standard ECMAScript / Web APIs
- * with zero `node:*` built-ins, `process.*`, `Buffer`, or CommonJS `require`.
- * @param {string} source
- * @returns {boolean}
- */
-export function isWebStandardPureBrickSource(source) {
-  return scanWebStandardPurity(source).pure;
-}
 
 function isCanonicalSharedPortName(bareName) {
   return Object.hasOwn(STACK_ONTOLOGY_PORTS, bareName) || TOOL_GRAPH_SHARED_PORT_SET.has(bareName);
@@ -1430,19 +896,6 @@ export function surrogateOntologyVertexId(namespace, logicalId) {
   );
 }
 
-/**
- * Scrub accidental private network IPs, secret tokens, or host user paths from ontology graph strings.
- * @param {unknown} value
- * @returns {string}
- */
-function scrubOntologyString(value) {
-  if (typeof value !== 'string' || !value) return '';
-  return value
-    .replace(SCRUB_PRIVATE_IPV4_RE, '[REDACTED_PRIVATE_IP]')
-    .replace(SCRUB_SECRET_TOKEN_RE, '[REDACTED_SECRET]')
-    .replace(SCRUB_LOCAL_HOME_PATH_RE, '[REDACTED_PATH]');
-}
-
 function normalizeIsoDateString(rawDate) {
   if (typeof rawDate !== 'string') {
     return null;
@@ -1475,8 +928,9 @@ function normalizeIsoDateString(rawDate) {
 }
 
 /**
- * Validate and normalize 4-axis ontology metadata for a candidate or sealed brick (`SEC-02`, `ARCH-01`).
- * Fails closed on forbidden keys, unknown stacks/channels/MoE profiles, invalid ports, or non-hash supersedes refs.
+ * Validate and normalize 4-axis ontology metadata for a candidate or sealed brick (`SEC-02`, `SEC-08`, `ARCH-01`).
+ * Fails closed on forbidden keys, unknown stacks/channels/MoE profiles, Web-Standard purity violations
+ * on explicitly declared edge/browser stacks, invalid ports, or non-hash supersedes refs.
  *
  * @param {object} [rawOntology={}]
  * @param {{ source?: string, blueprint?: object }} [options={}]
@@ -1495,6 +949,7 @@ export function normalizeBrickOntology(rawOntology = {}, options = {}) {
   const opts = isPlainObject(options) ? options : {};
   const blueprint = isPlainObject(opts.blueprint) ? opts.blueprint : {};
   const source = typeof opts.source === 'string' ? opts.source : '';
+  const hasNonEmptySource = typeof opts.source === 'string' && opts.source.trim().length > 0;
 
   const languageRaw = String(blueprint.language || rawOntology.language || 'js')
     .trim()
@@ -1502,7 +957,7 @@ export function normalizeBrickOntology(rawOntology = {}, options = {}) {
   const isPythonBrick = languageRaw === 'py' || languageRaw === 'python';
   const webStandardPurity = isPythonBrick
     ? { pure: false, violations: ['PYTHON_RUNTIME'] }
-    : typeof opts.source === 'string' && opts.source.trim().length > 0
+    : hasNonEmptySource
       ? scanWebStandardPurity(source)
       : { pure: true, violations: [] };
 
@@ -1539,6 +994,25 @@ export function normalizeBrickOntology(rawOntology = {}, options = {}) {
           `Unknown ontology stack "${String(item)}"`,
           { stack: item, supportedStacks: Object.keys(STACK_ONTOLOGY_STACKS) }
         );
+      }
+      if (hasNonEmptySource) {
+        const stackDef = STACK_ONTOLOGY_STACKS[slug];
+        if (isPythonBrick && stackDef.runtimeFamily !== 'python') {
+          return failEnvelope(
+            tool,
+            'STACK_RUNTIME_INCOMPATIBLE',
+            `Python brick source cannot declare incompatible JS/Edge ontology stack "${slug}"`,
+            { stack: slug, violations: ['PYTHON_TO_JS_RUNTIME_MISMATCH'] }
+          );
+        }
+        if (stackDef.requiresWebStandardPurity && !webStandardPurity.pure) {
+          return failEnvelope(
+            tool,
+            'STACK_RUNTIME_INCOMPATIBLE',
+            `Brick source violates Web-Standard purity required by declared ontology stack "${slug}" (${webStandardPurity.violations.join(', ')})`,
+            { stack: slug, violations: webStandardPurity.violations }
+          );
+        }
       }
       if (!seen.has(slug)) {
         seen.add(slug);
@@ -1770,6 +1244,8 @@ export function normalizeBrickOntology(rawOntology = {}, options = {}) {
     webStandardPurity
   });
 }
+
+registerDefaultOntologyNormalizer(normalizeBrickOntology);
 
 function normalizeStringList(raw) {
   if (!raw) return [];
@@ -2360,7 +1836,14 @@ export function checkBrickOntologyCompatibility(options = {}) {
 
     if (enforceChannelGuards === true && requiredSecurityBricks.length > 0) {
       const providedList = normalizeStringList(providedSecurityBricks);
-      const providedSet = new Set(providedList);
+      const hasAttestedMetadataHash =
+        parsed.isSealedBundle === true &&
+        typeof parsed.bundle?.lineage?.metadataHash === 'string' &&
+        parsed.bundle.lineage.metadataHash.length > 0;
+      const attestedCapabilities = hasAttestedMetadataHash
+        ? normalizeStringList(parsed.bundle.capabilities)
+        : [];
+      const providedSet = new Set([...providedList, ...attestedCapabilities]);
       const guardSatisfied = channelDef.acceptedGuardTokens.some((tok) => providedSet.has(tok));
       if (!guardSatisfied) {
         return failEnvelope(
@@ -2748,8 +2231,8 @@ export function composeCrossStackBricks(options = {}) {
       for (const older of parsedBricks) {
         if (older.logicalId === newer.logicalId) continue;
         if (!matchesSupersedesRef(older, ref)) continue;
-        // Enforce same-org boundary so one org cannot retire another org's brick
-        if (newer.orgId && older.orgId && newer.orgId !== older.orgId) {
+        // Enforce strict same-org boundary so empty orgId cannot retire an org-owned brick and vice versa (`SEC-08`)
+        if (String(newer.orgId || '') !== String(older.orgId || '')) {
           continue;
         }
         // Prevent cycles (`older ->* newer` already present)
@@ -3071,37 +2554,74 @@ export function composeCrossStackBricks(options = {}) {
   );
 }
 
-function extractInputSchemaShape(inputSchema) {
+function classifySchemaNumericProps(props, consumesPorts = []) {
+  const integerSet = new Set();
+  const floatSet = new Set();
+
+  for (const [k, desc] of Object.entries(props)) {
+    if (FORBIDDEN_KEYS.has(k) || !isPlainObject(desc)) continue;
+    const types = Array.isArray(desc.type) ? desc.type : [desc.type];
+    if (types.includes('integer') && !types.includes('number')) {
+      integerSet.add(k);
+    } else if (types.includes('number')) {
+      floatSet.add(k);
+    }
+  }
+
+  for (const portId of consumesPorts) {
+    const parsedPort = parsePortReference(portId);
+    const portKey = parsedPort?.shared ? parsedPort.bareName : portId;
+    const portDef = STACK_ONTOLOGY_PORTS[portKey];
+    if (!portDef) continue;
+    for (const [canonKey, fieldSpec] of Object.entries(portDef.canonicalFields)) {
+      if (FORBIDDEN_KEYS.has(canonKey) || integerSet.has(canonKey) || floatSet.has(canonKey)) {
+        continue;
+      }
+      if (fieldSpec.type === 'integer') {
+        integerSet.add(canonKey);
+      } else if (fieldSpec.type === 'number') {
+        floatSet.add(canonKey);
+      }
+    }
+  }
+
+  const integerFields = [...integerSet];
+  const floatFields = [...floatSet];
+  return {
+    integerFields,
+    floatFields,
+    numericFields: [...integerFields, ...floatFields]
+  };
+}
+
+function extractInputSchemaShape(inputSchema, consumesPorts = []) {
   if (!isPlainObject(inputSchema)) {
+    const classified = classifySchemaNumericProps({}, consumesPorts);
     return {
       properties: {},
       additionalProperties: true,
-      numericFields: [],
+      ...classified,
       isArrayInput: false
     };
   }
 
   if (inputSchema.type === 'array' && isPlainObject(inputSchema.items)) {
     const props = isPlainObject(inputSchema.items.properties) ? inputSchema.items.properties : {};
-    const numericFields = Object.entries(props)
-      .filter(([, desc]) => isPlainObject(desc) && (desc.type === 'number' || desc.type === 'integer'))
-      .map(([k]) => k);
+    const classified = classifySchemaNumericProps(props, consumesPorts);
     return {
       properties: props,
       additionalProperties: inputSchema.items.additionalProperties !== false,
-      numericFields,
+      ...classified,
       isArrayInput: true
     };
   }
 
   const props = isPlainObject(inputSchema.properties) ? inputSchema.properties : {};
-  const numericFields = Object.entries(props)
-    .filter(([, desc]) => isPlainObject(desc) && (desc.type === 'number' || desc.type === 'integer'))
-    .map(([k]) => k);
+  const classified = classifySchemaNumericProps(props, consumesPorts);
   return {
     properties: props,
     additionalProperties: inputSchema.additionalProperties !== false,
-    numericFields,
+    ...classified,
     isArrayInput: false
   };
 }
@@ -3329,7 +2849,10 @@ function brickSupportsNativeSkipHeaderRow(parsedBrick, bindingOverrides) {
 }
 
 function adaptSampleWithInferredRules(localSample, explicitFieldMap, parsedBrick, bindingOverrides = {}) {
-  const schemaInfo = extractInputSchemaShape(parsedBrick.blueprint?.inputSchema);
+  const schemaInfo = extractInputSchemaShape(
+    parsedBrick.blueprint?.inputSchema,
+    parsedBrick.consumesPorts
+  );
   const nativeSkipHeader = brickSupportsNativeSkipHeaderRow(parsedBrick, bindingOverrides);
 
   if (localSample === undefined || localSample === null) {
@@ -3526,11 +3049,47 @@ function toPythonLiteral(value) {
   return JSON.stringify(String(value));
 }
 
+function buildResolvedCanonicalToLocalMap(localToCanonicalMap) {
+  const out = {};
+  if (!isPlainObject(localToCanonicalMap)) {
+    return out;
+  }
+  for (const [localKey, canonicalKey] of Object.entries(localToCanonicalMap)) {
+    if (FORBIDDEN_KEYS.has(localKey) || FORBIDDEN_KEYS.has(canonicalKey)) continue;
+    if (!Object.hasOwn(out, canonicalKey)) {
+      defineSafeProp(out, canonicalKey, localKey);
+    }
+  }
+  return out;
+}
+
+function scrubBindingValuesDeep(value) {
+  if (typeof value === 'string') {
+    return scrubOntologyString(value);
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => scrubBindingValuesDeep(item));
+  }
+  if (!isPlainObject(value)) {
+    return value;
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (FORBIDDEN_KEYS.has(k)) continue;
+    defineSafeProp(out, k, scrubBindingValuesDeep(v));
+  }
+  return out;
+}
+
 function renderJsOrTsBindingSource({
   parsedBrick,
   targetStack,
   resolvedBinding,
   fieldMap,
+  resolvedFieldMap,
   hasHeaderRow,
   dropObjectHeaderRow,
   expectsPointsWrapper,
@@ -3549,8 +3108,11 @@ function renderJsOrTsBindingSource({
   const allowedKeys = Object.keys(schemaInfo.properties).filter((k) => !FORBIDDEN_KEYS.has(k));
   const stripUnknown = schemaInfo.additionalProperties === false && allowedKeys.length > 0;
 
-  const typeBlock = isTs ? `\nexport type AnyRecord = Record<string, unknown>;\n` : '';
+  const typeBlock = isTs
+    ? `\nexport type AnyRecord = Record<string, unknown>;\nexport type BoundBrickFn = (input: unknown, bindingConfig?: AnyRecord) => unknown;\n`
+    : '';
   const rawParamSig = isTs ? 'raw: unknown' : 'raw';
+  const extraBindingParamSig = isTs ? 'extraBinding?: AnyRecord' : 'extraBinding = undefined';
   const rowsParamSig = isTs ? 'rows: unknown[]' : 'rows';
   const returnObjSig = isTs ? ': unknown' : '';
 
@@ -3560,12 +3122,20 @@ function renderJsOrTsBindingSource({
     typeBlock.trimEnd(),
     `const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);`,
     `const ALLOWED_SCHEMA_KEYS = new Set(${JSON.stringify(allowedKeys)});`,
+    `const INTEGER_HEADER_FIELDS = new Set(${JSON.stringify(schemaInfo.integerFields || [])});`,
     `const NUMERIC_HEADER_FIELDS = new Set(${JSON.stringify(schemaInfo.numericFields)});`,
     `const STRIP_UNKNOWN_KEYS = ${stripUnknown ? 'true' : 'false'};`,
     `const DROP_OBJECT_HEADER_ROW = ${dropObjectHeaderRow ? 'true' : 'false'};`,
     `export const binding = Object.freeze(${JSON.stringify(resolvedBinding, null, 2)});`,
     `export const fieldMap = Object.freeze(${JSON.stringify(fieldMap, null, 2)});`,
+    `export const FIELD_MAP = Object.freeze(${JSON.stringify(resolvedFieldMap, null, 2)});`,
     `export const hasHeaderRow = ${Boolean(hasHeaderRow)};`,
+    ``,
+    `function coerceNumericHeaderString(${isTs ? 'val: string, fieldName: string' : 'val, fieldName'}) {`,
+    `  const parsed = Number(val);`,
+    `  if (!Number.isFinite(parsed)) return 0;`,
+    `  return INTEGER_HEADER_FIELDS.has(fieldName) ? Math.trunc(parsed) : parsed;`,
+    `}`,
     ``,
     `function isObjectHeaderUnitRow(${isTs ? 'rows: unknown[]' : 'rows'}) {`,
     `  if (!Array.isArray(rows) || rows.length < 2) return false;`,
@@ -3576,7 +3146,7 @@ function renderJsOrTsBindingSource({
     `    if (FORBIDDEN_KEYS.has(k)) continue;`,
     `    const v0 = (r0${isTs ? ' as AnyRecord' : ''})[k];`,
     `    const v1 = (r1${isTs ? ' as AnyRecord' : ''})[k];`,
-    `    if (typeof v0 === 'string' && v0.trim().length > 0 && Number.isNaN(Number(v0)) && typeof v1 === 'number' && Number.isFinite(v1)) {`,
+    `    if (typeof v0 === 'string' && v0.trim().length > 0 && !Number.isFinite(Number(v0)) && typeof v1 === 'number' && Number.isFinite(v1)) {`,
     `      return true;`,
     `    }`,
     `  }`,
@@ -3590,8 +3160,7 @@ function renderJsOrTsBindingSource({
     `    if (Object.hasOwn(obj, localKey)) {`,
     `      let val = Object.hasOwn(obj, canonical) ? obj[canonical] : obj[localKey];`,
     `      if (coerceHeaderNumeric && NUMERIC_HEADER_FIELDS.has(canonical) && typeof val === 'string') {`,
-    `        const parsed = Number(val);`,
-    `        val = Number.isFinite(parsed) ? parsed : 0;`,
+    `        val = coerceNumericHeaderString(val, canonical);`,
     `      }`,
     `      Object.defineProperty(out, canonical, { value: val, enumerable: true, writable: true, configurable: true });`,
     `    }`,
@@ -3601,8 +3170,7 @@ function renderJsOrTsBindingSource({
     `    if (STRIP_UNKNOWN_KEYS && !ALLOWED_SCHEMA_KEYS.has(key)) continue;`,
     `    let val = obj[key];`,
     `    if (coerceHeaderNumeric && NUMERIC_HEADER_FIELDS.has(key) && typeof val === 'string') {`,
-    `      const parsed = Number(val);`,
-    `      val = Number.isFinite(parsed) ? parsed : 0;`,
+    `      val = coerceNumericHeaderString(val, key);`,
     `    }`,
     `    Object.defineProperty(out, key, { value: val, enumerable: true, writable: true, configurable: true });`,
     `  }`,
@@ -3646,8 +3214,30 @@ function renderJsOrTsBindingSource({
     `  return rows.map((row) => adaptInput(row));`,
     `}`,
     ``,
-    `export function invokeAdaptedBrick(${rawParamSig}) {`,
-    `  return brickEntry(adaptInput(raw), binding);`,
+    `function mergeRuntimeBinding(${isTs ? 'extra?: AnyRecord' : 'extra'}) {`,
+    `  if (!extra || typeof extra !== 'object' || Array.isArray(extra)) return binding;`,
+    `  const keys = Object.keys(extra).filter((k) => !FORBIDDEN_KEYS.has(k));`,
+    `  if (keys.length === 0) return binding;`,
+    `  const merged${isTs ? ': AnyRecord' : ''} = { ...binding };`,
+    `  for (const k of keys) {`,
+    `    Object.defineProperty(merged, k, { value: extra[k], enumerable: true, writable: true, configurable: true });`,
+    `  }`,
+    `  return Object.freeze(merged);`,
+    `}`,
+    ``,
+    `export function invokeAdaptedBrick(${rawParamSig}, ${extraBindingParamSig}) {`,
+    `  return brickEntry(adaptInput(raw), mergeRuntimeBinding(extraBinding));`,
+    `}`,
+    ``,
+    `export function invokeBoundBrick(${
+      isTs
+        ? 'brickFnOrRaw: BoundBrickFn | unknown, maybeRaw?: unknown, extraBinding?: AnyRecord'
+        : 'brickFnOrRaw, maybeRaw = undefined, extraBinding = undefined'
+    }) {`,
+    `  if (typeof brickFnOrRaw === 'function') {`,
+    `    return (brickFnOrRaw${isTs ? ' as BoundBrickFn' : ''})(adaptInput(maybeRaw), mergeRuntimeBinding(extraBinding));`,
+    `  }`,
+    `  return invokeAdaptedBrick(brickFnOrRaw, ${isTs ? 'maybeRaw as AnyRecord | undefined' : 'maybeRaw'});`,
     `}`,
     ``
   ]
@@ -3659,6 +3249,7 @@ function renderPythonBindingAdapterSource({
   parsedBrick,
   resolvedBinding,
   fieldMap,
+  resolvedFieldMap,
   hasHeaderRow,
   dropObjectHeaderRow,
   expectsPointsWrapper,
@@ -3666,23 +3257,49 @@ function renderPythonBindingAdapterSource({
 }) {
   const allowedKeys = Object.keys(schemaInfo.properties).filter((k) => !FORBIDDEN_KEYS.has(k));
   const stripUnknown = schemaInfo.additionalProperties === false && allowedKeys.length > 0;
+  const integerFields = Array.isArray(schemaInfo.integerFields) ? schemaInfo.integerFields : [];
+  const floatFields = Array.isArray(schemaInfo.floatFields) ? schemaInfo.floatFields : [];
 
   return [
     `"""Zero-upload hexagonal Python contract adapter for sealed brick ${JSON.stringify(parsedBrick.brickId)}."""`,
     `from __future__ import annotations`,
     ``,
+    `import math`,
     `from typing import Any, Mapping, Sequence`,
     ``,
     `BRICK_ID: str = ${toPythonLiteral(parsedBrick.brickId)}`,
     `SOURCE_HASH: str = ${toPythonLiteral(parsedBrick.sourceHash)}`,
     `FORBIDDEN_KEYS: frozenset[str] = frozenset({"__proto__", "constructor", "prototype"})`,
     `ALLOWED_SCHEMA_KEYS: frozenset[str] = frozenset(${toPythonLiteral(allowedKeys)})`,
+    `INTEGER_HEADER_FIELDS: frozenset[str] = frozenset(${toPythonLiteral(integerFields)})`,
+    `FLOAT_HEADER_FIELDS: frozenset[str] = frozenset(${toPythonLiteral(floatFields)})`,
     `NUMERIC_HEADER_FIELDS: frozenset[str] = frozenset(${toPythonLiteral(schemaInfo.numericFields)})`,
     `STRIP_UNKNOWN_KEYS: bool = ${toPythonLiteral(stripUnknown)}`,
     `DROP_OBJECT_HEADER_ROW: bool = ${toPythonLiteral(Boolean(dropObjectHeaderRow))}`,
     `BINDING_CONFIG: dict[str, Any] = ${toPythonLiteral(resolvedBinding)}`,
     `FIELD_MAP: dict[str, str] = ${toPythonLiteral(fieldMap)}`,
+    `RESOLVED_FIELD_MAP: dict[str, str] = ${toPythonLiteral(resolvedFieldMap)}`,
     `HAS_HEADER_ROW: bool = ${toPythonLiteral(Boolean(hasHeaderRow))}`,
+    ``,
+    ``,
+    `def _coerce_header_numeric_str(raw_val: str, field_name: str) -> int | float:`,
+    `    text = raw_val.strip()`,
+    `    if not text:`,
+    `        return 0`,
+    `    if field_name in INTEGER_HEADER_FIELDS:`,
+    `        try:`,
+    `            return int(text, 10)`,
+    `        except ValueError:`,
+    `            try:`,
+    `                parsed_f = float(text)`,
+    `                return int(parsed_f) if math.isfinite(parsed_f) else 0`,
+    `            except ValueError:`,
+    `                return 0`,
+    `    try:`,
+    `        parsed = float(text)`,
+    `        return parsed if math.isfinite(parsed) else 0`,
+    `    except ValueError:`,
+    `        return 0`,
     ``,
     ``,
     `def _is_object_header_unit_row(rows: Sequence[Any]) -> bool:`,
@@ -3695,7 +3312,9 @@ function renderPythonBindingAdapterSource({
     `        v1 = r1.get(key)`,
     `        if isinstance(v0, str) and v0.strip() and isinstance(v1, (int, float)) and not isinstance(v1, bool):`,
     `            try:`,
-    `                float(v0)`,
+    `                parsed_v0 = float(v0)`,
+    `                if not math.isfinite(parsed_v0):`,
+    `                    return True`,
     `            except ValueError:`,
     `                return True`,
     `    return False`,
@@ -3709,10 +3328,9 @@ function renderPythonBindingAdapterSource({
     `        if local_key in record:`,
     `            val = record[canonical] if canonical in record else record[local_key]`,
     `            if coerce_header_numeric and canonical in NUMERIC_HEADER_FIELDS and isinstance(val, str):`,
-    `                try:`,
-    `                    val = float(val)`,
-    `                except ValueError:`,
-    `                    val = 0`,
+    `                val = _coerce_header_numeric_str(val, canonical)`,
+    `            elif isinstance(val, float) and not math.isfinite(val):`,
+    `                val = 0`,
     `            out[canonical] = val`,
     `    for key, val in record.items():`,
     `        if not isinstance(key, str) or key in FORBIDDEN_KEYS or key in FIELD_MAP or key in out:`,
@@ -3720,10 +3338,9 @@ function renderPythonBindingAdapterSource({
     `        if STRIP_UNKNOWN_KEYS and key not in ALLOWED_SCHEMA_KEYS:`,
     `            continue`,
     `        if coerce_header_numeric and key in NUMERIC_HEADER_FIELDS and isinstance(val, str):`,
-    `            try:`,
-    `                val = float(val)`,
-    `            except ValueError:`,
-    `                val = 0`,
+    `            val = _coerce_header_numeric_str(val, key)`,
+    `        elif isinstance(val, float) and not math.isfinite(val):`,
+    `            val = 0`,
     `        out[key] = val`,
     `    return out`,
     ``,
@@ -3746,7 +3363,10 @@ function renderPythonBindingAdapterSource({
     `                    continue`,
     `                canonical = FIELD_MAP.get(header, header)`,
     `                if canonical not in FORBIDDEN_KEYS and (not STRIP_UNKNOWN_KEYS or canonical in ALLOWED_SCHEMA_KEYS):`,
-    `                    item[canonical] = row[idx] if idx < len(row) else None`,
+    `                    cell_val = row[idx] if idx < len(row) else None`,
+    `                    if isinstance(cell_val, float) and not math.isfinite(cell_val):`,
+    `                        cell_val = 0`,
+    `                    item[canonical] = cell_val`,
     `            mapped_rows.append(item)`,
     `        return ${expectsPointsWrapper ? '{"points": mapped_rows}' : 'mapped_rows'}`,
     `    if isinstance(raw, list):`,
@@ -3766,6 +3386,23 @@ function renderPythonBindingAdapterSource({
     ``,
     `def adapt_batch(rows: Sequence[Any]) -> list[Any]:`,
     `    return [adapt_input(row) for row in rows]`,
+    ``,
+    ``,
+    `def build_mcp_or_http_payload(`,
+    `    raw: Any,`,
+    `    extra_binding: Mapping[str, Any] | None = None,`,
+    `) -> dict[str, Any]:`,
+    `    merged_binding: dict[str, Any] = dict(BINDING_CONFIG)`,
+    `    if extra_binding is not None:`,
+    `        for key, val in extra_binding.items():`,
+    `            if isinstance(key, str) and key not in FORBIDDEN_KEYS:`,
+    `                merged_binding[key] = val`,
+    `    return {`,
+    `        "brickId": BRICK_ID,`,
+    `        "sourceHash": SOURCE_HASH,`,
+    `        "input": adapt_input(raw),`,
+    `        "binding": merged_binding,`,
+    `    }`,
     ``
   ].join('\n');
 }
@@ -3876,7 +3513,7 @@ export async function synthesizeHexagonalBinding(options = {}) {
   const stackDef = STACK_ONTOLOGY_STACKS[cleanStack];
 
   // Resolve schema defaults + bindingOverrides safely via defineSafeProp
-  const resolvedBinding = {};
+  const rawResolvedBinding = {};
   const bindingProps = parsed.blueprint?.bindingSchema?.properties;
   const bindingForbidsAdditional =
     parsed.blueprint?.bindingSchema?.additionalProperties === false && isPlainObject(bindingProps);
@@ -3884,7 +3521,7 @@ export async function synthesizeHexagonalBinding(options = {}) {
   if (isPlainObject(bindingProps)) {
     for (const [k, propSpec] of Object.entries(bindingProps)) {
       if (!FORBIDDEN_KEYS.has(k) && isPlainObject(propSpec) && propSpec.default !== undefined) {
-        defineSafeProp(resolvedBinding, k, propSpec.default);
+        defineSafeProp(rawResolvedBinding, k, propSpec.default);
       }
     }
   }
@@ -3896,24 +3533,28 @@ export async function synthesizeHexagonalBinding(options = {}) {
     !Array.isArray(localSample?.[0]) &&
     (!bindingForbidsAdditional || Object.hasOwn(bindingProps, 'skipHeaderRow'))
   ) {
-    defineSafeProp(resolvedBinding, 'skipHeaderRow', true);
+    defineSafeProp(rawResolvedBinding, 'skipHeaderRow', true);
   }
 
   for (const [k, v] of Object.entries(bindingOverrides)) {
     if (!FORBIDDEN_KEYS.has(k) && v !== undefined) {
-      defineSafeProp(resolvedBinding, k, v);
+      defineSafeProp(rawResolvedBinding, k, v);
     }
   }
 
+  // INV-STACK-04: Scrub accidental private network IPs, secrets, or OS home paths from binding & adapter source!
+  const resolvedBinding = scrubBindingValuesDeep(rawResolvedBinding);
+  const resolvedFieldMap = buildResolvedCanonicalToLocalMap(adaptation.fieldMap);
   const expectsPointsWrapper = parsed.blueprint?.inputSchema?.type === 'object';
 
   const adapterFileName = stackDef.adapterFileName;
-  const adapterSource =
+  const rawAdapterSource =
     cleanStack === 'python-fastapi'
       ? renderPythonBindingAdapterSource({
           parsedBrick: parsed,
           resolvedBinding,
           fieldMap: adaptation.fieldMap,
+          resolvedFieldMap,
           hasHeaderRow: adaptation.hasHeaderRow,
           dropObjectHeaderRow: adaptation.dropObjectHeaderRow,
           expectsPointsWrapper,
@@ -3924,11 +3565,13 @@ export async function synthesizeHexagonalBinding(options = {}) {
           targetStack: cleanStack,
           resolvedBinding,
           fieldMap: adaptation.fieldMap,
+          resolvedFieldMap,
           hasHeaderRow: adaptation.hasHeaderRow,
           dropObjectHeaderRow: adaptation.dropObjectHeaderRow,
           expectsPointsWrapper,
           schemaInfo: adaptation.schemaInfo
         });
+  const adapterSource = scrubOntologyString(rawAdapterSource);
 
   let sandboxVerification = {
     verified: false,
@@ -4011,6 +3654,7 @@ export async function synthesizeHexagonalBinding(options = {}) {
       adapterSource,
       binding: resolvedBinding,
       fieldMap: adaptation.fieldMap,
+      resolvedFieldMap,
       hasHeaderRow: adaptation.hasHeaderRow,
       headerColumns: adaptation.headerColumns,
       adaptedSample: adaptation.adaptedSample,

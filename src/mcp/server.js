@@ -1496,7 +1496,7 @@ export function getStackTools({
   return rawAllowed.map(({ component: _c, ...toolDef }) => toolDef);
 }
 
-const HTTP_STRIPPED_ARG_KEYS = new Set([
+const INTERNAL_STRIPPED_ARG_KEYS = new Set([
   'allowExternalPaths',
   'authorizedBricks',
   'tryBrickFn',
@@ -1510,24 +1510,35 @@ const HTTP_STRIPPED_ARG_KEYS = new Set([
   'prototype'
 ]);
 
+const UNTRUSTED_BOUNDARY_STRIPPED_ARG_KEYS = new Set([
+  ...INTERNAL_STRIPPED_ARG_KEYS,
+  'viewerOrgId'
+]);
+
 /**
  * Dispatch a tool call by name against a KruschStack instance.
  */
 export async function dispatchStackTool(stack, toolName, rawArgs = {}, options = {}) {
-  let args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
+  const inputArgs = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
+  const strippedSet =
+    options.httpBoundary || options.mcpBoundary
+      ? UNTRUSTED_BOUNDARY_STRIPPED_ARG_KEYS
+      : INTERNAL_STRIPPED_ARG_KEYS;
+  const cleanArgs = {};
+  for (const key of Object.keys(inputArgs)) {
+    if (strippedSet.has(key)) continue;
+    Object.defineProperty(cleanArgs, key, {
+      value: inputArgs[key],
+      enumerable: true,
+      writable: true,
+      configurable: true
+    });
+  }
+  let args = cleanArgs;
 
-  if (options.httpBoundary) {
-    const cleanArgs = {};
-    for (const key of Object.keys(args)) {
-      if (HTTP_STRIPPED_ARG_KEYS.has(key)) continue;
-      Object.defineProperty(cleanArgs, key, {
-        value: args[key],
-        enumerable: true,
-        writable: true,
-        configurable: true
-      });
-    }
+  if ((options.httpBoundary || options.mcpBoundary || options.allowExternalPaths !== true) && stack?.workspaceRoot) {
     try {
+      const isGitTool = String(toolName || '').startsWith('krusch_git_');
       for (const pathKey of [
         'targetDir',
         'repoRoot',
@@ -1538,7 +1549,7 @@ export async function dispatchStackTool(stack, toolName, rawArgs = {}, options =
         'file_path'
       ]) {
         if (typeof cleanArgs[pathKey] === 'string' && cleanArgs[pathKey].trim()) {
-          cleanArgs[pathKey] = assertPathWithinWorkspace(
+          const checkedAbs = assertPathWithinWorkspace(
             cleanArgs[pathKey],
             stack.workspaceRoot,
             {
@@ -1546,15 +1557,22 @@ export async function dispatchStackTool(stack, toolName, rawArgs = {}, options =
                 pathKey === 'targetDir' && toolName === 'hydrascope_ingest_directory'
             }
           );
+          if (pathKey === 'file_path' && isGitTool && checkedAbs !== 'reset') {
+            cleanArgs[pathKey] = path.relative(path.resolve(stack.workspaceRoot), checkedAbs) || '.';
+          } else {
+            cleanArgs[pathKey] = checkedAbs;
+          }
         }
       }
       if (
         typeof cleanArgs.path === 'string' &&
         cleanArgs.path.trim() &&
-        (String(toolName || '').startsWith('krusch_fs_') ||
-          String(toolName || '').startsWith('krusch_git_'))
+        (String(toolName || '').startsWith('krusch_fs_') || isGitTool)
       ) {
-        cleanArgs.path = assertPathWithinWorkspace(cleanArgs.path, stack.workspaceRoot);
+        const checkedAbs = assertPathWithinWorkspace(cleanArgs.path, stack.workspaceRoot);
+        cleanArgs.path = isGitTool
+          ? path.relative(path.resolve(stack.workspaceRoot), checkedAbs) || '.'
+          : checkedAbs;
       }
       if (Array.isArray(cleanArgs.paths)) {
         cleanArgs.paths = cleanArgs.paths.map((item) =>
@@ -1884,6 +1902,7 @@ export function createMcpServer(options = {}) {
         pinnedToolNames: resolveEffectivePinnedTools(options.server, options.pinnedToolNames),
         dispatcher: (innerToolName, innerArgs) =>
           dispatchStackTool(stack, innerToolName, innerArgs, {
+            mcpBoundary: true,
             profile: effectiveProfile,
             components: options.components,
             server: options.server,
@@ -1925,6 +1944,7 @@ export function createMcpServer(options = {}) {
 
     try {
       const result = await dispatchStackTool(stack, toolName, args, {
+        mcpBoundary: true,
         deferredBridge,
         profile: effectiveProfile,
         components: options.components,

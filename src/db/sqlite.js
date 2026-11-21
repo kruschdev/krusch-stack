@@ -9,6 +9,60 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 
+export const BRICK_EXCHANGE_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
+    brick_key TEXT PRIMARY KEY,
+    brick_id TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    brick_class TEXT NOT NULL DEFAULT 'general',
+    author_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    bundle_json TEXT NOT NULL,
+    estimated_hours_saved REAL NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_brick_exchange_bricks_natural_key
+    ON brick_exchange_bricks(brick_id, source_hash);
+
+  CREATE INDEX IF NOT EXISTS idx_brick_exchange_bricks_org
+    ON brick_exchange_bricks(org_id, brick_id);
+
+  CREATE TABLE IF NOT EXISTS brick_exchange_grants (
+    grant_id TEXT PRIMARY KEY,
+    brick_id TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    issuer_id TEXT NOT NULL,
+    issuer_org_id TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'federated',
+    recipients_json TEXT NOT NULL DEFAULT '[]',
+    revoked INTEGER NOT NULL DEFAULT 0,
+    expires_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_brick_exchange_grants_brick
+    ON brick_exchange_grants(brick_id, source_hash);
+
+  CREATE TABLE IF NOT EXISTS brick_exchange_adoptions (
+    adoption_id TEXT PRIMARY KEY,
+    brick_id TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    grant_id TEXT NOT NULL DEFAULT '',
+    binding_hash TEXT NOT NULL DEFAULT '',
+    created_at_ms INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
+    ON brick_exchange_adoptions(brick_id, created_at_ms);
+`;
+
 export const STACK_SCHEMA_SQL = `
   PRAGMA journal_mode = WAL;
   PRAGMA synchronous = NORMAL;
@@ -276,54 +330,7 @@ export const STACK_SCHEMA_SQL = `
     ON grounded_events(session_id, created_at_ms);
 
   -- INV-STACK-12: Collaborative Brick Exchange & 4-Axis Ontology
-  CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
-    brick_key TEXT PRIMARY KEY,
-    brick_id TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    name TEXT NOT NULL,
-    summary TEXT NOT NULL DEFAULT '',
-    brick_class TEXT NOT NULL DEFAULT 'general',
-    author_id TEXT NOT NULL,
-    org_id TEXT NOT NULL,
-    key_id TEXT NOT NULL,
-    capabilities_json TEXT NOT NULL DEFAULT '[]',
-    bundle_json TEXT NOT NULL,
-    estimated_hours_saved REAL NOT NULL DEFAULT 0,
-    created_at_ms INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_brick_exchange_bricks_org
-    ON brick_exchange_bricks(org_id, brick_id);
-
-  CREATE TABLE IF NOT EXISTS brick_exchange_grants (
-    grant_id TEXT PRIMARY KEY,
-    brick_id TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    issuer_id TEXT NOT NULL,
-    issuer_org_id TEXT NOT NULL,
-    scope TEXT NOT NULL DEFAULT 'federated',
-    recipients_json TEXT NOT NULL DEFAULT '[]',
-    revoked INTEGER NOT NULL DEFAULT 0,
-    expires_at_ms INTEGER NOT NULL,
-    created_at_ms INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_brick_exchange_grants_brick
-    ON brick_exchange_grants(brick_id, source_hash);
-
-  CREATE TABLE IF NOT EXISTS brick_exchange_adoptions (
-    adoption_id TEXT PRIMARY KEY,
-    brick_id TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    org_id TEXT NOT NULL,
-    grant_id TEXT NOT NULL DEFAULT '',
-    binding_hash TEXT NOT NULL DEFAULT '',
-    created_at_ms INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
-    ON brick_exchange_adoptions(brick_id, created_at_ms);
+  ${BRICK_EXCHANGE_SCHEMA_SQL}
 
   -- INV-STACK-13: Tier 2C HydraScope Structural Context & Temporal Ontology Graph
   CREATE TABLE IF NOT EXISTS hydrascope_nodes (
@@ -530,54 +537,7 @@ export function ensureStackSchemaMigrations(db) {
     CREATE INDEX IF NOT EXISTS idx_grounded_events_session_time
       ON grounded_events(session_id, created_at_ms);
 
-    CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
-      brick_key TEXT PRIMARY KEY,
-      brick_id TEXT NOT NULL,
-      source_hash TEXT NOT NULL,
-      name TEXT NOT NULL,
-      summary TEXT NOT NULL DEFAULT '',
-      brick_class TEXT NOT NULL DEFAULT 'general',
-      author_id TEXT NOT NULL,
-      org_id TEXT NOT NULL,
-      key_id TEXT NOT NULL,
-      capabilities_json TEXT NOT NULL DEFAULT '[]',
-      bundle_json TEXT NOT NULL,
-      estimated_hours_saved REAL NOT NULL DEFAULT 0,
-      created_at_ms INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_brick_exchange_bricks_org
-      ON brick_exchange_bricks(org_id, brick_id);
-
-    CREATE TABLE IF NOT EXISTS brick_exchange_grants (
-      grant_id TEXT PRIMARY KEY,
-      brick_id TEXT NOT NULL,
-      source_hash TEXT NOT NULL,
-      issuer_id TEXT NOT NULL,
-      issuer_org_id TEXT NOT NULL,
-      scope TEXT NOT NULL DEFAULT 'federated',
-      recipients_json TEXT NOT NULL DEFAULT '[]',
-      revoked INTEGER NOT NULL DEFAULT 0,
-      expires_at_ms INTEGER NOT NULL,
-      created_at_ms INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_brick_exchange_grants_brick
-      ON brick_exchange_grants(brick_id, source_hash);
-
-    CREATE TABLE IF NOT EXISTS brick_exchange_adoptions (
-      adoption_id TEXT PRIMARY KEY,
-      brick_id TEXT NOT NULL,
-      source_hash TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      org_id TEXT NOT NULL,
-      grant_id TEXT NOT NULL DEFAULT '',
-      binding_hash TEXT NOT NULL DEFAULT '',
-      created_at_ms INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
-      ON brick_exchange_adoptions(brick_id, created_at_ms);
+    ${BRICK_EXCHANGE_SCHEMA_SQL}
 
     CREATE TABLE IF NOT EXISTS hydrascope_nodes (
       node_key TEXT PRIMARY KEY,

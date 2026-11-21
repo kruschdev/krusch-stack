@@ -10,10 +10,17 @@ import { okEnvelope } from '../db/sqlite.js';
 
 export const VERSION = '1.3.1';
 
+export const THREE_CHAIR_MODELS = Object.freeze({
+  first_chair: 'inkling-2-mini:ud-iq4_xs-dspark',
+  second_chair: 'qwen3-coder-30b-moe:latest',
+  third_chair: 'gemma4:e2b'
+});
+
 const TIER_CATALOG = {
   L1_FAST_LOCAL: {
     tier: 'L1_FAST_LOCAL',
-    model: 'qwen2.5-coder:7b',
+    model: 'gemma4:e2b',
+    chair: '3rd-chair',
     provider: 'ollama-local',
     max_context: 16384,
     cost_tier: 'free-local'
@@ -21,8 +28,18 @@ const TIER_CATALOG = {
   L2_SWE_MOE: {
     tier: 'L2_SWE_MOE',
     model: 'qwen3-coder-30b-moe:latest',
+    reasoning_model: 'inkling-2-mini:ud-iq4_xs-dspark',
+    chair: '2nd-chair',
     provider: 'ollama-local',
     max_context: 16384,
+    cost_tier: 'free-local'
+  },
+  L2_LOCAL_REASONING: {
+    tier: 'L2_LOCAL_REASONING',
+    model: 'inkling-2-mini:ud-iq4_xs-dspark',
+    chair: '1st-chair',
+    provider: 'ollama-local',
+    max_context: 32768,
     cost_tier: 'free-local'
   },
   L2_5_BURST_120B: {
@@ -43,6 +60,7 @@ const TIER_CATALOG = {
 
 const L3_RE = /\b(referee|security\s+audit|cso|stride|owasp|formal\s+verification|compliance|zero-finding|cross-family|constitutional)\b/i;
 const L2_5_RE = /\b(120b|burst|deep\s+architecture|multi-agent\s+swarm|spec-first\s+refactor|large-scale|100k\s+context|theorem|physics)\b/i;
+const L2_REASONING_RE = /\b(inkling|first[- ]chair|root\s+cause|deliberat|hypothesis|sre\s+triage)\b/i;
 const L2_RE = /\b(refactor|implement|bug|fix|unit\s+test|migration|sql|schema|ast|endpoint|component|engine|docker|diff)\b/i;
 
 /**
@@ -89,6 +107,10 @@ export function createRouterEngine({ config = {} } = {}) {
       selectedKey = 'L2_5_BURST_120B';
       reason = 'High-complexity burst tier requested for deep architectural synthesis';
       confidence = 0.95;
+    } else if (budget === 'first_chair' || budget === 'l2_reasoning' || explicitType === 'reasoning') {
+      selectedKey = 'L2_LOCAL_REASONING';
+      reason = '1st-Chair local reasoning specialist requested';
+      confidence = 0.96;
     } else if (budget === 'local_only' || budget === 'l1') {
       selectedKey = 'L1_FAST_LOCAL';
       reason = 'Strict L1 fast local budget constraint';
@@ -101,6 +123,10 @@ export function createRouterEngine({ config = {} } = {}) {
       selectedKey = 'L2_5_BURST_120B';
       reason = 'Detected deep architectural or long-context synthesis workload';
       confidence = 0.91;
+    } else if (L2_REASONING_RE.test(text)) {
+      selectedKey = 'L2_LOCAL_REASONING';
+      reason = 'Detected 1st-Chair local reasoning / root-cause deliberation signal';
+      confidence = 0.93;
     } else if (
       budget === 'l2' ||
       explicitType === 'code' ||
@@ -137,6 +163,8 @@ export function createRouterEngine({ config = {} } = {}) {
         endpoint,
         max_context: spec.max_context,
         cost_tier: spec.cost_tier,
+        local_reasoning_model: THREE_CHAIR_MODELS.first_chair,
+        three_chair_models: THREE_CHAIR_MODELS,
         latency_us: latencyUs,
         within_sla: latencyUs < 250,
         confidence,
@@ -225,7 +253,8 @@ export function createRouterEngine({ config = {} } = {}) {
         router_metrics: {
           total_routed: totalRouted,
           avg_latency_us: avgLatencyUs,
-          available_tiers: Object.keys(TIER_CATALOG)
+          available_tiers: Object.keys(TIER_CATALOG),
+          three_chair_models: THREE_CHAIR_MODELS
         }
       }
     );

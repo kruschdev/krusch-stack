@@ -1144,3 +1144,153 @@ test('P2 Parity: package.json ./brick-ontology subpath, openStackDatabase, runSt
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Wave 10.1 Hardening: SEC-02 lexer desync, SEC-04 metadataHash/stripped ontology, SEC-05/06 viewerOrgId/MCP/revocation/org-conflict, BUG-01 3-Chair & dual adapters, and PERF-02 check cap', async () => {
+  const { dispatchStackTool } = await import('../src/mcp/server.js');
+  const { verifySealedBrickBundle } = await import('../src/index.js');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kruschstack-w101-'));
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kruschstack-outside-'));
+  let gateway = null;
+  try {
+    const stack = createKruschStack({ workspaceRoot: tmpDir, ephemeral: true });
+
+    // 1. BUG-01: 3-Chair Bandit models + financial-integer-ledger preserveNegativeValues: true
+    const finProf = STACK_ONTOLOGY_MOE_PROFILES['financial-integer-ledger'];
+    assert.equal(finProf.invariants.preserveNegativeValues, true);
+    assert.equal(finProf.preferredModels.L1_FAST, 'gemma4:e2b');
+    assert.equal(finProf.preferredModels.L2_FIRST_CHAIR_INKLING, 'inkling-2-mini:ud-iq4_xs-dspark');
+
+    // 2. SEC-02: Control-header regex/comment lexer desync cannot hide host process.env access
+    const sneakySource = `export function calc(x) { if (true) /\\/*/.test(""); const leak = process.env; /* */ return { y: x.v }; }`;
+    assert.equal(isWebStandardPureBrickSource(sneakySource), false);
+    const sneakySeal = await stack.brickExchange.sealBrick({
+      blueprint: { id: 'sneaky-brick', inputSchema: { type: 'object' }, outputSchema: { type: 'object' } },
+      source: sneakySource,
+      positiveChecks: [{ name: 'ok', input: { v: 1 }, expectedOutput: { y: 1 } }],
+      faultChecks: [{ name: 'bad', input: null, expectThrow: true }]
+    });
+    assert.equal(sneakySeal.ok, false);
+
+    // 3. PERF-02: >32 seal checks rejected immediately
+    const tooManyRes = await stack.brickExchange.sealBrick({
+      blueprint: { id: 'many-checks', inputSchema: { type: 'object' }, outputSchema: { type: 'object' } },
+      source: 'export default function(x) { if (!x) throw new Error("bad"); return x; }',
+      positiveChecks: Array.from({ length: 32 }, (_, i) => ({ name: `p${i}`, input: { a: 1 }, expectedOutput: { a: 1 } })),
+      faultChecks: [{ name: 'f0', input: null, expectThrow: true }]
+    });
+    assert.equal(tooManyRes.ok, false);
+    assert.equal(tooManyRes.error.code, 'TOO_MANY_SEAL_CHECKS');
+
+    // 4. Seal valid org-alpha brick, test SEC-04 metadataHash & stripped ontology, SEC-06 cross-org conflict, SEC-05 HTTP viewerOrgId & MCP nowMs/path/revocation
+    const validSeal = await stack.brickExchange.sealBrick({
+      orgId: 'org-alpha',
+      authorId: 'alice',
+      brickClass: 'finance',
+      capabilities: ['@krusch/toolkit/schema'],
+      publish: true,
+      blueprint: {
+        id: 'alpha-signed-ledger',
+        inputSchema: {
+          type: 'object',
+          required: ['gross'],
+          properties: { gross: { type: 'integer' } }
+        },
+        outputSchema: { type: 'object' },
+        ontology: { stacks: ['node-esm'], consumesPorts: ['ledger_event'], producesPorts: ['audit_record'] }
+      },
+      source: 'export default function(x) { if (!x || !Number.isInteger(x.gross)) throw new Error("bad"); return { gross: x.gross }; }',
+      positiveChecks: [{ name: 'pos', input: { gross: 100 }, expectedOutput: { gross: 100 } }],
+      faultChecks: [{ name: 'flt', input: null, expectThrow: true }]
+    });
+    assert.equal(validSeal.ok, true);
+    const bundle = validSeal.data.bundle;
+    assert.equal(typeof bundle.lineage.metadataHash, 'string');
+
+    // SEC-04: Stripping bundle.ontology or mutating capabilities/brickClass fails verifySealedBrickBundle
+    const strippedOnt = JSON.parse(JSON.stringify(bundle));
+    delete strippedOnt.ontology;
+    assert.equal(verifySealedBrickBundle(strippedOnt).ok, false);
+
+    const mutatedCaps = JSON.parse(JSON.stringify(bundle));
+    mutatedCaps.capabilities.push('@krusch/toolkit/webhooks');
+    assert.equal(verifySealedBrickBundle(mutatedCaps).ok, false);
+
+    // SEC-06: Second org attempting to overwrite same brickId fails with BRICK_ORG_CONFLICT
+    const hijackSeal = await stack.brickExchange.sealBrick({
+      orgId: 'org-mallory',
+      authorId: 'mallory',
+      publish: true,
+      blueprint: bundle.blueprint,
+      source: bundle.source,
+      positiveChecks: [{ name: 'pos', input: { gross: 100 }, expectedOutput: { gross: 100 } }],
+      faultChecks: [{ name: 'flt', input: null, expectThrow: true }]
+    });
+    assert.equal(hijackSeal.ok, false);
+    assert.equal(hijackSeal.error.code, 'BRICK_ORG_CONFLICT');
+
+    // Dual adapter exports (FIELD_MAP + fieldMap, invokeBoundBrick + invokeAdaptedBrick)
+    const bindRes = await stack.brickExchange.synthesizeBinding({
+      bundle,
+      targetStack: 'node-esm',
+      localSample: { amount_cents: 500 }
+    });
+    assert.equal(bindRes.ok, true);
+    assert.deepEqual(bindRes.data.resolvedFieldMap, { gross: 'amount_cents' });
+    assert.match(bindRes.data.adapterSource, /export const FIELD_MAP =/);
+    assert.match(bindRes.data.adapterSource, /export function invokeBoundBrick\(/);
+
+    // Issue short grant to bob, revoke it, verify direct-bundle adoptBrick rejects revoked grantId (SEC-05)
+    const grantRes = stack.brickExchange.issueGrant({
+      brickId: 'alpha-signed-ledger',
+      issuerId: 'alice',
+      issuerOrgId: 'org-alpha',
+      recipients: ['bob'],
+      ttlMs: 1000
+    });
+    assert.equal(grantRes.ok, true);
+    const revokeRes = stack.brickExchange.revokeGrant({
+      actorId: 'alice',
+      grantId: grantRes.data.grantId
+    });
+    assert.equal(revokeRes.ok, true);
+
+    const revokedAdopt = await stack.brickExchange.adoptBrick({
+      bundle,
+      grantId: grantRes.data.grantId,
+      userId: 'bob',
+      orgId: 'org-beta',
+      targetRepoDir: path.join(tmpDir, 'bob-repo')
+    });
+    assert.equal(revokedAdopt.ok, false);
+
+    // MCP dispatchStackTool blocks targetRepoDir outside workspaceRoot and strips nowMs clock injection
+    const escapeAdopt = await dispatchStackTool(
+      stack,
+      'brick_adopt',
+      { bundle, targetRepoDir: outsideDir },
+      { mcpBoundary: true }
+    );
+    assert.equal(escapeAdopt.ok, false);
+    assert.equal(escapeAdopt.data?.code, 'PATH_OUTSIDE_WORKSPACE');
+
+    // HTTP Gateway strips spoofed viewerOrgId: 'org-alpha' so ungranted outsider gets 0 bricks
+    gateway = await startHttpGateway({ stack, workspaceRoot: tmpDir, port: 0 });
+    const spoofHttp = await fetch(`http://${gateway.host}:${gateway.port}/brick-exchange/ontology-compose`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        viewerId: 'mallory',
+        viewerOrgId: 'org-alpha',
+        targetStack: 'node-esm'
+      })
+    }).then((r) => r.json());
+    assert.equal(spoofHttp.ok, true);
+    assert.equal(spoofHttp.data.graph.stats.authorizedBrickCount, 0);
+  } finally {
+    if (gateway?.server) {
+      await new Promise((resolve) => gateway.server.close(resolve));
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});

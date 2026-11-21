@@ -299,6 +299,9 @@ CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
   created_at_ms BIGINT NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_brick_exchange_bricks_natural_key
+  ON brick_exchange_bricks(brick_id, source_hash);
+
 CREATE INDEX IF NOT EXISTS idx_brick_exchange_bricks_org
   ON brick_exchange_bricks(org_id, brick_id);
 

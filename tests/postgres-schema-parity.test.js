@@ -257,7 +257,7 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
     assert.equal(parsed.minParenDepth, 0, 'Parenthesis depth must never drop below zero');
     assert.equal(parsed.finalParenDepth, 0, 'Parentheses must be balanced across db/init.sql');
     assert.equal(parsed.unterminatedTrailing, '', 'Every SQL statement must terminate with ";"');
-    assert.ok(parsed.statements.length >= 25, 'Expected extension, 19 tables, and index statements');
+    assert.ok(parsed.statements.length >= 25, 'Expected extension, 21 tables, and index statements');
 
     assert.ok(
       parsed.statements.some((s) => /^CREATE\s+EXTENSION\s+IF\s+EXISTS\b/i.test(s) === false) &&
@@ -463,6 +463,14 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
       assert.ok(pgCols, `Brick Exchange table ${tableName} missing from db/init.sql`);
       assert.deepEqual([...pgCols.keys()], [...sqliteCols.keys()]);
     }
+    assert.equal(
+      pgTables.get('brick_exchange_bricks').get('estimated_hours_saved'),
+      'DOUBLE PRECISION NOT NULL DEFAULT 0'
+    );
+    assert.equal(pgTables.get('brick_exchange_bricks').get('created_at_ms'), 'BIGINT NOT NULL');
+    assert.equal(pgTables.get('brick_exchange_grants').get('expires_at_ms'), 'BIGINT NOT NULL');
+    assert.equal(pgTables.get('brick_exchange_grants').get('created_at_ms'), 'BIGINT NOT NULL');
+    assert.equal(pgTables.get('brick_exchange_adoptions').get('created_at_ms'), 'BIGINT NOT NULL');
 
     // 6. Cross-check INV-STACK-13 HydraScope tables & types
     const sqliteHydraTables = extractTableColumns(HYDRASCOPE_SCHEMA_SQL);
@@ -471,6 +479,11 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
       assert.ok(pgCols, `HydraScope table ${tableName} missing from db/init.sql`);
       assert.deepEqual([...pgCols.keys()], [...sqliteCols.keys()]);
     }
+    assert.equal(pgTables.get('hydrascope_nodes').get('updated_at_ms'), 'BIGINT NOT NULL');
+    assert.equal(
+      pgTables.get('hydrascope_edges').get('weight'),
+      'DOUBLE PRECISION NOT NULL DEFAULT 1'
+    );
 
     const requiredIndexes = [
       ['idx_stack_hitl_gates_task_status', 'stack_hitl_gates', '(task_id, status)'],
@@ -479,6 +492,7 @@ describe('PostgreSQL 16 + pgvector Schema Parity Suite (db/init.sql)', () => {
       ['idx_action_harness_events_session_time', 'action_harness_events', '(session_id, created_at_ms)'],
       ['idx_grounded_events_sig', 'grounded_events', '(session_id, call_signature)'],
       ['idx_grounded_events_session_time', 'grounded_events', '(session_id, created_at_ms)'],
+      ['idx_brick_exchange_bricks_natural_key', 'brick_exchange_bricks', '(brick_id, source_hash)'],
       ['idx_brick_exchange_bricks_org', 'brick_exchange_bricks', '(org_id, brick_id)'],
       ['idx_brick_exchange_grants_brick', 'brick_exchange_grants', '(brick_id, source_hash)'],
       ['idx_brick_exchange_adoptions_brick', 'brick_exchange_adoptions', '(brick_id, created_at_ms)'],

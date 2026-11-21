@@ -24,6 +24,36 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { okEnvelope, openStackDatabase } from '../db/sqlite.js';
 import {
+  FORBIDDEN_KEYS,
+  BANNED_HOST_MODULES,
+  SECRET_LEAK_RE,
+  LOCAL_FS_DIR_LEAK_RE,
+  PRIVATE_DOMAIN_LEAK_RE,
+  isPlainObject,
+  isIdentStart,
+  isIdentPart,
+  containsPrivateIpv4Literal,
+  decodeJsStringSpecifier,
+  stripJsCommentsPreservingLiterals,
+  maskStringAndTemplateBodies,
+  hasRuntimeIdentifierReference,
+  stripTypeOnlyImportExport
+} from './shared/js-code-scanner.js';
+import {
+  BRICK_EXCHANGE_SCHEMA_SQL,
+  SEAL_DOMAIN_PREFIX,
+  SEAL_ATTESTATION_DOMAIN,
+  SEALED_BUNDLE_FORMAT,
+  LINEAGE_STANDARD,
+  canonicalJsonResult,
+  computeCanonicalHash,
+  extractContractShape,
+  computeBrickMetadataHash,
+  derivePublicKeyId,
+  generateEd25519BrickKeys,
+  verifySealedBrickBundle
+} from './brick-exchange/seal-crypto.js';
+import {
   CANONICAL_SHARED_TYPES,
   STACK_ONTOLOGY_STACKS,
   STACK_ONTOLOGY_PORTS,
@@ -43,6 +73,10 @@ import {
 } from './brick-ontology-engine.js';
 
 export {
+  BRICK_EXCHANGE_SCHEMA_SQL,
+  computeBrickMetadataHash,
+  generateEd25519BrickKeys,
+  verifySealedBrickBundle,
   CANONICAL_SHARED_TYPES,
   STACK_ONTOLOGY_STACKS,
   STACK_ONTOLOGY_PORTS,
@@ -61,61 +95,8 @@ export {
   createBrickOntologyEngine
 };
 
-export const BRICK_EXCHANGE_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS brick_exchange_bricks (
-  brick_key TEXT PRIMARY KEY,
-  brick_id TEXT NOT NULL,
-  source_hash TEXT NOT NULL,
-  name TEXT NOT NULL,
-  summary TEXT NOT NULL DEFAULT '',
-  brick_class TEXT NOT NULL DEFAULT 'general',
-  author_id TEXT NOT NULL,
-  org_id TEXT NOT NULL,
-  key_id TEXT NOT NULL,
-  capabilities_json TEXT NOT NULL DEFAULT '[]',
-  bundle_json TEXT NOT NULL,
-  estimated_hours_saved REAL NOT NULL DEFAULT 0,
-  created_at_ms INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_brick_exchange_bricks_org
-  ON brick_exchange_bricks(org_id, brick_id);
-
-CREATE TABLE IF NOT EXISTS brick_exchange_grants (
-  grant_id TEXT PRIMARY KEY,
-  brick_id TEXT NOT NULL,
-  source_hash TEXT NOT NULL,
-  issuer_id TEXT NOT NULL,
-  issuer_org_id TEXT NOT NULL,
-  scope TEXT NOT NULL DEFAULT 'federated',
-  recipients_json TEXT NOT NULL DEFAULT '[]',
-  revoked INTEGER NOT NULL DEFAULT 0,
-  expires_at_ms INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_brick_exchange_grants_brick
-  ON brick_exchange_grants(brick_id, source_hash);
-
-CREATE TABLE IF NOT EXISTS brick_exchange_adoptions (
-  adoption_id TEXT PRIMARY KEY,
-  brick_id TEXT NOT NULL,
-  source_hash TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  org_id TEXT NOT NULL,
-  grant_id TEXT NOT NULL DEFAULT '',
-  binding_hash TEXT NOT NULL DEFAULT '',
-  created_at_ms INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_brick_exchange_adoptions_brick
-  ON brick_exchange_adoptions(brick_id, created_at_ms);
-`;
-
-const SEAL_DOMAIN_PREFIX = 'krusch-brick-seal-v1:';
-const SEAL_ATTESTATION_DOMAIN = 'krusch-brick-seal-v1';
-const SEALED_BUNDLE_FORMAT = 'krusch-sealed-brick/v1';
-const LINEAGE_STANDARD = 'krusch-brick-exchange-v1';
+export const MAX_SEAL_CHECKS = 32;
+const MAX_SEAL_WALL_CLOCK_MS = 15_000;
 
 const DEFAULT_SANDBOX_TIMEOUT_MS = 800;
 const DEFAULT_SANDBOX_MAX_MEMORY_MB = 32;
@@ -126,37 +107,8 @@ const DEFAULT_GRANT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 const BRICK_ID_RE = /^[a-z0-9][a-z0-9-_]{1,63}$/;
 const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
-const HEX64_RE = /^[0-9a-f]{64}$/;
-const HEX128_RE = /^[0-9a-f]{128}$/;
-const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
-const BANNED_HOST_MODULES = new Set([
-  'fs',
-  'fs/promises',
-  'net',
-  'tls',
-  'http',
-  'https',
-  'http2',
-  'dgram',
-  'dns',
-  'dns/promises',
-  'child_process',
-  'worker_threads',
-  'cluster',
-  'os',
-  'v8',
-  'vm',
-  'inspector',
-  'inspector/promises',
-  'module',
-  'process',
-  'readline',
-  'repl',
-  'tty',
-  'wasi',
-  'sqlite'
-]);
+const CONTROL_HEADER_KEYWORDS = new Set(['if', 'while', 'for', 'with']);
 
 const REGEX_PRECEDING_KEYWORDS = new Set([
   'return',
@@ -244,28 +196,6 @@ const SENSITIVE_SYSTEM_PREFIXES = [
   '/boot',
   '/var/run'
 ];
-
-// Dynamically assembled so static repository leak scanners never match detector patterns.
-const SECRET_LEAK_RE = new RegExp(
-  [
-    `${'AIza' + 'Sy'}[A-Za-z0-9_-]{3,}`,
-    `\\b${'sk' + '-'}[A-Za-z0-9_-]{4,}`,
-    `\\b${'gh' + 'p_'}[A-Za-z0-9]{4,}`,
-    `\\bgh[ousr]_[A-Za-z0-9]{6,}`,
-    `\\bgithub_pat_[A-Za-z0-9_]{6,}`,
-    `\\bxox[baprs]-[A-Za-z0-9-]{6,}`,
-    `${'-----' + 'BEGIN'}\\b`
-  ].join('|')
-);
-
-const LOCAL_FS_DIR_LEAK_RE = new RegExp(
-  `(?<![A-Za-z0-9._-])\\/(?:${['ho' + 'me', 'Us' + 'ers', 'm' + 'nt'].join('|')})\\/[A-Za-z0-9._-]+`
-);
-
-const PRIVATE_DOMAIN_LEAK_RE = new RegExp(
-  `\\.(?:${['l' + 'an', 'lo' + 'cal', 'inter' + 'nal', 'ts\\.' + 'net'].join('|')})\\b`,
-  'i'
-);
 
 const SANDBOX_JSON_MARKER_PREFIX = '__KRUSCHSTACK_PERM_SANDBOX_JSON__:';
 
@@ -438,203 +368,12 @@ function failEnvelope(tool, code, message, details = null) {
   };
 }
 
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
 function isSafeIdentifier(value) {
   if (typeof value !== 'string') return false;
   const trimmed = value.trim();
   if (!trimmed || trimmed !== value) return false;
   if (FORBIDDEN_KEYS.has(trimmed) || trimmed.includes('..')) return false;
   return SAFE_ID_RE.test(trimmed);
-}
-
-function isIdentStart(code) {
-  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 36;
-}
-
-function isIdentPart(code) {
-  return isIdentStart(code) || (code >= 48 && code <= 57);
-}
-
-function constantTimeHexEqual(actual, expectedHex) {
-  if (typeof expectedHex !== 'string' || expectedHex.length === 0) {
-    return false;
-  }
-  const expectedBuf = Buffer.from(expectedHex, 'utf8');
-  if (typeof actual !== 'string') {
-    crypto.timingSafeEqual(expectedBuf, expectedBuf);
-    return false;
-  }
-  const actualBuf = Buffer.from(actual, 'utf8');
-  if (actualBuf.length !== expectedBuf.length) {
-    crypto.timingSafeEqual(expectedBuf, expectedBuf);
-    return false;
-  }
-  return crypto.timingSafeEqual(actualBuf, expectedBuf);
-}
-
-function constantTimeStringEqual(actual, expected) {
-  if (typeof actual !== 'string' || typeof expected !== 'string') {
-    return false;
-  }
-  const aBuf = Buffer.from(actual, 'utf8');
-  const bBuf = Buffer.from(expected, 'utf8');
-  if (aBuf.length !== bBuf.length) {
-    if (bBuf.length > 0) crypto.timingSafeEqual(bBuf, bBuf);
-    return false;
-  }
-  if (bBuf.length === 0) return true;
-  return crypto.timingSafeEqual(aBuf, bBuf);
-}
-
-function hasLoneSurrogate(str) {
-  if (typeof str.isWellFormed === 'function') {
-    return !str.isWellFormed();
-  }
-  for (let i = 0; i < str.length; i += 1) {
-    const code = str.charCodeAt(i);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      if (i + 1 >= str.length) return true;
-      const next = str.charCodeAt(i + 1);
-      if (next < 0xdc00 || next > 0xdfff) return true;
-      i += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Deterministic RFC-8785-compatible canonical JSON serializer matching @krusch/toolkit/audit-log.
- * @param {unknown} value
- * @param {number} [maxDepth=64]
- * @returns {{ ok: true, json: string } | { ok: false, message: string }}
- */
-function canonicalJsonResult(value, maxDepth = 64) {
-  const ancestors = new Set();
-
-  function serializeNode(node, depth) {
-    if (node === null || node === undefined) {
-      return { ok: true, json: 'null' };
-    }
-    let current = node;
-    if (current instanceof Boolean || current instanceof Number || current instanceof String) {
-      current = current.valueOf();
-    }
-    const t = typeof current;
-    if (t === 'boolean') {
-      return { ok: true, json: current ? 'true' : 'false' };
-    }
-    if (t === 'number') {
-      if (!Number.isFinite(current)) {
-        return { ok: false, message: 'Non-finite number in canonical payload' };
-      }
-      if (Object.is(current, -0) || current === 0) {
-        return { ok: true, json: '0' };
-      }
-      return { ok: true, json: JSON.stringify(current) };
-    }
-    if (t === 'string') {
-      if (hasLoneSurrogate(current)) {
-        return { ok: false, message: 'Lone UTF-16 surrogate in canonical payload' };
-      }
-      return { ok: true, json: JSON.stringify(current) };
-    }
-    if (t === 'bigint' || t === 'symbol' || t === 'function') {
-      return { ok: false, message: `Unsupported ${t} value in canonical payload` };
-    }
-    if (current instanceof Date) {
-      const ms = current.getTime();
-      if (!Number.isFinite(ms)) {
-        return { ok: false, message: 'Invalid Date in canonical payload' };
-      }
-      return { ok: true, json: JSON.stringify(current.toISOString()) };
-    }
-    if (depth > maxDepth) {
-      return { ok: false, message: 'Maximum canonicalization depth exceeded' };
-    }
-    if (ancestors.has(current)) {
-      return { ok: false, message: 'Circular reference in canonical payload' };
-    }
-    ancestors.add(current);
-    try {
-      if (Array.isArray(current)) {
-        const parts = [];
-        for (let i = 0; i < current.length; i += 1) {
-          const item = current[i] === undefined ? null : current[i];
-          const sub = serializeNode(item, depth + 1);
-          if (!sub.ok) return sub;
-          parts.push(sub.json);
-        }
-        return { ok: true, json: `[${parts.join(',')}]` };
-      }
-      const keys = Object.keys(current).sort();
-      const entries = [];
-      for (let i = 0; i < keys.length; i += 1) {
-        const k = keys[i];
-        if (FORBIDDEN_KEYS.has(k)) {
-          return { ok: false, message: `Forbidden prototype key "${k}" in canonical payload` };
-        }
-        if (current[k] === undefined) continue;
-        if (hasLoneSurrogate(k)) {
-          return { ok: false, message: 'Lone UTF-16 surrogate in object key' };
-        }
-        const sub = serializeNode(current[k], depth + 1);
-        if (!sub.ok) return sub;
-        entries.push(`${JSON.stringify(k)}:${sub.json}`);
-      }
-      return { ok: true, json: `{${entries.join(',')}}` };
-    } finally {
-      ancestors.delete(current);
-    }
-  }
-
-  return serializeNode(value, 0);
-}
-
-function fallbackCanonicalJson(value, seen = new WeakSet()) {
-  if (value === null || value === undefined) return 'null';
-  const t = typeof value;
-  if (t === 'boolean') return value ? 'true' : 'false';
-  if (t === 'number') {
-    if (!Number.isFinite(value)) return JSON.stringify(String(value));
-    return Object.is(value, -0) || value === 0 ? '0' : JSON.stringify(value);
-  }
-  if (t === 'string') return JSON.stringify(value);
-  if (t === 'bigint' || t === 'symbol' || t === 'function') return JSON.stringify(String(value));
-  if (value instanceof Date) {
-    const ms = value.getTime();
-    return Number.isFinite(ms) ? JSON.stringify(value.toISOString()) : 'null';
-  }
-  if (seen.has(value)) return '"[Circular]"';
-  seen.add(value);
-  try {
-    if (Array.isArray(value)) {
-      return `[${value.map((v) => (v === undefined ? 'null' : fallbackCanonicalJson(v, seen))).join(',')}]`;
-    }
-    const keys = Object.keys(value)
-      .filter((k) => !FORBIDDEN_KEYS.has(k) && value[k] !== undefined)
-      .sort();
-    return `{${keys.map((k) => `${JSON.stringify(k)}:${fallbackCanonicalJson(value[k], seen)}`).join(',')}}`;
-  } finally {
-    seen.delete(value);
-  }
-}
-
-function computeCanonicalHash(value) {
-  if (typeof value === 'string') {
-    return crypto.createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
-  }
-  const canon = canonicalJsonResult(value);
-  const serialized = canon.ok ? canon.json : fallbackCanonicalJson(value);
-  return crypto.createHash('sha256').update(Buffer.from(serialized, 'utf8')).digest('hex');
 }
 
 function deepFreezeClone(value) {
@@ -662,358 +401,6 @@ function deepFreezeClone(value) {
     }
   }
   return Object.freeze(cloned);
-}
-
-function extractContractShape(blueprint) {
-  return {
-    inputSchema: blueprint?.inputSchema ?? {},
-    outputSchema: blueprint?.outputSchema ?? {},
-    bindingSchema: blueprint?.bindingSchema ?? {}
-  };
-}
-
-function derivePublicKeyId(publicKeyPem) {
-  const pubKey = crypto.createPublicKey(String(publicKeyPem || '').trim());
-  const spkiDer = pubKey.export({ type: 'spki', format: 'der' });
-  const digest = crypto.createHash('sha256').update(spkiDer).digest('hex');
-  return `key_${digest.slice(0, 16)}`;
-}
-
-/**
- * Generate a fresh Ed25519 signing keypair for sealing verified bricks.
- * @returns {{ ok: true, tool: 'krusch_brick_keygen', summary: string, data: { keyId: string, publicKeyPem: string, privateKeyPem: string, algorithm: 'ed25519' } }}
- */
-export function generateEd25519BrickKeys() {
-  const { publicKey: publicKeyPem, privateKey: privateKeyPem } = crypto.generateKeyPairSync(
-    'ed25519',
-    {
-      publicKeyEncoding: { type: 'spki', format: 'pem' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
-    }
-  );
-  const keyId = derivePublicKeyId(publicKeyPem);
-  return okEnvelope('krusch_brick_keygen', 'Generated Ed25519 brick signing keypair', {
-    keyId,
-    publicKeyPem,
-    privateKeyPem,
-    algorithm: 'ed25519'
-  });
-}
-
-/**
- * Verify a sealed brick bundle's format (`krusch-sealed-brick/v1`), canonical SHA-256 digests,
- * adversarial fault-injection qualification, optional pinned public key, and Ed25519 signature.
- *
- * @param {unknown} bundle
- * @param {{ trustedPublicKeyPem?: string | null }} [options={}]
- */
-export function verifySealedBrickBundle(bundle, { trustedPublicKeyPem = null } = {}) {
-  const tool = 'krusch_brick_verify';
-
-  if (!isPlainObject(bundle) || bundle.format !== SEALED_BUNDLE_FORMAT) {
-    return failEnvelope(
-      tool,
-      'INVALID_BRICK_BUNDLE',
-      'Bundle must be an object with format "krusch-sealed-brick/v1"'
-    );
-  }
-
-  const forbiddenInBundle = hasForbiddenKeyRecursive(bundle);
-  if (forbiddenInBundle) {
-    return failEnvelope(
-      tool,
-      forbiddenInBundle.startsWith('__') ? 'INVALID_BRICK_BUNDLE' : 'ONTOLOGY_FORBIDDEN_KEY',
-      `Rejected unsafe key or depth/cycle violation (${forbiddenInBundle}) in brick bundle`,
-      { key: forbiddenInBundle }
-    );
-  }
-
-  if (typeof bundle.brickId !== 'string' || !BRICK_ID_RE.test(bundle.brickId)) {
-    return failEnvelope(tool, 'INVALID_BRICK_BUNDLE', 'Bundle brickId is missing or invalid', {
-      field: 'brickId'
-    });
-  }
-
-  if (!isSafeIdentifier(bundle.authorId) || !isSafeIdentifier(bundle.orgId)) {
-    return failEnvelope(
-      tool,
-      'INVALID_BRICK_BUNDLE',
-      'Bundle authorId and orgId must be valid safe identifiers'
-    );
-  }
-
-  if (typeof bundle.brickClass !== 'string' || !isSafeIdentifier(bundle.brickClass)) {
-    return failEnvelope(tool, 'INVALID_BRICK_BUNDLE', 'Bundle brickClass is missing or invalid', {
-      field: 'brickClass'
-    });
-  }
-
-  if (typeof bundle.source !== 'string' || bundle.source.trim().length === 0) {
-    return failEnvelope(tool, 'INVALID_BRICK_BUNDLE', 'Bundle source must be a non-empty string', {
-      field: 'source'
-    });
-  }
-
-  if (!isPlainObject(bundle.blueprint) || bundle.blueprint.id !== bundle.brickId) {
-    return failEnvelope(
-      tool,
-      'INVALID_BRICK_BUNDLE',
-      'Bundle blueprint is missing or blueprint.id does not match brickId',
-      { field: 'blueprint' }
-    );
-  }
-
-  if (
-    !Array.isArray(bundle.checks) ||
-    bundle.checks.length < 2 ||
-    !bundle.checks.every(
-      (c) =>
-        isPlainObject(c) &&
-        typeof c.name === 'string' &&
-        c.name.trim().length > 0 &&
-        typeof c.kind === 'string' &&
-        c.kind.trim().length > 0 &&
-        c.passed === true
-    ) ||
-    !bundle.checks.some((c) => c.kind === 'fault')
-  ) {
-    return failEnvelope(
-      tool,
-      'INVALID_BRICK_BUNDLE',
-      'Bundle checks must include >= 2 passed checks including at least 1 fault challenge',
-      { field: 'checks' }
-    );
-  }
-
-  const { lineage, attestation } = bundle;
-  if (
-    !isPlainObject(lineage) ||
-    lineage.standard !== LINEAGE_STANDARD ||
-    lineage.brickId !== bundle.brickId ||
-    lineage.authorId !== bundle.authorId ||
-    lineage.orgId !== bundle.orgId ||
-    !HEX64_RE.test(String(lineage.sourceHash || '')) ||
-    !HEX64_RE.test(String(lineage.blueprintHash || '')) ||
-    !HEX64_RE.test(String(lineage.contractHash || '')) ||
-    !HEX64_RE.test(String(lineage.checksHash || ''))
-  ) {
-    return failEnvelope(
-      tool,
-      'INVALID_BRICK_BUNDLE',
-      'Bundle lineage metadata is missing, inconsistent, or malformed',
-      { field: 'lineage' }
-    );
-  }
-
-  if (
-    !isPlainObject(attestation) ||
-    attestation.algorithm !== 'ed25519' ||
-    attestation.domain !== SEAL_ATTESTATION_DOMAIN ||
-    typeof attestation.publicKeyPem !== 'string' ||
-    attestation.publicKeyPem.trim().length === 0 ||
-    typeof attestation.keyId !== 'string' ||
-    attestation.keyId.trim().length === 0
-  ) {
-    return failEnvelope(
-      tool,
-      'INVALID_BRICK_BUNDLE',
-      'Bundle attestation metadata is missing or unsupported',
-      { field: 'attestation' }
-    );
-  }
-
-  const actualSourceHash = computeCanonicalHash(bundle.source);
-  if (!constantTimeHexEqual(actualSourceHash, lineage.sourceHash)) {
-    return failEnvelope(
-      tool,
-      'BRICK_HASH_MISMATCH',
-      'Brick source hash mismatch; bundle source was modified after sealing',
-      { field: 'sourceHash' }
-    );
-  }
-
-  const actualBlueprintHash = computeCanonicalHash(bundle.blueprint);
-  if (!constantTimeHexEqual(actualBlueprintHash, lineage.blueprintHash)) {
-    return failEnvelope(
-      tool,
-      'BRICK_HASH_MISMATCH',
-      'Brick blueprint hash mismatch; blueprint was modified after sealing',
-      { field: 'blueprintHash' }
-    );
-  }
-
-  // SEC-02: Verify top-level bundle.ontology (when present) matches normalized signed blueprint.ontology!
-  if (bundle.ontology !== undefined) {
-    if (!isPlainObject(bundle.ontology) || !isPlainObject(bundle.blueprint.ontology)) {
-      return failEnvelope(
-        tool,
-        'TAMPERED_ONTOLOGY',
-        'Unsigned or invalid top-level bundle.ontology detected; ontology must match signed blueprint.ontology',
-        { field: 'ontology' }
-      );
-    }
-    const normSignedOnt = normalizeBrickOntology(bundle.blueprint.ontology, {
-      source: bundle.source,
-      blueprint: bundle.blueprint
-    });
-    if (!normSignedOnt.ok) {
-      return failEnvelope(
-        tool,
-        'TAMPERED_ONTOLOGY',
-        `Signed blueprint.ontology failed normalization: ${normSignedOnt.error.message}`,
-        { field: 'ontology' }
-      );
-    }
-    const canonTopOnt = canonicalJsonResult(bundle.ontology);
-    const canonSignedOnt = canonicalJsonResult(normSignedOnt.data.ontology);
-    if (
-      !canonTopOnt.ok ||
-      !canonSignedOnt.ok ||
-      !constantTimeStringEqual(canonTopOnt.json, canonSignedOnt.json)
-    ) {
-      return failEnvelope(
-        tool,
-        'TAMPERED_ONTOLOGY',
-        'Top-level bundle.ontology does not match signed blueprint.ontology',
-        { field: 'ontology' }
-      );
-    }
-  }
-
-  const actualContractHash = computeCanonicalHash(extractContractShape(bundle.blueprint));
-  if (!constantTimeHexEqual(actualContractHash, lineage.contractHash)) {
-    return failEnvelope(tool, 'BRICK_HASH_MISMATCH', 'Brick contract schema hash mismatch', {
-      field: 'contractHash'
-    });
-  }
-
-  const actualChecksHash = computeCanonicalHash(bundle.checks);
-  if (!constantTimeHexEqual(actualChecksHash, lineage.checksHash)) {
-    return failEnvelope(tool, 'BRICK_HASH_MISMATCH', 'Brick verification checks hash mismatch', {
-      field: 'checksHash'
-    });
-  }
-
-  const actualFaultCount = bundle.checks.filter((c) => c.kind === 'fault').length;
-  if (lineage.faultChallengeCount !== actualFaultCount) {
-    return failEnvelope(
-      tool,
-      'BRICK_HASH_MISMATCH',
-      'Lineage faultChallengeCount does not match bundle checks',
-      { field: 'faultChallengeCount' }
-    );
-  }
-
-  let pubKey;
-  let derivedBundleKeyId;
-  try {
-    pubKey = crypto.createPublicKey(attestation.publicKeyPem.trim());
-    if (pubKey.asymmetricKeyType !== 'ed25519') {
-      return failEnvelope(
-        tool,
-        'BRICK_SIGNATURE_INVALID',
-        'Attestation public key is not an Ed25519 key'
-      );
-    }
-    derivedBundleKeyId = derivePublicKeyId(attestation.publicKeyPem);
-  } catch {
-    return failEnvelope(
-      tool,
-      'BRICK_SIGNATURE_INVALID',
-      'Attestation publicKeyPem could not be parsed'
-    );
-  }
-
-  if (!constantTimeStringEqual(attestation.keyId, derivedBundleKeyId)) {
-    return failEnvelope(
-      tool,
-      'BRICK_SIGNATURE_INVALID',
-      'Attestation keyId does not match attestation publicKeyPem',
-      { expectedKeyId: derivedBundleKeyId, actualKeyId: attestation.keyId }
-    );
-  }
-
-  if (
-    trustedPublicKeyPem !== null &&
-    trustedPublicKeyPem !== undefined &&
-    trustedPublicKeyPem !== ''
-  ) {
-    let trustedKeyId;
-    try {
-      if (typeof trustedPublicKeyPem !== 'string') {
-        throw new TypeError('trustedPublicKeyPem must be a PEM string');
-      }
-      const trustedKeyObj = crypto.createPublicKey(trustedPublicKeyPem.trim());
-      if (trustedKeyObj.asymmetricKeyType !== 'ed25519') {
-        throw new TypeError('trustedPublicKeyPem must be an Ed25519 key');
-      }
-      trustedKeyId = derivePublicKeyId(trustedPublicKeyPem);
-    } catch {
-      return failEnvelope(
-        tool,
-        'UNTRUSTED_SIGNING_KEY',
-        'Provided trustedPublicKeyPem is invalid or unsupported'
-      );
-    }
-
-    if (!constantTimeStringEqual(trustedKeyId, derivedBundleKeyId)) {
-      return failEnvelope(
-        tool,
-        'UNTRUSTED_SIGNING_KEY',
-        'Bundle signing key does not match trusted public key',
-        { expectedKeyId: trustedKeyId, actualKeyId: derivedBundleKeyId }
-      );
-    }
-  }
-
-  if (typeof attestation.signature !== 'string' || !HEX128_RE.test(attestation.signature)) {
-    return failEnvelope(
-      tool,
-      'BRICK_SIGNATURE_INVALID',
-      'Attestation signature must be a 128-character lowercase hex Ed25519 signature'
-    );
-  }
-
-  const lineageCanon = canonicalJsonResult(lineage);
-  if (!lineageCanon.ok) {
-    return failEnvelope(
-      tool,
-      'INVALID_BRICK_BUNDLE',
-      `Bundle lineage failed canonical serialization: ${lineageCanon.message}`
-    );
-  }
-
-  const payloadBuf = Buffer.from(`${SEAL_DOMAIN_PREFIX}${lineageCanon.json}`, 'utf8');
-  const signatureBuf = Buffer.from(attestation.signature, 'hex');
-
-  let signatureValid = false;
-  try {
-    signatureValid = crypto.verify(null, payloadBuf, pubKey, signatureBuf);
-  } catch {
-    signatureValid = false;
-  }
-
-  if (!signatureValid) {
-    return failEnvelope(
-      tool,
-      'BRICK_SIGNATURE_INVALID',
-      'Ed25519 attestation signature verification failed',
-      { brickId: bundle.brickId, keyId: derivedBundleKeyId }
-    );
-  }
-
-  return okEnvelope(
-    tool,
-    `Verified Ed25519 seal for "${bundle.brickId}"@${lineage.sourceHash.slice(0, 8)}`,
-    {
-      valid: true,
-      brickId: bundle.brickId,
-      sourceHash: lineage.sourceHash,
-      blueprintHash: lineage.blueprintHash,
-      keyId: attestation.keyId,
-      lineage
-    }
-  );
 }
 
 // ============================================================================
@@ -1045,160 +432,6 @@ function consumeTemplateBody(source, startIdx, out, templateBraceStack, currentB
   return i;
 }
 
-function stripJsCommentsPreservingLiterals(source) {
-  const len = source.length;
-  const out = [];
-  let i = 0;
-  let canStartRegex = true;
-  let braceDepth = 0;
-  const templateBraceStack = [];
-
-  while (i < len) {
-    const ch = source[i];
-    const next = i + 1 < len ? source[i + 1] : '';
-
-    if (ch === '/' && next === '/') {
-      out.push(' ', ' ');
-      i += 2;
-      while (i < len && source[i] !== '\n') {
-        out.push(source[i] === '\r' ? '\r' : ' ');
-        i += 1;
-      }
-      continue;
-    }
-
-    if (ch === '/' && next === '*') {
-      out.push(' ', ' ');
-      i += 2;
-      while (i < len) {
-        if (source[i] === '*' && source[i + 1] === '/') {
-          out.push(' ', ' ');
-          i += 2;
-          break;
-        }
-        out.push(source[i] === '\n' || source[i] === '\r' ? source[i] : ' ');
-        i += 1;
-      }
-      continue;
-    }
-
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      out.push(ch);
-      i += 1;
-      while (i < len) {
-        const c = source[i];
-        out.push(c);
-        i += 1;
-        if (c === '\\' && i < len) {
-          out.push(source[i]);
-          i += 1;
-          continue;
-        }
-        if (c === quote) break;
-      }
-      canStartRegex = false;
-      continue;
-    }
-
-    if (ch === '`') {
-      out.push(ch);
-      i = consumeTemplateBody(source, i + 1, out, templateBraceStack, braceDepth);
-      canStartRegex = templateBraceStack.length > 0;
-      continue;
-    }
-
-    if (
-      ch === '}' &&
-      templateBraceStack.length > 0 &&
-      braceDepth === templateBraceStack[templateBraceStack.length - 1]
-    ) {
-      templateBraceStack.pop();
-      out.push(ch);
-      i = consumeTemplateBody(source, i + 1, out, templateBraceStack, braceDepth);
-      canStartRegex = templateBraceStack.length > 0;
-      continue;
-    }
-
-    if (ch === '/' && canStartRegex && next !== '/' && next !== '*') {
-      out.push(ch);
-      i += 1;
-      let inCharClass = false;
-      while (i < len) {
-        const c = source[i];
-        out.push(c);
-        i += 1;
-        if (c === '\\' && i < len) {
-          out.push(source[i]);
-          i += 1;
-          continue;
-        }
-        if (c === '[') inCharClass = true;
-        else if (c === ']') inCharClass = false;
-        else if (c === '/' && !inCharClass) {
-          while (i < len && isIdentPart(source.charCodeAt(i))) {
-            out.push(source[i]);
-            i += 1;
-          }
-          break;
-        } else if (c === '\n' || c === '\r') {
-          break;
-        }
-      }
-      canStartRegex = false;
-      continue;
-    }
-
-    if (isIdentStart(ch.charCodeAt(0))) {
-      const start = i;
-      while (i < len && isIdentPart(source.charCodeAt(i))) {
-        out.push(source[i]);
-        i += 1;
-      }
-      const word = source.slice(start, i);
-      canStartRegex = REGEX_PRECEDING_KEYWORDS.has(word);
-      continue;
-    }
-
-    if (ch >= '0' && ch <= '9') {
-      while (i < len && (isIdentPart(source.charCodeAt(i)) || source[i] === '.')) {
-        out.push(source[i]);
-        i += 1;
-      }
-      canStartRegex = false;
-      continue;
-    }
-
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') {
-      out.push(ch);
-      i += 1;
-      continue;
-    }
-
-    if (ch === '{') {
-      braceDepth += 1;
-      canStartRegex = true;
-    } else if (ch === '}') {
-      braceDepth = Math.max(0, braceDepth - 1);
-      canStartRegex = false;
-    } else if (ch === ')' || ch === ']') {
-      canStartRegex = false;
-    } else if ((ch === '+' && next === '+') || (ch === '-' && next === '-')) {
-      out.push(ch, next);
-      i += 2;
-      canStartRegex = false;
-      continue;
-    } else {
-      canStartRegex = true;
-    }
-
-    out.push(ch);
-    i += 1;
-  }
-
-  return out.join('');
-}
-
 function stripTypeOnlyDeclarationsForScan(commentStrippedSource) {
   if (typeof nodeModule.stripTypeScriptTypes === 'function') {
     try {
@@ -1207,27 +440,10 @@ function stripTypeOnlyDeclarationsForScan(commentStrippedSource) {
       // Fallback if source has syntax errors caught later
     }
   }
-  return commentStrippedSource
-    .replace(/\bimport\s+type\s+(?:[\s\S]*?\s+from\s+)?['"][^'"]+['"]\s*;?/g, ' ')
-    .replace(/\bexport\s+type\s+\{[\s\S]*?\}(?:\s+from\s+['"][^'"]+['"])?\s*;?/g, ' ')
-    .replace(/\bexport\s+type\s+[A-Za-z_$][A-Za-z0-9_$]*[\s\S]*?;/g, ' ');
-}
-
-function containsPrivateIpv4Literal(text) {
-  const ipv4Re = /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g;
-  for (const match of text.matchAll(ipv4Re)) {
-    const octets = [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4])];
-    if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) continue;
-    const [o1, o2] = octets;
-    const isClassA = o1 === 10;
-    const isClassB = o1 === 172 && o2 >= 16 && o2 <= 31;
-    const isClassC = o1 === 192 && o2 === 168;
-    const isCgnat = o1 === 100 && o2 >= 64 && o2 <= 127;
-    if (isClassA || isClassB || isClassC || isCgnat) {
-      return true;
-    }
-  }
-  return false;
+  return stripTypeOnlyImportExport(commentStrippedSource).replace(
+    /\bexport\s+type\s+[A-Za-z_$][A-Za-z0-9_$]*[^;]*;/g,
+    ' '
+  );
 }
 
 function scanBrickSourceSafety(source) {
@@ -1259,61 +475,103 @@ function scanBrickSourceSafety(source) {
   };
 
   const commentStripped = stripJsCommentsPreservingLiterals(source);
+  const typeStrippedCommentCode = stripTypeOnlyImportExport(commentStripped);
   const runtimeCode = stripTypeOnlyDeclarationsForScan(commentStripped);
 
   const checkSpecifier = (specifier, syntaxKind) => {
-    const clean = String(specifier || '').trim();
-    const bare = clean.startsWith('node:') ? clean.slice(5) : clean;
-    if (clean.startsWith('node:') || BANNED_HOST_MODULES.has(bare)) {
+    const decoded = decodeJsStringSpecifier(String(specifier || '')).trim();
+    const bare = decoded.startsWith('node:') ? decoded.slice(5) : decoded;
+    const baseMod = bare.split('/')[0];
+    if (
+      decoded.startsWith('node:') ||
+      decoded.startsWith('bun:') ||
+      decoded.startsWith('deno:') ||
+      BANNED_HOST_MODULES.has(bare) ||
+      BANNED_HOST_MODULES.has(baseMod)
+    ) {
       pushFinding(
         'AMBIENT_IMPORT_FORBIDDEN',
-        `Forbidden host capability ${syntaxKind} of "${clean}"; inject capability ports via binding`
+        `Forbidden host capability ${syntaxKind} of "${decoded}"; inject capability ports via binding`
       );
       return;
     }
     pushFinding(
       'AMBIENT_IMPORT_FORBIDDEN',
-      `External runtime ${syntaxKind} of "${clean}" is forbidden in sealed bricks`
+      `External runtime ${syntaxKind} of "${decoded}" is forbidden in sealed bricks`
     );
   };
 
-  for (const m of runtimeCode.matchAll(/\bimport\s+(?!type\b)[\s\S]*?\bfrom\s*(['"`])([^'"`]+)\1/g)) {
-    checkSpecifier(m[2], 'import');
-  }
-  for (const m of runtimeCode.matchAll(/\bimport\s*(['"`])([^'"`]+)\1/g)) {
-    checkSpecifier(m[2], 'import');
-  }
-  for (const m of runtimeCode.matchAll(
-    /\bexport\s+(?!type\b)(?:\*(?:\s+as\s+[A-Za-z_$][A-Za-z0-9_$]*)?|\{[\s\S]*?\})\s*from\s*(['"`])([^'"`]+)\1/g
-  )) {
-    checkSpecifier(m[2], 're-export');
-  }
-  for (const m of runtimeCode.matchAll(/(?<!(?:\.\s*|\?\.\s*|function\s+))\bimport\s*\(\s*(?:(['"`])([^'"`]*)\1)?/g)) {
-    if (m[2] !== undefined) checkSpecifier(m[2], 'dynamic import()');
-    else pushFinding('AMBIENT_IMPORT_FORBIDDEN', 'Computed dynamic import() expression is forbidden in sealed bricks');
-  }
-  for (const m of runtimeCode.matchAll(/(?<!(?:\.\s*|\?\.\s*|function\s+))\brequire\s*\(\s*(?:(['"`])([^'"`]*)\1)?/g)) {
-    if (m[2] !== undefined) checkSpecifier(m[2], 'require()');
-    else pushFinding('AMBIENT_IMPORT_FORBIDDEN', 'Dynamic require() call is forbidden in sealed bricks');
+  for (const targetCode of [typeStrippedCommentCode, runtimeCode]) {
+    for (const m of targetCode.matchAll(/\bimport\s+(?!type\b)[\s\S]*?\bfrom\s*(['"`])((?:\\.|(?!\1)[\s\S])*)\1/g)) {
+      checkSpecifier(m[2], 'import');
+    }
+    for (const m of targetCode.matchAll(/\bimport\s*(['"`])((?:\\.|(?!\1)[\s\S])*)\1/g)) {
+      checkSpecifier(m[2], 'import');
+    }
+    for (const m of targetCode.matchAll(
+      /\bexport\s+(?!type\b)(?:\*(?:\s+as\s+[A-Za-z_$][A-Za-z0-9_$]*)?|\{[\s\S]*?\})\s*from\s*(['"`])((?:\\.|(?!\1)[\s\S])*)\1/g
+    )) {
+      checkSpecifier(m[2], 're-export');
+    }
+    for (const m of targetCode.matchAll(
+      /(?<!(?:\.\s*|\?\.\s*|function\s+))\bimport\s*\(\s*(?:(['"`])((?:\\.|(?!\1)(?!\$\{)[\s\S])*)\1\s*\))?/g
+    )) {
+      if (m[2] !== undefined) checkSpecifier(m[2], 'dynamic import()');
+      else pushFinding('AMBIENT_IMPORT_FORBIDDEN', 'Computed dynamic import() expression is forbidden in sealed bricks');
+    }
+    for (const m of targetCode.matchAll(
+      /(?<!(?:\.\s*|\?\.\s*|function\s+))\brequire\s*\(\s*(?:(['"`])((?:\\.|(?!\1)[\s\S])*)\1\s*\))?/g
+    )) {
+      if (m[2] !== undefined) checkSpecifier(m[2], 'require()');
+      else pushFinding('AMBIENT_IMPORT_FORBIDDEN', 'Dynamic require() call is forbidden in sealed bricks');
+    }
   }
 
+  const codeOnly = maskStringAndTemplateBodies(runtimeCode);
+  const rawCodeOnly = maskStringAndTemplateBodies(typeStrippedCommentCode);
+
   if (
-    /\bprocess\s*\.\s*(?:env|exit|binding|dlopen|kill|mainModule|chdir|umask|cwd|argv)\b/.test(runtimeCode) ||
-    /\bprocess\s*\[\s*['"`](?:env|exit|binding|dlopen|kill|mainModule)['"`]\s*\]/.test(runtimeCode) ||
-    /\b(?:globalThis|global)\s*(?:\.\s*process\b|\[\s*['"`]process['"`]\s*\])/.test(runtimeCode)
+    /\bcreateRequire\b/.test(codeOnly) ||
+    /\bimport\s*\.\s*meta\s*\.\s*(?:dirname|filename)\b/.test(codeOnly)
   ) {
     pushFinding(
-      'AMBIENT_PROCESS_FORBIDDEN',
-      'Direct process access (process.env, process.exit, process.binding) is forbidden; inject configuration via binding'
+      'AMBIENT_IMPORT_FORBIDDEN',
+      'CommonJS createRequire or import.meta.dirname/filename host coupling is forbidden in sealed bricks'
     );
   }
 
   if (
-    /\b(?:globalThis|global|window|self)\s*(?:\.\s*fetch\b|\[\s*['"`]fetch['"`]\s*\])/.test(runtimeCode) ||
-    /(?<!(?:\.\s*|\?\.\s*|function\s+))\bfetch\s*\(/.test(runtimeCode) ||
-    /\bXMLHttpRequest\b/.test(runtimeCode) ||
-    /\b(?:globalThis|global|window|self)\s*\.\s*WebSocket\b/.test(runtimeCode) ||
-    /(?<!(?:\.\s*|\?\.\s*|function\s+|class\s+))\bWebSocket\b/.test(runtimeCode)
+    hasRuntimeIdentifierReference(codeOnly, 'process') ||
+    hasRuntimeIdentifierReference(rawCodeOnly, 'process') ||
+    /\.\s*process\b/.test(codeOnly) ||
+    /\b(?:globalThis|global|window|self)\s*\[\s*['"`]process['"`]\s*\]/.test(commentStripped)
+  ) {
+    pushFinding(
+      'AMBIENT_PROCESS_FORBIDDEN',
+      'Direct or aliased process access is forbidden; inject configuration via binding'
+    );
+  }
+
+  if (
+    hasRuntimeIdentifierReference(codeOnly, 'Deno') ||
+    hasRuntimeIdentifierReference(rawCodeOnly, 'Deno') ||
+    /\.\s*Deno\b/.test(codeOnly) ||
+    hasRuntimeIdentifierReference(codeOnly, 'Bun') ||
+    hasRuntimeIdentifierReference(rawCodeOnly, 'Bun') ||
+    /\.\s*Bun\b/.test(codeOnly)
+  ) {
+    pushFinding(
+      'AMBIENT_PROCESS_FORBIDDEN',
+      'Ambient Deno/Bun host runtime access is forbidden; inject capability ports via binding'
+    );
+  }
+
+  if (
+    /\b(?:globalThis|global|window|self)\s*(?:\.\s*fetch\b|\[\s*['"`]fetch['"`]\s*\])/.test(commentStripped) ||
+    /(?<!(?:\.\s*|\?\.\s*|function\s+))\bfetch\s*\(/.test(codeOnly) ||
+    /\bXMLHttpRequest\b/.test(codeOnly) ||
+    /\b(?:globalThis|global|window|self)\s*\.\s*WebSocket\b/.test(codeOnly) ||
+    /(?<!(?:\.\s*|\?\.\s*|function\s+|class\s+))\bWebSocket\b/.test(codeOnly)
   ) {
     pushFinding(
       'AMBIENT_NETWORK_FORBIDDEN',
@@ -1321,17 +579,28 @@ function scanBrickSourceSafety(source) {
     );
   }
 
+  let hasBracketConstructor = false;
+  for (const m of commentStripped.matchAll(/\[\s*(['"`])((?:\\.|(?!\1)[\s\S])*)\1\s*\]/g)) {
+    if (decodeJsStringSpecifier(m[2]).trim() === 'constructor') {
+      hasBracketConstructor = true;
+      break;
+    }
+  }
+
   if (
-    /(?<!(?:\.\s*|\?\.\s*|function\s+))\beval\s*\(/.test(runtimeCode) ||
-    /\b(?:globalThis|global|window|self)\s*\.\s*eval\b/.test(runtimeCode) ||
-    /\(\s*0\s*,\s*eval\s*\)/.test(runtimeCode) ||
-    /\bnew\s+Function\s*\(/.test(runtimeCode) ||
-    /(?<!(?:\.\s*|\?\.\s*|function\s+))\bFunction\s*\(/.test(runtimeCode) ||
-    /\.\s*constructor\s*\.\s*constructor\b/.test(runtimeCode)
+    /(?<!(?:\.\s*|\?\.\s*|function\s+))\beval\s*\(/.test(codeOnly) ||
+    /\b(?:globalThis|global|window|self)\s*\.\s*eval\b/.test(codeOnly) ||
+    /\(\s*0\s*,\s*eval\s*\)/.test(codeOnly) ||
+    /\bnew\s+Function\s*\(/.test(codeOnly) ||
+    /(?<!(?:\.\s*|\?\.\s*|function\s+))\bFunction\s*\(/.test(codeOnly) ||
+    /\.\s*constructor\b/.test(codeOnly) ||
+    hasBracketConstructor ||
+    /\b(?:const|let|var)\s*\{[^}]*\bconstructor\b[^}]*\}\s*=/.test(codeOnly) ||
+    /\b(?:globalThis|global|window|self)\s*(?:\?\.\s*)?\[/.test(codeOnly)
   ) {
     pushFinding(
       'DYNAMIC_CODE_FORBIDDEN',
-      'Dynamic code evaluation (eval, Function constructor) is forbidden inside sealed bricks'
+      'Dynamic code evaluation, .constructor escape, or computed globalThis[...] access is forbidden inside sealed bricks'
     );
   }
 
@@ -1573,9 +842,12 @@ function transpileBrickSourceToCjs(source) {
 
   let i = 0;
   let canStartRegex = true;
+  let afterPropertyDot = false;
+  let pendingControlKeyword = null;
   let braceDepth = 0;
   let parenDepth = 0;
   let bracketDepth = 0;
+  const parenStack = [];
   const templateBraceStack = [];
 
   while (i < len) {
@@ -1593,6 +865,10 @@ function transpileBrickSourceToCjs(source) {
       i = Math.min(len, i + 2);
       continue;
     }
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') {
+      i += 1;
+      continue;
+    }
     if (ch === "'" || ch === '"') {
       const q = ch;
       i += 1;
@@ -1608,11 +884,16 @@ function transpileBrickSourceToCjs(source) {
         i += 1;
       }
       canStartRegex = false;
+      afterPropertyDot = false;
+      pendingControlKeyword = null;
       continue;
     }
     if (ch === '`') {
+      afterPropertyDot = false;
+      pendingControlKeyword = null;
+      const prevLen = templateBraceStack.length;
       i = consumeTemplateBody(code, i + 1, [], templateBraceStack, braceDepth);
-      canStartRegex = templateBraceStack.length > 0;
+      canStartRegex = templateBraceStack.length > prevLen;
       continue;
     }
     if (
@@ -1621,8 +902,11 @@ function transpileBrickSourceToCjs(source) {
       braceDepth === templateBraceStack[templateBraceStack.length - 1]
     ) {
       templateBraceStack.pop();
+      afterPropertyDot = false;
+      pendingControlKeyword = null;
+      const prevLen = templateBraceStack.length;
       i = consumeTemplateBody(code, i + 1, [], templateBraceStack, braceDepth);
-      canStartRegex = templateBraceStack.length > 0;
+      canStartRegex = templateBraceStack.length > prevLen;
       continue;
     }
     if (ch === '/' && canStartRegex && next !== '/' && next !== '*') {
@@ -1630,8 +914,11 @@ function transpileBrickSourceToCjs(source) {
       let inCharClass = false;
       while (i < len) {
         const c = code[i];
+        if (c === '\n' || c === '\r') {
+          break;
+        }
         i += 1;
-        if (c === '\\') {
+        if (c === '\\' && i < len && code[i] !== '\n' && code[i] !== '\r') {
           i += 1;
           continue;
         }
@@ -1640,11 +927,11 @@ function transpileBrickSourceToCjs(source) {
         else if (c === '/' && !inCharClass) {
           while (i < len && isIdentPart(code.charCodeAt(i))) i += 1;
           break;
-        } else if (c === '\n' || c === '\r') {
-          break;
         }
       }
       canStartRegex = false;
+      afterPropertyDot = false;
+      pendingControlKeyword = null;
       continue;
     }
 
@@ -1652,7 +939,6 @@ function transpileBrickSourceToCjs(source) {
       const start = i;
       while (i < len && isIdentPart(code.charCodeAt(i))) i += 1;
       const word = code.slice(start, i);
-      const prevChar = start > 0 ? code[start - 1] : '';
 
       if (
         word === 'export' &&
@@ -1660,7 +946,7 @@ function transpileBrickSourceToCjs(source) {
         parenDepth === 0 &&
         bracketDepth === 0 &&
         templateBraceStack.length === 0 &&
-        prevChar !== '.'
+        !afterPropertyDot
       ) {
         const afterExport = skipWhitespaceAndComments(code, i);
         if (code[afterExport] === '{') {
@@ -1688,6 +974,8 @@ function transpileBrickSourceToCjs(source) {
             edits.push({ start, end: stmtEnd, replacement: '' });
             i = stmtEnd;
             canStartRegex = true;
+            afterPropertyDot = false;
+            pendingControlKeyword = null;
             continue;
           }
         } else {
@@ -1725,6 +1013,8 @@ function transpileBrickSourceToCjs(source) {
             }
             i = kw.end;
             canStartRegex = true;
+            afterPropertyDot = false;
+            pendingControlKeyword = null;
             continue;
           }
 
@@ -1765,17 +1055,79 @@ function transpileBrickSourceToCjs(source) {
         }
       }
 
-      canStartRegex = REGEX_PRECEDING_KEYWORDS.has(word);
+      if (afterPropertyDot) {
+        afterPropertyDot = false;
+        pendingControlKeyword = null;
+        canStartRegex = false;
+      } else if (word === 'await' && pendingControlKeyword === 'for') {
+        pendingControlKeyword = 'for-await';
+        canStartRegex = true;
+      } else if (CONTROL_HEADER_KEYWORDS.has(word)) {
+        pendingControlKeyword = word;
+        canStartRegex = false;
+      } else {
+        pendingControlKeyword = null;
+        canStartRegex = REGEX_PRECEDING_KEYWORDS.has(word);
+      }
       continue;
     }
 
     if (ch >= '0' && ch <= '9') {
       while (i < len && (isIdentPart(code.charCodeAt(i)) || code[i] === '.')) i += 1;
       canStartRegex = false;
+      afterPropertyDot = false;
+      pendingControlKeyword = null;
       continue;
     }
 
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') {
+    if (ch === '?' && next === '.' && !(code[i + 2] >= '0' && code[i + 2] <= '9')) {
+      i += 2;
+      afterPropertyDot = true;
+      canStartRegex = false;
+      pendingControlKeyword = null;
+      continue;
+    }
+
+    if (ch === '.') {
+      if (next === '.' && code[i + 2] === '.') {
+        i += 3;
+        afterPropertyDot = false;
+        canStartRegex = true;
+        pendingControlKeyword = null;
+        continue;
+      }
+      if (next >= '0' && next <= '9') {
+        i += 1;
+        while (i < len && (isIdentPart(code.charCodeAt(i)) || code[i] === '.')) i += 1;
+        afterPropertyDot = false;
+        canStartRegex = false;
+        pendingControlKeyword = null;
+        continue;
+      }
+      i += 1;
+      afterPropertyDot = true;
+      canStartRegex = false;
+      pendingControlKeyword = null;
+      continue;
+    }
+
+    afterPropertyDot = false;
+
+    if (ch === '(') {
+      parenDepth += 1;
+      parenStack.push(pendingControlKeyword !== null ? 'control-header' : 'expr');
+      pendingControlKeyword = null;
+      canStartRegex = true;
+      i += 1;
+      continue;
+    }
+
+    pendingControlKeyword = null;
+
+    if (ch === ')') {
+      parenDepth = Math.max(0, parenDepth - 1);
+      const frame = parenStack.length > 0 ? parenStack.pop() : 'expr';
+      canStartRegex = frame === 'control-header';
       i += 1;
       continue;
     }
@@ -1785,12 +1137,6 @@ function transpileBrickSourceToCjs(source) {
       canStartRegex = true;
     } else if (ch === '}') {
       braceDepth = Math.max(0, braceDepth - 1);
-      canStartRegex = false;
-    } else if (ch === '(') {
-      parenDepth += 1;
-      canStartRegex = true;
-    } else if (ch === ')') {
-      parenDepth = Math.max(0, parenDepth - 1);
       canStartRegex = false;
     } else if (ch === '[') {
       bracketDepth += 1;
@@ -2850,7 +2196,27 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
 
   activeDb.exec(BRICK_EXCHANGE_SCHEMA_SQL);
 
+  function findConflictingBrickOrg(brickId, attemptedOrgId) {
+    const existingRows = activeDb
+      .prepare('SELECT DISTINCT org_id FROM brick_exchange_bricks WHERE brick_id = ?')
+      .all(brickId);
+    const conflict = existingRows.find(
+      (row) => String(row.org_id) !== String(attemptedOrgId)
+    );
+    return conflict ? String(conflict.org_id) : null;
+  }
+
   function persistVerifiedBundle(bundle) {
+    const conflictingOrgId = findConflictingBrickOrg(bundle.brickId, bundle.orgId);
+    if (conflictingOrgId !== null) {
+      return {
+        ok: false,
+        code: 'BRICK_ORG_CONFLICT',
+        ownerOrgId: conflictingOrgId,
+        message: `Brick "${bundle.brickId}" is already owned by organization "${conflictingOrgId}" and cannot be overwritten by "${bundle.orgId}"`
+      };
+    }
+
     const brickKey = `${bundle.brickId}:${bundle.lineage.sourceHash}`;
     const parsedCreatedMs = Date.parse(bundle.createdAt);
     const createdAtMs = Number.isFinite(parsedCreatedMs) ? Math.trunc(parsedCreatedMs) : Date.now();
@@ -2878,7 +2244,8 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
           capabilities_json = excluded.capabilities_json,
           bundle_json = excluded.bundle_json,
           estimated_hours_saved = excluded.estimated_hours_saved,
-          created_at_ms = excluded.created_at_ms`
+          created_at_ms = excluded.created_at_ms
+        WHERE brick_exchange_bricks.org_id = excluded.org_id`
       )
       .run(
         brickKey,
@@ -2896,7 +2263,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
         createdAtMs
       );
 
-    return { brickKey, createdAtMs };
+    return { ok: true, brickKey, createdAtMs };
   }
 
   /**
@@ -3063,6 +2430,38 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       });
     }
 
+    // PERF-02: Enforce MAX_SEAL_CHECKS = 32 before spawning any sandbox subprocesses!
+    if (positiveChecks.length + faultChecks.length > MAX_SEAL_CHECKS) {
+      return failEnvelope(
+        tool,
+        'TOO_MANY_SEAL_CHECKS',
+        `Total verification checks (${positiveChecks.length + faultChecks.length}) exceed MAX_SEAL_CHECKS (${MAX_SEAL_CHECKS})`,
+        {
+          maxSealChecks: MAX_SEAL_CHECKS,
+          positiveCount: positiveChecks.length,
+          faultCount: faultChecks.length,
+          totalCount: positiveChecks.length + faultChecks.length
+        }
+      );
+    }
+
+    // SEC-06: Fast-fail cross-org ownership conflicts before Gate 3 subprocess execution when publish === true.
+    if (publish === true) {
+      const preflightOrgConflict = findConflictingBrickOrg(blueprint.id.trim(), orgId);
+      if (preflightOrgConflict !== null) {
+        return failEnvelope(
+          tool,
+          'BRICK_ORG_CONFLICT',
+          `Brick "${blueprint.id.trim()}" is already owned by organization "${preflightOrgConflict}" and cannot be overwritten by "${orgId}"`,
+          {
+            brickId: blueprint.id.trim(),
+            ownerOrgId: preflightOrgConflict,
+            attemptedOrgId: orgId
+          }
+        );
+      }
+    }
+
     let cjsCode;
     try {
       cjsCode = transpileBrickSourceToCjs(source);
@@ -3092,8 +2491,21 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
 
     const checks = [];
     const repairHints = [];
+    const sealChecksStartNs = process.hrtime.bigint();
+    const getRemainingSealWallClockMs = () =>
+      MAX_SEAL_WALL_CLOCK_MS - Number(process.hrtime.bigint() - sealChecksStartNs) / 1e6;
 
     for (let idx = 0; idx < positiveChecks.length; idx += 1) {
+      const remainingBeforeMs = getRemainingSealWallClockMs();
+      if (remainingBeforeMs <= 0) {
+        return failEnvelope(
+          tool,
+          'SANDBOX_TIMEOUT',
+          `Aggregate sealBrick verification exceeded ${MAX_SEAL_WALL_CLOCK_MS}ms wall-clock budget`,
+          { maxWallClockMs: MAX_SEAL_WALL_CLOCK_MS, completedChecks: checks.length }
+        );
+      }
+
       const check = isPlainObject(positiveChecks[idx]) ? positiveChecks[idx] : {};
       const checkName =
         typeof check.name === 'string' && check.name.trim() ? check.name.trim() : `positive_${idx + 1}`;
@@ -3113,14 +2525,25 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
         }
       }
 
+      const requestedPosTimeoutMs =
+        Number(check.timeoutMs ?? timeoutMs) || DEFAULT_SANDBOX_TIMEOUT_MS;
       const execRes = await executeInPermissionSubprocess({
         cjsCode,
         exportName,
         input: check.input,
         binding: check.binding ?? {},
-        timeoutMs: check.timeoutMs ?? timeoutMs,
+        timeoutMs: Math.max(10, Math.min(requestedPosTimeoutMs, Math.ceil(remainingBeforeMs))),
         maxMemoryMb
       });
+
+      if (getRemainingSealWallClockMs() <= 0) {
+        return failEnvelope(
+          tool,
+          'SANDBOX_TIMEOUT',
+          `Aggregate sealBrick verification exceeded ${MAX_SEAL_WALL_CLOCK_MS}ms wall-clock budget`,
+          { maxWallClockMs: MAX_SEAL_WALL_CLOCK_MS, completedChecks: checks.length }
+        );
+      }
 
       if (!execRes.ok) {
         const detail = `Execution failed (${execRes.code}): ${execRes.message}`;
@@ -3250,6 +2673,16 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     }
 
     for (let idx = 0; idx < faultChecks.length; idx += 1) {
+      const remainingBeforeMs = getRemainingSealWallClockMs();
+      if (remainingBeforeMs <= 0) {
+        return failEnvelope(
+          tool,
+          'SANDBOX_TIMEOUT',
+          `Aggregate sealBrick verification exceeded ${MAX_SEAL_WALL_CLOCK_MS}ms wall-clock budget`,
+          { maxWallClockMs: MAX_SEAL_WALL_CLOCK_MS, completedChecks: checks.length }
+        );
+      }
+
       const fault = isPlainObject(faultChecks[idx]) ? faultChecks[idx] : {};
       const checkName =
         typeof fault.name === 'string' && fault.name.trim() ? fault.name.trim() : `fault_${idx + 1}`;
@@ -3282,14 +2715,25 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
         continue;
       }
 
+      const requestedFaultTimeoutMs =
+        Number(fault.timeoutMs ?? timeoutMs) || DEFAULT_SANDBOX_TIMEOUT_MS;
       const execRes = await executeInPermissionSubprocess({
         cjsCode,
         exportName,
         input: fault.input,
         binding: fault.binding ?? {},
-        timeoutMs: fault.timeoutMs ?? timeoutMs,
+        timeoutMs: Math.max(10, Math.min(requestedFaultTimeoutMs, Math.ceil(remainingBeforeMs))),
         maxMemoryMb
       });
+
+      if (getRemainingSealWallClockMs() <= 0) {
+        return failEnvelope(
+          tool,
+          'SANDBOX_TIMEOUT',
+          `Aggregate sealBrick verification exceeded ${MAX_SEAL_WALL_CLOCK_MS}ms wall-clock budget`,
+          { maxWallClockMs: MAX_SEAL_WALL_CLOCK_MS, completedChecks: checks.length }
+        );
+      }
 
       if (expectThrow) {
         if (execRes.ok) {
@@ -3556,7 +3000,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       );
     }
 
-    // SEC-02: Embed normalized ontology into blueprint.ontology BEFORE computing blueprintHash & mirror on bundle.ontology!
+    // SEC-02 & SEC-04: Embed normalized ontology into blueprint.ontology and bind metadataHash + createdAt === sealedAt!
     const normalizedBlueprint = {
       ...blueprint,
       id: blueprint.id.trim(),
@@ -3577,7 +3021,30 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     );
     const checksHash = computeCanonicalHash(checksSummary);
     const faultChallengeCount = checksSummary.filter((c) => c.kind === 'fault').length;
-    const createdAt = new Date().toISOString();
+
+    const resolvedName =
+      typeof frozenBlueprint.name === 'string' && frozenBlueprint.name.trim()
+        ? frozenBlueprint.name.trim()
+        : frozenBlueprint.id;
+    const resolvedSummary =
+      typeof frozenBlueprint.summary === 'string' ? frozenBlueprint.summary : '';
+    const resolvedBrickClass = String(brickClass).trim();
+    const resolvedReplacesBoilerplate = String(replacesBoilerplate || '');
+    const safeHoursSaved = Number.isFinite(Number(estimatedHoursSaved))
+      ? Math.max(0, Number(estimatedHoursSaved))
+      : 0;
+    const normalizedCapabilities = Object.freeze(normalizeStringArray(capabilities));
+    const metadataHash = computeBrickMetadataHash({
+      brickClass: resolvedBrickClass,
+      capabilities: normalizedCapabilities,
+      estimatedHoursSaved: safeHoursSaved,
+      name: resolvedName,
+      replacesBoilerplate: resolvedReplacesBoilerplate,
+      summary: resolvedSummary
+    });
+
+    const sealedAt = new Date().toISOString();
+    const createdAt = sealedAt;
 
     const lineage = Object.freeze({
       standard: LINEAGE_STANDARD,
@@ -3587,11 +3054,12 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       contractHash,
       sourceHash,
       checksHash,
+      metadataHash,
       faultChallengeCount,
       provenance: 'agent-verified',
       authorId,
       orgId,
-      sealedAt: createdAt
+      sealedAt
     });
 
     const lineageCanon = canonicalJsonResult(lineage);
@@ -3606,24 +3074,16 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     const payloadBuf = Buffer.from(`${SEAL_DOMAIN_PREFIX}${lineageCanon.json}`, 'utf8');
     const signature = crypto.sign(null, payloadBuf, privKey).toString('hex');
 
-    const safeHoursSaved = Number.isFinite(Number(estimatedHoursSaved))
-      ? Math.max(0, Number(estimatedHoursSaved))
-      : 0;
-    const normalizedCapabilities = Object.freeze(normalizeStringArray(capabilities));
-
     const bundle = Object.freeze({
       format: SEALED_BUNDLE_FORMAT,
       brickId: frozenBlueprint.id,
-      name:
-        typeof frozenBlueprint.name === 'string' && frozenBlueprint.name.trim()
-          ? frozenBlueprint.name.trim()
-          : frozenBlueprint.id,
-      summary: typeof frozenBlueprint.summary === 'string' ? frozenBlueprint.summary : '',
-      brickClass: String(brickClass).trim(),
+      name: resolvedName,
+      summary: resolvedSummary,
+      brickClass: resolvedBrickClass,
       authorId,
       orgId,
       capabilities: normalizedCapabilities,
-      replacesBoilerplate: String(replacesBoilerplate || ''),
+      replacesBoilerplate: resolvedReplacesBoilerplate,
       estimatedHoursSaved: safeHoursSaved,
       blueprint: frozenBlueprint,
       ...(isPlainObject(frozenBlueprint.ontology) ? { ontology: frozenBlueprint.ontology } : {}),
@@ -3643,6 +3103,13 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     let publishedBrickKey = null;
     if (publish === true) {
       const pubOut = persistVerifiedBundle(bundle);
+      if (!pubOut.ok) {
+        return failEnvelope(tool, pubOut.code, pubOut.message, {
+          brickId: bundle.brickId,
+          ownerOrgId: pubOut.ownerOrgId,
+          attemptedOrgId: bundle.orgId
+        });
+      }
       publishedBrickKey = pubOut.brickKey;
     }
 
@@ -3659,6 +3126,7 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
           blueprintHash,
           contractHash,
           checksHash,
+          metadataHash,
           checks,
           repairHints: []
         },
@@ -3684,7 +3152,15 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       return failEnvelope(tool, sealCheck.error.code, sealCheck.error.message, sealCheck.error.details);
     }
 
-    const { brickKey, createdAtMs } = persistVerifiedBundle(bundle);
+    const pubOut = persistVerifiedBundle(bundle);
+    if (!pubOut.ok) {
+      return failEnvelope(tool, pubOut.code, pubOut.message, {
+        brickId: bundle.brickId,
+        ownerOrgId: pubOut.ownerOrgId,
+        attemptedOrgId: bundle.orgId
+      });
+    }
+    const { brickKey, createdAtMs } = pubOut;
     return okEnvelope(
       tool,
       `Published sealed brick "${bundle.brickId}" (${brickKey})`,
@@ -3726,33 +3202,48 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
       return failEnvelope(tool, 'INVALID_GRANT_RECIPIENTS', 'recipients must be an array of viewer IDs');
     }
 
-    const row =
-      typeof sourceHash === 'string' && sourceHash.trim()
+    const cleanSourceHash =
+      typeof sourceHash === 'string' && sourceHash.trim() ? sourceHash.trim() : '';
+
+    // SEC-06: Scope lookup to `(brick_id, org_id)` first so cross-org rows never shadow org ownership.
+    const row = cleanSourceHash
+      ? activeDb
+          .prepare(
+            'SELECT * FROM brick_exchange_bricks WHERE brick_id = ? AND source_hash = ? AND org_id = ?'
+          )
+          .get(brickId, cleanSourceHash, issuerOrgId)
+      : activeDb
+          .prepare(
+            'SELECT * FROM brick_exchange_bricks WHERE brick_id = ? AND org_id = ? ORDER BY created_at_ms DESC LIMIT 1'
+          )
+          .get(brickId, issuerOrgId);
+
+    if (!row) {
+      const foreignRow = cleanSourceHash
         ? activeDb
             .prepare(
-              'SELECT * FROM brick_exchange_bricks WHERE brick_id = ? AND source_hash = ?'
+              'SELECT org_id FROM brick_exchange_bricks WHERE brick_id = ? AND source_hash = ? LIMIT 1'
             )
-            .get(brickId, sourceHash.trim())
+            .get(brickId, cleanSourceHash)
         : activeDb
             .prepare(
-              'SELECT * FROM brick_exchange_bricks WHERE brick_id = ? ORDER BY created_at_ms DESC LIMIT 1'
+              'SELECT org_id FROM brick_exchange_bricks WHERE brick_id = ? ORDER BY created_at_ms DESC LIMIT 1'
             )
             .get(brickId);
 
-    if (!row) {
+      if (foreignRow) {
+        return failEnvelope(
+          tool,
+          'GRANT_ISSUER_FORBIDDEN',
+          `Issuer org "${issuerOrgId}" cannot issue grants for brick owned by "${foreignRow.org_id}"`,
+          { brickId, brickOrgId: foreignRow.org_id, issuerOrgId }
+        );
+      }
+
       return failEnvelope(tool, 'BRICK_NOT_FOUND', `Published brick "${brickId}" not found`, {
         brickId,
         sourceHash: sourceHash || null
       });
-    }
-
-    if (String(row.org_id) !== issuerOrgId) {
-      return failEnvelope(
-        tool,
-        'GRANT_ISSUER_FORBIDDEN',
-        `Issuer org "${issuerOrgId}" cannot issue grants for brick owned by "${row.org_id}"`,
-        { brickId, brickOrgId: row.org_id, issuerOrgId }
-      );
     }
 
     const createdAtMs = Date.now();
@@ -4198,6 +3689,133 @@ export function createBrickExchangeEngine({ db, workspaceRoot = process.cwd() } 
     const sealCheck = verifySealedBrickBundle(bundle);
     if (!sealCheck.ok) {
       return failEnvelope(tool, sealCheck.error.code, sealCheck.error.message, sealCheck.error.details);
+    }
+
+    // SEC-05: Enforce grant revocation, expiration, and recipient ACL on direct-bundle adoptions
+    // before synthesizing bindings or writing any files to disk!
+    const evalNowMs = Number.isFinite(Number(rawOpts.nowMs))
+      ? Math.trunc(Number(rawOpts.nowMs))
+      : Date.now();
+    const explicitUserId =
+      typeof (rawOpts.userId ?? rawOpts.viewerId) === 'string'
+        ? String(rawOpts.userId ?? rawOpts.viewerId).trim()
+        : '';
+    const explicitOrgId =
+      typeof (rawOpts.orgId ?? rawOpts.viewerOrgId) === 'string'
+        ? String(rawOpts.orgId ?? rawOpts.viewerOrgId).trim()
+        : '';
+    const cleanGrantId = typeof grantId === 'string' ? grantId.trim() : '';
+
+    if (cleanGrantId.length > 0) {
+      const grantRow = activeDb
+        .prepare(
+          'SELECT * FROM brick_exchange_grants WHERE grant_id = ? AND brick_id = ? AND source_hash = ?'
+        )
+        .get(cleanGrantId, bundle.brickId, bundle.lineage.sourceHash);
+
+      if (
+        !grantRow ||
+        Number(grantRow.revoked) !== 0 ||
+        Number(grantRow.expires_at_ms) <= evalNowMs
+      ) {
+        return failEnvelope(
+          tool,
+          'GRANT_REVOKED_OR_EXPIRED',
+          `Grant "${cleanGrantId}" is missing, revoked, or expired for brick "${bundle.brickId}"`,
+          {
+            grantId: cleanGrantId,
+            brickId: bundle.brickId,
+            sourceHash: bundle.lineage.sourceHash
+          }
+        );
+      }
+
+      const recipients = parseJsonArraySafe(grantRow.recipients_json);
+      const isRecipient =
+        Boolean(explicitUserId) &&
+        (recipients.includes(explicitUserId) ||
+          (Boolean(explicitOrgId) && recipients.includes(`${explicitOrgId}:${explicitUserId}`)));
+      if (!isRecipient) {
+        return failEnvelope(
+          tool,
+          'ADOPT_FORBIDDEN',
+          `User "${explicitUserId || 'anonymous'}" is not an authorized recipient of grant "${cleanGrantId}"`,
+          {
+            grantId: cleanGrantId,
+            brickId: bundle.brickId,
+            userId: explicitUserId || null
+          }
+        );
+      }
+      grantId = cleanGrantId;
+    } else {
+      const storedBrickRow =
+        activeDb
+          .prepare(
+            'SELECT org_id FROM brick_exchange_bricks WHERE brick_id = ? AND source_hash = ? LIMIT 1'
+          )
+          .get(bundle.brickId, bundle.lineage.sourceHash) ||
+        activeDb
+          .prepare('SELECT org_id FROM brick_exchange_bricks WHERE brick_id = ? LIMIT 1')
+          .get(bundle.brickId);
+
+      const isCrossOrgAttempt =
+        Boolean(storedBrickRow) &&
+        Boolean(explicitOrgId) &&
+        String(bundle.orgId) !== explicitOrgId;
+      const isCrossUserWithGrantHistory =
+        Boolean(storedBrickRow) &&
+        !explicitOrgId &&
+        Boolean(explicitUserId) &&
+        String(bundle.authorId) !== explicitUserId;
+
+      if (isCrossOrgAttempt || isCrossUserWithGrantHistory) {
+        const allGrants = activeDb
+          .prepare(
+            `SELECT grant_id, recipients_json, revoked, expires_at_ms
+             FROM brick_exchange_grants
+             WHERE brick_id = ? AND source_hash = ?
+             ORDER BY created_at_ms DESC`
+          )
+          .all(bundle.brickId, bundle.lineage.sourceHash);
+
+        const matchingRecipientGrants = explicitUserId
+          ? allGrants.filter((g) => {
+              const recs = parseJsonArraySafe(g.recipients_json);
+              return (
+                recs.includes(explicitUserId) ||
+                (Boolean(explicitOrgId) && recs.includes(`${explicitOrgId}:${explicitUserId}`))
+              );
+            })
+          : [];
+
+        const activeRecipientGrant = matchingRecipientGrants.find(
+          (g) => Number(g.revoked) === 0 && Number(g.expires_at_ms) > evalNowMs
+        );
+
+        if (activeRecipientGrant) {
+          grantId = String(activeRecipientGrant.grant_id);
+        } else if (matchingRecipientGrants.length > 0) {
+          return failEnvelope(
+            tool,
+            'GRANT_REVOKED_OR_EXPIRED',
+            `Cross-org grant for "${bundle.brickId}" to "${explicitUserId}" has been revoked or expired`,
+            { brickId: bundle.brickId, userId: explicitUserId }
+          );
+        } else if (isCrossOrgAttempt) {
+          return failEnvelope(
+            tool,
+            'ADOPT_FORBIDDEN',
+            `Cross-org adoption of "${bundle.brickId}" (owned by "${bundle.orgId}") by "${explicitOrgId}" requires an active scoped grant`,
+            {
+              brickId: bundle.brickId,
+              ownerOrgId: bundle.orgId,
+              viewerOrgId: explicitOrgId,
+              userId: explicitUserId || null
+            }
+          );
+        }
+      }
     }
 
     if (

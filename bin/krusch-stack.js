@@ -699,8 +699,9 @@ export function startHttpGateway(options = {}) {
             return;
           }
 
-          // SEC-03: Strip internal/callback/clock keys & prototype-pollution keys from untrusted HTTP JSON bodies!
+          // SEC-03 & SEC-05: Strip internal/callback/clock/authority keys & prototype-pollution keys from untrusted HTTP JSON bodies!
           const strippedKeys = new Set([
+            'viewerOrgId',
             'authorizedBricks',
             'tryBrickFn',
             'getAuthorizedBricksFn',
@@ -721,6 +722,18 @@ export function startHttpGateway(options = {}) {
               writable: true,
               configurable: true
             });
+          }
+          if (httpPayload.timeoutMs !== undefined) {
+            const numericTimeout = Math.trunc(Number(httpPayload.timeoutMs));
+            httpPayload.timeoutMs = Number.isFinite(numericTimeout)
+              ? Math.max(10, Math.min(2000, numericTimeout))
+              : 800;
+          }
+          if (httpPayload.maxMemoryMb !== undefined) {
+            const numericMem = Math.trunc(Number(httpPayload.maxMemoryMb));
+            httpPayload.maxMemoryMb = Number.isFinite(numericMem)
+              ? Math.max(16, Math.min(128, numericMem))
+              : 32;
           }
 
           // SEC-02: Enforce workspaceRoot containment on repoDir / repoRoot / targetRepoDir over HTTP and assign canonical path.
@@ -831,13 +844,17 @@ export function startHttpGateway(options = {}) {
             ? 200
             : errCode === 'VIEWER_AUTH_REQUIRED' || errCode === 'INVALID_VIEWER'
               ? 401
-              : errCode === 'GRANT_ISSUER_FORBIDDEN' ||
-                  errCode === 'GRANT_REVOKE_FORBIDDEN' ||
-                  errCode === 'VIEWER_FORBIDDEN' ||
-                  errCode === 'HTTP_INVARIANT_SCRIPT_FORBIDDEN' ||
-                  errCode === 'PATH_OUTSIDE_WORKSPACE'
-                ? 403
-                : 400;
+              : errCode === 'BRICK_ORG_CONFLICT'
+                ? 409
+                : errCode === 'GRANT_ISSUER_FORBIDDEN' ||
+                    errCode === 'GRANT_REVOKE_FORBIDDEN' ||
+                    errCode === 'GRANT_REVOKED_OR_EXPIRED' ||
+                    errCode === 'ADOPT_FORBIDDEN' ||
+                    errCode === 'VIEWER_FORBIDDEN' ||
+                    errCode === 'HTTP_INVARIANT_SCRIPT_FORBIDDEN' ||
+                    errCode === 'PATH_OUTSIDE_WORKSPACE'
+                  ? 403
+                  : 400;
           res.writeHead(status);
           res.end(JSON.stringify(result, null, 2));
         })
@@ -862,6 +879,7 @@ export function startHttpGateway(options = {}) {
               key === 'prototype' ||
               key === 'allowExternalPaths' ||
               key === 'authorizedBricks' ||
+              key === 'viewerOrgId' ||
               key === 'nowMs'
             ) {
               continue;

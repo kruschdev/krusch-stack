@@ -1,7 +1,7 @@
 # KruschStack (`krusch-stack`) Specification
 
 > **Repository**: `https://github.com/kruschdev/krusch-stack.git`
-> **Version**: `1.3.0`
+> **Version**: `1.3.1`
 > **Runtime**: Node.js `>=22.0.0` (Native ESM + `node:sqlite`) & Docker Compose (`pgvector/pgvector:pg16` DDL parity)
 > **License**: MIT
 
@@ -102,9 +102,9 @@
     - `listDriveWorkspace({ folder = "" })`
     - `getWorkspaceStatus()`
 - **`src/engines/router-engine.js`**:
-  - Exports `VERSION = '1.3.0'` and `createRouterEngine({ config })` returning:
-    - `routeTask({ prompt, task_type, budget_tier })`
-    - `getStackStatus({ engines, db })` (reporting `version: '1.3.0'`, `auxiliary_engines`, `hydrascope_tables_ready`, and `brick_exchange_tables_ready`)
+  - Exports `VERSION = '1.3.1'` and `createRouterEngine({ config })` returning:
+    - `routeTask({ prompt, task_type, budget_tier })` (aligned with the 3-Chair Bandit fleet: `gemma4:e2b`, `qwen3-coder-30b-moe:latest`, `inkling-2-mini:ud-iq4_xs-dspark`)
+    - `getStackStatus({ engines, db })` (reporting `version: '1.3.1'`, `auxiliary_engines`, `hydrascope_tables_ready`, and `brick_exchange_tables_ready`)
 
 ### Module Group C: Installer, Doctor & Docker (`src/installer/ide-config.js`, `src/installer/doctor.js`, `Dockerfile`, `docker-compose.yml`, `db/init.sql`)
 - **`src/installer/ide-config.js`**:
@@ -146,8 +146,8 @@
 - **`src/engines/brick-exchange-engine.js` (`krusch-stack/brick-exchange`) & `src/engines/brick-ontology-engine.js` (`krusch-stack/brick-ontology`)**:
   - Exports `BRICK_EXCHANGE_SCHEMA_SQL`, `generateEd25519BrickKeys`, `verifySealedBrickBundle`, `createBrickExchangeEngine({ db, workspaceRoot })`, `CANONICAL_SHARED_TYPES`, `STACK_ONTOLOGY_STACKS`, `STACK_ONTOLOGY_PORTS`, `STACK_ONTOLOGY_CHANNELS`, `STACK_ONTOLOGY_MOE_PROFILES`, `hasForbiddenKeyRecursive`, `parsePortReference`, `isWebStandardPureBrickSource`, `areOntologyPortsCompatible`, `surrogateOntologyVertexId`, `normalizeBrickOntology`, `inspectBrickOntology`, `checkBrickOntologyCompatibility`, `composeCrossStackBricks`, `synthesizeHexagonalBinding`, and `createBrickOntologyEngine`.
   - `stack.brickExchange` exposes `keygen`, `sealBrick`, `verifyBrick`, `publishBrick`, `issueGrant`, `revokeGrant`, `listInbox`, `tryBrick`, `adoptBrick` (honoring `adapterFileName`: `binding.js`, `binding.ts`, `binding_adapter.py`), `auditBrickLocks`, `analyzeBlastRadius`, `planFanOut`, `verifyBlastRadius`, `inspectOntology`, `checkOntologyCompatibility`, `composeCrossStack`, `synthesizeBinding`, and `stats`.
-- **HTTP Gateway Security Contract (`bin/krusch-stack.js`)**:
-  - Mounts `POST /brick-exchange/{keygen,seal,verify,publish,grant,revoke,inbox,try,adopt,audit-locks,blast-radius,fanout,verify-blast-radius,ontology-inspect,ontology-check,ontology-compose,ontology-bind,stats}` while stripping internal/callback keys (`authorizedBricks`, `tryBrickFn`, `getAuthorizedBricksFn`, `invariantScript`, `repairFn`, `assertFn`, `__proto__', `constructor`, `prototype`) from HTTP JSON payloads, requiring authenticated `viewerId` (`401`/`403`) on `POST /brick-exchange/ontology-compose`, and blocking inline `invariantScript` (`403`) on `POST /brick-exchange/verify-blast-radius` while keeping `ALL_STACK_TOOLS.length === 39` unchanged.
+- **HTTP Gateway Security Contract (`bin/krusch-stack.js` & `src/mcp/server.js`, `STATUS: FROZEN 2026-11-21T12:20:00-08:00`)**:
+  - Mounts `POST /brick-exchange/{keygen,seal,verify,publish,grant,revoke,inbox,try,adopt,audit-locks,blast-radius,fanout,verify-blast-radius,ontology-inspect,ontology-check,ontology-compose,ontology-bind,stats}` while stripping internal/callback/authority keys (`viewerOrgId`, `nowMs`, `authorizedBricks`, `tryBrickFn`, `getAuthorizedBricksFn`, `invariantScript`, `repairFn`, `assertFn`, `__proto__`, `constructor`, `prototype`) on HTTP JSON payloads, stripping `nowMs`/callbacks + enforcing `assertPathWithinWorkspace` across both HTTP and MCP `dispatchStackTool`, capping `MAX_SEAL_CHECKS = 32` (`15s` aggregate wall-clock) on `sealBrick`, blocking cross-org `(brick_id, source_hash)` / `brick_id` ownership overwrites (`BRICK_ORG_CONFLICT`), checking `brick_exchange_grants` revocation on direct-bundle `adoptBrick`, sharing `src/engines/shared/js-code-scanner.js` + `src/engines/brick-exchange/seal-crypto.js` (zero circular ESM imports, single `BRICK_EXCHANGE_SCHEMA_SQL` source), requiring authenticated `viewerId` (`401`/`403`) on `POST /brick-exchange/ontology-compose`, and blocking inline `invariantScript` (`403`) on `POST /brick-exchange/verify-blast-radius` while keeping `ALL_STACK_TOOLS.length === 39` unchanged.
 
 ### Module Group G: Tier 2C HydraScope Structural Context Engine (`src/engines/hydrascope-engine.js`, `bin/krusch-stack.js`)
 - **`src/engines/hydrascope-engine.js` (`krusch-stack/hydrascope`)**:
