@@ -19,6 +19,9 @@
  *      evolved rules (GH-EVO-01..05).
  *   8. INV-GH-12 Early Scope & Authorization Drift + SERS data-minimization guard and DART
  *      zero-turn MCP-vs-CLI boundary realization repair/hold.
+ *   9. INV-GH-13 3-Strike Zero-Progress Mutation Stall Breaker (evaluateMutationStallGuard).
+ *  10. INV-GH-14 Upstream Source Fingerprint Drift Invalidation (evaluateSourceFingerprintDrift).
+ *  11. INV-GH-15 // INFALLIBLE: <reason> Panic & Assertion Surface Auditor (auditInfallibleAssertions).
  */
 
 import crypto from 'node:crypto';
@@ -1236,6 +1239,896 @@ function matchesEvolvedRule(rule, toolName, commandText) {
   return true;
 }
 
+function normalizeDigestRelPath(rawPath, resolvedRoot = null) {
+  const raw = String(rawPath ?? '').trim();
+  if (!raw) return '';
+  if (resolvedRoot && path.isAbsolute(raw)) {
+    const rel = path.relative(resolvedRoot, path.resolve(raw));
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      return rel.replace(/\\/g, '/').replace(/^\.\//, '').trim();
+    }
+  }
+  return raw.replace(/\\/g, '/').replace(/^\.\//, '').trim();
+}
+
+function extractMutatedPathsFromArgs(args, extraPaths = [], resolvedRoot = null) {
+  const collected = new Set();
+  const pushCandidate = (val) => {
+    if (typeof val !== 'string') return;
+    const norm = normalizeDigestRelPath(val, resolvedRoot);
+    if (norm) collected.add(norm);
+  };
+
+  if (args && typeof args === 'object' && !Array.isArray(args)) {
+    const scalarKeys = [
+      'path',
+      'relPath',
+      'rel_path',
+      'file_path',
+      'filePath',
+      'target_file',
+      'targetFile',
+      'filename',
+      'destination',
+      'file'
+    ];
+    for (const k of scalarKeys) {
+      pushCandidate(args[k]);
+    }
+    const arrayKeys = ['paths', 'files', 'mutated_paths', 'mutatedPaths'];
+    for (const k of arrayKeys) {
+      if (Array.isArray(args[k])) {
+        for (const item of args[k]) pushCandidate(item);
+      }
+    }
+  }
+
+  if (Array.isArray(extraPaths)) {
+    for (const item of extraPaths) pushCandidate(item);
+  }
+
+  return [...collected];
+}
+
+/**
+ * 3-Strike Zero-Progress Mutation Stall Breaker (`INV-GH-13`).
+ * Tracks consecutive verified edit cycles without throttling normal multi-file edits prior to verification.
+ * @param {object} [options={}]
+ */
+export function evaluateMutationStallGuard(options = {}) {
+  const {
+    priorState = {},
+    isMutating = false,
+    passedCases,
+    totalCases,
+    verificationPassed,
+    maxStalledMutations = 3
+  } = options || {};
+
+  const threshold =
+    Number.isInteger(Number(maxStalledMutations)) && Number(maxStalledMutations) > 0
+      ? Number(maxStalledMutations)
+      : 3;
+
+  const safePrior =
+    priorState && typeof priorState === 'object' && !Array.isArray(priorState) ? priorState : {};
+  const prevStreak =
+    Number.isFinite(Number(safePrior.stalledStreak)) && Number(safePrior.stalledStreak) >= 0
+      ? Math.trunc(Number(safePrior.stalledStreak))
+      : 0;
+  const prevBest =
+    safePrior.bestPassedCases !== null &&
+    safePrior.bestPassedCases !== undefined &&
+    safePrior.bestPassedCases !== '' &&
+    typeof safePrior.bestPassedCases !== 'boolean' &&
+    Number.isFinite(Number(safePrior.bestPassedCases))
+      ? Math.max(0, Math.trunc(Number(safePrior.bestPassedCases)))
+      : null;
+  const prevMutations =
+    Number.isFinite(Number(safePrior.mutationsSinceLastEval)) &&
+    Number(safePrior.mutationsSinceLastEval) >= 0
+      ? Math.trunc(Number(safePrior.mutationsSinceLastEval))
+      : 0;
+  const prevHolds =
+    Number.isFinite(Number(safePrior.stalledHolds)) && Number(safePrior.stalledHolds) >= 0
+      ? Math.trunc(Number(safePrior.stalledHolds))
+      : 0;
+
+  const hasNumericPassed =
+    passedCases !== undefined &&
+    passedCases !== null &&
+    passedCases !== '' &&
+    typeof passedCases !== 'boolean' &&
+    Number.isFinite(Number(passedCases));
+  const hasNumericTotal =
+    totalCases !== undefined &&
+    totalCases !== null &&
+    totalCases !== '' &&
+    typeof totalCases !== 'boolean' &&
+    Number.isFinite(Number(totalCases));
+  const hasEvalSignal = typeof verificationPassed === 'boolean' || hasNumericPassed;
+
+  let stalledStreak = prevStreak;
+  let bestPassedCases = prevBest;
+  let mutationsSinceLastEval = prevMutations;
+
+  if (!hasEvalSignal) {
+    if (isMutating === true) {
+      mutationsSinceLastEval = prevMutations + 1;
+    }
+  } else {
+    const numericPassed = hasNumericPassed ? Math.max(0, Math.trunc(Number(passedCases))) : null;
+    const numericTotal = hasNumericTotal ? Math.max(0, Math.trunc(Number(totalCases))) : null;
+    const allPassed =
+      verificationPassed === true ||
+      (numericPassed !== null &&
+        numericTotal !== null &&
+        numericTotal > 0 &&
+        numericPassed >= numericTotal &&
+        verificationPassed !== false);
+
+    if (allPassed) {
+      stalledStreak = 0;
+      mutationsSinceLastEval = 0;
+      bestPassedCases = numericPassed !== null ? Math.max(prevBest ?? 0, numericPassed) : prevBest;
+    } else if (prevBest !== null && numericPassed !== null && numericPassed > prevBest) {
+      stalledStreak = 0;
+      bestPassedCases = numericPassed;
+      mutationsSinceLastEval = 0;
+    } else if (prevBest === null && prevMutations === 0 && isMutating !== true) {
+      bestPassedCases = numericPassed ?? 0;
+      stalledStreak = 0;
+      mutationsSinceLastEval = 0;
+    } else {
+      stalledStreak = prevStreak + 1;
+      bestPassedCases =
+        prevBest === null
+          ? (numericPassed ?? 0)
+          : numericPassed !== null
+            ? Math.max(prevBest, numericPassed)
+            : prevBest;
+      mutationsSinceLastEval = 0;
+    }
+  }
+
+  const stalled = stalledStreak >= threshold;
+  const reason = stalled ? 'STALLED_MUTATION_LOOP' : null;
+  const correctivePrompt = stalled
+    ? `MUTATION STALL GUARD (STALLED_MUTATION_LOOP): ${stalledStreak} consecutive verified mutation cycle(s) failed to improve passing test cases (bestPassedCases=${bestPassedCases ?? 0}). Stop blind editing, diagnose the remaining assertion mismatches or missing domain rules, or escalate blockers to the user.`
+    : null;
+
+  return {
+    stalled,
+    stalledStreak,
+    bestPassedCases,
+    mutationsSinceLastEval,
+    maxStalledMutations: threshold,
+    reason,
+    correctivePrompt,
+    nextState: {
+      stalledStreak,
+      bestPassedCases,
+      mutationsSinceLastEval,
+      stalledHolds: prevHolds
+    }
+  };
+}
+
+/**
+ * Upstream Source Fingerprint Drift Invalidation (`INV-GH-14`).
+ * Compares baseline SHA-256 fileDigests against currentDigests or safe bounded workspaceDir reads,
+ * ignoring paths mutated by the active session (`sessionMutatedPaths`).
+ * @param {object} [options={}]
+ */
+export function evaluateSourceFingerprintDrift(options = {}) {
+  const {
+    baselineDigests = {},
+    currentDigests = null,
+    workspaceDir = null,
+    sessionMutatedPaths = []
+  } = options || {};
+
+  const safeBaseline =
+    baselineDigests && typeof baselineDigests === 'object' && !Array.isArray(baselineDigests)
+      ? baselineDigests
+      : {};
+  const hasCurrentMap =
+    currentDigests !== null &&
+    typeof currentDigests === 'object' &&
+    !Array.isArray(currentDigests);
+  const resolvedWorkspace =
+    typeof workspaceDir === 'string' && workspaceDir.trim()
+      ? path.resolve(workspaceDir.trim())
+      : null;
+
+  if (!hasCurrentMap && !resolvedWorkspace) {
+    return {
+      drifted: false,
+      driftedFiles: [],
+      checkedCount: 0,
+      reason: null,
+      correctivePrompt: null
+    };
+  }
+
+  const mutatedSet = new Set(
+    (Array.isArray(sessionMutatedPaths) ? sessionMutatedPaths : [])
+      .map((p) => normalizeDigestRelPath(p, resolvedWorkspace))
+      .filter(Boolean)
+  );
+
+  const normalizedCurrentMap = new Map();
+  if (hasCurrentMap) {
+    for (const [rawKey, val] of Object.entries(currentDigests)) {
+      const normKey = normalizeDigestRelPath(rawKey, resolvedWorkspace);
+      if (!normKey) continue;
+      normalizedCurrentMap.set(
+        normKey,
+        typeof val === 'string' && val.trim() ? val.trim() : null
+      );
+    }
+  }
+
+  const baselineEntries = Object.entries(safeBaseline)
+    .map(([rawKey, expectedVal]) => ({
+      normPath: normalizeDigestRelPath(rawKey, resolvedWorkspace),
+      expectedSha256: typeof expectedVal === 'string' ? expectedVal.trim() : ''
+    }))
+    .filter((entry) => entry.normPath && entry.expectedSha256)
+    .sort((a, b) => a.normPath.localeCompare(b.normPath));
+
+  const driftedFiles = [];
+  let checkedCount = 0;
+
+  let realWorkspace = null;
+  if (resolvedWorkspace) {
+    try {
+      realWorkspace = fs.realpathSync(resolvedWorkspace);
+    } catch {
+      realWorkspace = null;
+    }
+  }
+
+  const isLexicallyContained = (rootDir, targetAbs) => {
+    const rel = path.relative(rootDir, targetAbs);
+    return Boolean(
+      rel &&
+      rel !== '..' &&
+      !rel.startsWith('../') &&
+      !rel.startsWith('..\\') &&
+      !path.isAbsolute(rel)
+    );
+  };
+
+  const readSafeStackWorkspaceSha256 = (normPath) => {
+    if (!resolvedWorkspace || !realWorkspace || !normPath || path.isAbsolute(normPath)) {
+      return { validPath: false, sha256: null };
+    }
+    const segments = normPath.split('/');
+    if (segments.some((seg) => seg === '..' || seg === '')) {
+      return { validPath: false, sha256: null };
+    }
+    const candidateFull = path.resolve(resolvedWorkspace, normPath);
+    if (!isLexicallyContained(resolvedWorkspace, candidateFull)) {
+      return { validPath: false, sha256: null };
+    }
+
+    let probeDir = path.dirname(candidateFull);
+    while (probeDir.length >= resolvedWorkspace.length) {
+      if (fs.existsSync(probeDir)) {
+        try {
+          const realAncestor = fs.realpathSync(probeDir);
+          if (realAncestor !== realWorkspace && !isLexicallyContained(realWorkspace, realAncestor)) {
+            return { validPath: false, sha256: null };
+          }
+        } catch {
+          return { validPath: false, sha256: null };
+        }
+        break;
+      }
+      const nextParent = path.dirname(probeDir);
+      if (nextParent === probeDir) break;
+      probeDir = nextParent;
+    }
+
+    let lstat;
+    try {
+      lstat = fs.lstatSync(candidateFull);
+    } catch (err) {
+      if (err && typeof err === 'object' && err.code === 'ENOENT') {
+        return { validPath: true, sha256: null };
+      }
+      return { validPath: false, sha256: null };
+    }
+
+    try {
+      const realTarget = fs.realpathSync(candidateFull);
+      if (realTarget !== realWorkspace && !isLexicallyContained(realWorkspace, realTarget)) {
+        return { validPath: false, sha256: null };
+      }
+      const st = lstat.isSymbolicLink() ? fs.statSync(realTarget) : lstat;
+      if (!st.isFile() || st.size > 16 * 1024 * 1024) {
+        return { validPath: false, sha256: null };
+      }
+      return { validPath: true, sha256: sha256Hex(fs.readFileSync(realTarget)) };
+    } catch {
+      return { validPath: false, sha256: null };
+    }
+  };
+
+  for (const { normPath, expectedSha256 } of baselineEntries) {
+    if (mutatedSet.has(normPath)) continue;
+
+    let actualSha256 = null;
+    if (hasCurrentMap) {
+      if (normalizedCurrentMap.has(normPath)) {
+        actualSha256 = normalizedCurrentMap.get(normPath);
+      } else if (resolvedWorkspace) {
+        const diskRes = readSafeStackWorkspaceSha256(normPath);
+        if (!diskRes.validPath) {
+          continue;
+        }
+        actualSha256 = diskRes.sha256;
+      } else {
+        actualSha256 = null;
+      }
+      checkedCount += 1;
+    } else if (resolvedWorkspace) {
+      const diskRes = readSafeStackWorkspaceSha256(normPath);
+      if (!diskRes.validPath) {
+        continue;
+      }
+      checkedCount += 1;
+      actualSha256 = diskRes.sha256;
+    }
+
+    if (actualSha256 === null) {
+      driftedFiles.push({
+        path: normPath,
+        expectedSha256,
+        actualSha256: null,
+        status: 'DELETED_UPSTREAM'
+      });
+    } else if (actualSha256.toLowerCase() !== expectedSha256.toLowerCase()) {
+      driftedFiles.push({
+        path: normPath,
+        expectedSha256,
+        actualSha256,
+        status: 'MODIFIED_UPSTREAM'
+      });
+    }
+  }
+
+  const drifted = driftedFiles.length > 0;
+  return {
+    drifted,
+    driftedFiles,
+    checkedCount,
+    reason: drifted ? 'STALE_GROUNDING_DRIFT' : null,
+    correctivePrompt: drifted
+      ? `SOURCE FINGERPRINT DRIFT (STALE_GROUNDING_DRIFT): ${driftedFiles.length} upstream file(s) changed outside this session (${driftedFiles.map((f) => `${f.path}:${f.status}`).join(', ')}). Re-ground or re-read affected files and re-verify before stopping.`
+      : null
+  };
+}
+
+function stripCodeForInfallibleAudit(src, lang) {
+  const len = src.length;
+  const out = new Array(len);
+  const rawLines = src.split('\n');
+  const lineHasInfallible = new Array(rawLines.length).fill(false);
+  let i = 0;
+  let lineIdx = 0;
+  let lastNonWsChar = '';
+  let inJsTemplate = false;
+  let jsBraceDepth = 0;
+  const jsTemplateBraceStack = [];
+
+  while (i < len) {
+    const ch = src[i];
+    const next = src[i + 1] || '';
+
+    if (inJsTemplate) {
+      if (ch === '\\' && i + 1 < len) {
+        out[i] = ' ';
+        if (src[i + 1] === '\n') {
+          out[i + 1] = '\n';
+          lineIdx += 1;
+        } else {
+          out[i + 1] = ' ';
+        }
+        i += 2;
+        continue;
+      }
+      if (ch === '$' && next === '{') {
+        jsTemplateBraceStack.push(jsBraceDepth);
+        inJsTemplate = false;
+        out[i] = ' ';
+        out[i + 1] = ' ';
+        lastNonWsChar = '{';
+        i += 2;
+        continue;
+      }
+      if (ch === '`') {
+        inJsTemplate = false;
+        out[i] = ' ';
+        lastNonWsChar = '`';
+        i += 1;
+        continue;
+      }
+      if (ch === '\n') {
+        out[i] = '\n';
+        lineIdx += 1;
+      } else {
+        out[i] = ' ';
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === '\n') {
+      out[i] = '\n';
+      lineIdx += 1;
+      i += 1;
+      continue;
+    }
+
+    // Line comment //
+    if (ch === '/' && next === '/') {
+      const commentStart = i;
+      while (i < len && src[i] !== '\n') {
+        out[i] = ' ';
+        i += 1;
+      }
+      const commentSlice = src.slice(commentStart, i);
+      if (/^\/\/\s*INFALLIBLE\s*:\s*(?:\S\s*){3,}/.test(commentSlice)) {
+        lineHasInfallible[lineIdx] = true;
+      }
+      continue;
+    }
+
+    // Block comment /* ... */ (supports nested comments in Rust)
+    if (ch === '/' && next === '*') {
+      out[i] = ' ';
+      out[i + 1] = ' ';
+      i += 2;
+      let depth = 1;
+      while (i < len && depth > 0) {
+        if (src[i] === '\n') {
+          out[i] = '\n';
+          lineIdx += 1;
+          i += 1;
+        } else if (lang === 'rust' && src[i] === '/' && src[i + 1] === '*') {
+          depth += 1;
+          out[i] = ' ';
+          out[i + 1] = ' ';
+          i += 2;
+        } else if (src[i] === '*' && src[i + 1] === '/') {
+          depth -= 1;
+          out[i] = ' ';
+          out[i + 1] = ' ';
+          i += 2;
+        } else {
+          out[i] = ' ';
+          i += 1;
+        }
+      }
+      continue;
+    }
+
+    if (lang === 'rust') {
+      // Rust raw strings r"...", r#"..."#, br#"..."#
+      const prevChar = i > 0 ? src[i - 1] : '';
+      if (
+        !/[A-Za-z0-9_]/.test(prevChar) &&
+        (ch === 'r' || (ch === 'b' && next === 'r'))
+      ) {
+        let p = ch === 'b' ? i + 2 : i + 1;
+        let hashes = 0;
+        while (p < len && src[p] === '#') {
+          hashes += 1;
+          p += 1;
+        }
+        if (p < len && src[p] === '"') {
+          for (let k = i; k <= p; k += 1) out[k] = ' ';
+          i = p + 1;
+          while (i < len) {
+            if (src[i] === '\n') {
+              out[i] = '\n';
+              lineIdx += 1;
+              i += 1;
+              continue;
+            }
+            if (src[i] === '"') {
+              let matched = 0;
+              while (matched < hashes && src[i + 1 + matched] === '#') {
+                matched += 1;
+              }
+              if (matched === hashes) {
+                for (let k = 0; k <= hashes; k += 1) out[i + k] = ' ';
+                i += hashes + 1;
+                lastNonWsChar = '"';
+                break;
+              }
+            }
+            out[i] = ' ';
+            i += 1;
+          }
+          continue;
+        }
+      }
+
+      // Rust char literals vs lifetimes ('a / 'static)
+      if (ch === "'") {
+        if (next === '\\') {
+          let endQuote = -1;
+          for (let k = i + 2; k < Math.min(len, i + 14) && src[k] !== '\n'; k += 1) {
+            if (src[k] === "'") {
+              endQuote = k;
+              break;
+            }
+          }
+          if (endQuote !== -1) {
+            for (let k = i; k <= endQuote; k += 1) out[k] = ' ';
+            i = endQuote + 1;
+            lastNonWsChar = "'";
+            continue;
+          }
+        } else if (i + 2 < len && next !== "'" && next !== '\n' && src[i + 2] === "'") {
+          out[i] = ' ';
+          out[i + 1] = ' ';
+          out[i + 2] = ' ';
+          i += 3;
+          lastNonWsChar = "'";
+          continue;
+        }
+        out[i] = ch;
+        lastNonWsChar = ch;
+        i += 1;
+        continue;
+      }
+
+      // Rust standard string "..."
+      if (ch === '"') {
+        out[i] = ' ';
+        i += 1;
+        while (i < len) {
+          if (src[i] === '\n') {
+            out[i] = '\n';
+            lineIdx += 1;
+            i += 1;
+          } else if (src[i] === '\\') {
+            out[i] = ' ';
+            if (i + 1 < len) {
+              if (src[i + 1] === '\n') {
+                out[i + 1] = '\n';
+                lineIdx += 1;
+              } else {
+                out[i + 1] = ' ';
+              }
+              i += 2;
+            } else {
+              i += 1;
+            }
+          } else if (src[i] === '"') {
+            out[i] = ' ';
+            i += 1;
+            lastNonWsChar = '"';
+            break;
+          } else {
+            out[i] = ' ';
+            i += 1;
+          }
+        }
+        continue;
+      }
+    } else {
+      // JS/TS string & template literals (with ${...} interpolation code recovery)
+      if (ch === '`') {
+        inJsTemplate = true;
+        out[i] = ' ';
+        i += 1;
+        continue;
+      }
+      if (ch === '{') {
+        jsBraceDepth += 1;
+        out[i] = '{';
+        lastNonWsChar = '{';
+        i += 1;
+        continue;
+      }
+      if (ch === '}') {
+        if (
+          jsTemplateBraceStack.length > 0 &&
+          jsBraceDepth === jsTemplateBraceStack[jsTemplateBraceStack.length - 1]
+        ) {
+          jsTemplateBraceStack.pop();
+          inJsTemplate = true;
+          out[i] = ' ';
+          i += 1;
+          continue;
+        }
+        jsBraceDepth = Math.max(0, jsBraceDepth - 1);
+        out[i] = '}';
+        lastNonWsChar = '}';
+        i += 1;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        const quote = ch;
+        out[i] = ' ';
+        i += 1;
+        while (i < len) {
+          if (src[i] === '\n') {
+            out[i] = '\n';
+            lineIdx += 1;
+            i += 1;
+            break;
+          } else if (src[i] === '\\') {
+            out[i] = ' ';
+            if (i + 1 < len) {
+              if (src[i + 1] === '\n') {
+                out[i + 1] = '\n';
+                lineIdx += 1;
+              } else {
+                out[i + 1] = ' ';
+              }
+              i += 2;
+            } else {
+              i += 1;
+            }
+          } else if (src[i] === quote) {
+            out[i] = ' ';
+            i += 1;
+            lastNonWsChar = quote;
+            break;
+          } else {
+            out[i] = ' ';
+            i += 1;
+          }
+        }
+        continue;
+      }
+
+      // JS/TS single-line regex literal /.../flags
+      if (
+        ch === '/' &&
+        (!lastNonWsChar || '=(,[!&|?:;{}~+-*%^<>'.includes(lastNonWsChar))
+      ) {
+        let p = i + 1;
+        let inCharClass = false;
+        let closeSlash = -1;
+        while (p < len && src[p] !== '\n') {
+          if (src[p] === '\\') {
+            p += 2;
+            continue;
+          }
+          if (src[p] === '[') {
+            inCharClass = true;
+            p += 1;
+            continue;
+          }
+          if (src[p] === ']') {
+            inCharClass = false;
+            p += 1;
+            continue;
+          }
+          if (!inCharClass && src[p] === '/') {
+            closeSlash = p;
+            break;
+          }
+          p += 1;
+        }
+        if (closeSlash > i + 1) {
+          let endRe = closeSlash + 1;
+          while (endRe < len && /[dgimsuvy]/.test(src[endRe])) {
+            endRe += 1;
+          }
+          for (let k = i; k < endRe; k += 1) out[k] = ' ';
+          i = endRe;
+          lastNonWsChar = '/';
+          continue;
+        }
+      }
+    }
+
+    out[i] = ch;
+    if (!/\s/.test(ch)) {
+      lastNonWsChar = ch;
+    }
+    i += 1;
+  }
+
+  // Blank out Rust #[cfg(test)] items while preserving exact line numbers
+  if (lang === 'rust') {
+    const joined = out.join('');
+    const cfgTestRe = /#\[\s*cfg\s*\(\s*test\s*\)\s*\]/g;
+    for (const m of joined.matchAll(cfgTestRe)) {
+      const startIdx = m.index;
+      if (out[startIdx] === ' ') continue;
+      let cursor = startIdx + m[0].length;
+      while (cursor < len) {
+        while (cursor < len && /\s/.test(out[cursor])) cursor += 1;
+        if (out[cursor] === '#' && out[cursor + 1] === '[') {
+          let bracketDepth = 1;
+          cursor += 2;
+          while (cursor < len && bracketDepth > 0) {
+            if (out[cursor] === '[') bracketDepth += 1;
+            else if (out[cursor] === ']') bracketDepth -= 1;
+            cursor += 1;
+          }
+          continue;
+        }
+        break;
+      }
+      while (cursor < len && out[cursor] !== '{' && out[cursor] !== ';') {
+        cursor += 1;
+      }
+      let endIdx = cursor;
+      if (cursor < len && out[cursor] === '{') {
+        let braceDepth = 1;
+        cursor += 1;
+        while (cursor < len && braceDepth > 0) {
+          if (out[cursor] === '{') braceDepth += 1;
+          else if (out[cursor] === '}') braceDepth -= 1;
+          cursor += 1;
+        }
+        endIdx = cursor - 1;
+      }
+      for (let k = startIdx; k <= Math.min(len - 1, endIdx); k += 1) {
+        if (out[k] !== '\n') out[k] = ' ';
+      }
+    }
+  }
+
+  return {
+    rawLines,
+    strippedCode: out.join(''),
+    strippedLines: out.join('').split('\n'),
+    lineHasInfallible
+  };
+}
+
+/**
+ * `// INFALLIBLE: <reason>` Panic & Assertion Surface Auditor (`INV-GH-15`).
+ * Scans fallible Rust (`Result<...>`) and JS/TS (`okEnvelope`/`errorEnvelope`) modules while ignoring
+ * string literals, comments, and Rust `#[cfg(test)]` modules.
+ * @param {object} [options={}]
+ */
+export function auditInfallibleAssertions(options = {}) {
+  const {
+    code = '',
+    filePath = '',
+    language = '',
+    requireFallibleContract = true
+  } = options || {};
+
+  const normalizedCode = String(code ?? '').replace(/\r\n/g, '\n');
+  const safeFilePath = String(filePath || '');
+  const langHint = String(language || '').trim().toLowerCase();
+  const extHint = path.extname(safeFilePath.trim()).toLowerCase();
+
+  let detectedLanguage = 'javascript';
+  if (langHint === 'rust' || langHint === 'rs') {
+    detectedLanguage = 'rust';
+  } else if (
+    langHint === 'js' ||
+    langHint === 'javascript' ||
+    langHint === 'mjs' ||
+    langHint === 'cjs' ||
+    langHint === 'ts' ||
+    langHint === 'tsx' ||
+    langHint === 'jsx' ||
+    langHint === 'typescript'
+  ) {
+    detectedLanguage = 'javascript';
+  } else if (
+    extHint === '.rs' ||
+    /\bfn\s+[A-Za-z0-9_]+\s*(?:<[^>]*>)?\s*\([^)]*\)\s*->\s*Result\b|\bpub\s+(?:fn|struct|enum|mod|trait)\b|#\[\s*cfg\s*\(|\b(?:unimplemented|todo|panic)!\s*[([]/.test(
+      normalizedCode
+    )
+  ) {
+    detectedLanguage = 'rust';
+  }
+
+  const { rawLines, strippedCode, strippedLines, lineHasInfallible } =
+    stripCodeForInfallibleAudit(normalizedCode, detectedLanguage);
+
+  const fallibleContractDetected =
+    detectedLanguage === 'rust'
+      ? /\bResult\s*</.test(strippedCode)
+      : /\b(?:okEnvelope|errorEnvelope)\b/.test(strippedCode);
+
+  if (requireFallibleContract !== false && !fallibleContractDetected) {
+    return {
+      passed: true,
+      language: detectedLanguage,
+      fallibleContractDetected: false,
+      findings: [],
+      reason: null,
+      correctivePrompt: null
+    };
+  }
+
+  const rules =
+    detectedLanguage === 'rust'
+      ? [
+          {
+            kind: 'unwrap',
+            re: /\.\s*unwrap\s*\(\s*\)/g,
+            allowInfallibleComment: true,
+            fix: 'Propagate errors via Result/? or annotate mathematically guaranteed invariants with // INFALLIBLE: <reason>.'
+          },
+          {
+            kind: 'expect',
+            re: /\.\s*expect\s*\(/g,
+            allowInfallibleComment: true,
+            fix: 'Propagate errors via Result/? or annotate mathematically guaranteed invariants with // INFALLIBLE: <reason>.'
+          },
+          {
+            kind: 'panic!',
+            re: /\bpanic!\s*[([]/g,
+            allowInfallibleComment: true,
+            fix: 'Return Err(...) instead of panicking or annotate unreachable invariant with // INFALLIBLE: <reason>.'
+          },
+          {
+            kind: 'unimplemented!',
+            re: /\bunimplemented!\s*[([]/g,
+            allowInfallibleComment: false,
+            fix: 'Replace unimplemented! stub with a complete fallible implementation.'
+          },
+          {
+            kind: 'todo!',
+            re: /\btodo!\s*[([]/g,
+            allowInfallibleComment: false,
+            fix: 'Replace todo! stub with a complete fallible implementation.'
+          }
+        ]
+      : [
+          {
+            kind: 'process.exit',
+            re: /\bprocess\s*\.\s*exit\s*\(/g,
+            allowInfallibleComment: true,
+            fix: 'Return errorEnvelope(...) instead of calling process.exit(...), or annotate CLI entrypoint boundary with // INFALLIBLE: <reason>.'
+          }
+        ];
+
+  const findings = [];
+  for (let idx = 0; idx < strippedLines.length; idx += 1) {
+    const lineText = strippedLines[idx];
+    if (!lineText.trim()) continue;
+    const hasAnnotation =
+      Boolean(lineHasInfallible[idx]) || (idx > 0 && Boolean(lineHasInfallible[idx - 1]));
+
+    for (const rule of rules) {
+      if (rule.allowInfallibleComment && hasAnnotation) continue;
+      rule.re.lastIndex = 0;
+      for (const m of lineText.matchAll(rule.re)) {
+        findings.push({
+          line: idx + 1,
+          column: (m.index ?? 0) + 1,
+          kind: rule.kind,
+          snippet: String(rawLines[idx] || '').trim().slice(0, 160),
+          filePath: safeFilePath,
+          fix: rule.fix
+        });
+      }
+    }
+  }
+
+  findings.sort((a, b) => a.line - b.line || a.column - b.column);
+  const passed = findings.length === 0;
+  return {
+    passed,
+    language: detectedLanguage,
+    fallibleContractDetected,
+    findings,
+    reason: passed ? null : 'UNEXPLAINED_INFALLIBLE_ASSERTION',
+    correctivePrompt: passed
+      ? null
+      : `INFALLIBLE ASSERTION AUDIT (UNEXPLAINED_INFALLIBLE_ASSERTION): Found ${findings.length} unannotated panic/exit/stub site(s) in ${safeFilePath || detectedLanguage} (${findings.map((f) => `L${f.line}:${f.kind}`).join(', ')}). Propagate errors cleanly or add // INFALLIBLE: <reason> where guaranteed.`
+  };
+}
+
 /**
  * Create the zero-dependency SQLite-backed Grounded Harness Engine (`stack.groundedHarness`).
  * @param {object} options
@@ -1411,6 +2304,22 @@ export function createGroundedHarnessEngine({
       params.enable_auth_drift_guard !== false && params.enableAuthDriftGuard !== false;
     const enableDartBoundaryGuard =
       params.enable_dart_boundary_guard !== false && params.enableDartBoundaryGuard !== false;
+    const rawMaxStall = Number(
+      params.max_stalled_mutations ?? params.maxStalledMutations ?? 3
+    );
+    const maxStalledMutations =
+      Number.isInteger(rawMaxStall) && rawMaxStall > 0 ? rawMaxStall : 3;
+    const enableMutationStallGuard =
+      params.enable_mutation_stall_guard !== false && params.enableMutationStallGuard !== false;
+    const enableSourceDriftGuard =
+      params.enable_source_drift_guard !== false && params.enableSourceDriftGuard !== false;
+    const enableInfallibleAudit =
+      params.enable_infallible_audit !== false && params.enableInfallibleAudit !== false;
+    const rawExplicitWorkspaceDir = params.workspace_dir ?? params.workspaceDir;
+    const explicitWorkspaceDir =
+      typeof rawExplicitWorkspaceDir === 'string' && rawExplicitWorkspaceDir.trim()
+        ? path.resolve(workspaceRoot, rawExplicitWorkspaceDir.trim())
+        : null;
     const initialDriftState = {
       driftScore: 0,
       overcollectionCount: 0,
@@ -1418,7 +2327,22 @@ export function createGroundedHarnessEngine({
       taintedDomains: [],
       maxBulkLimit,
       enableAuthDriftGuard,
-      enableDartBoundaryGuard
+      enableDartBoundaryGuard,
+      maxStalledMutations,
+      enableMutationStallGuard,
+      enableSourceDriftGuard,
+      enableInfallibleAudit,
+      workspaceDir: explicitWorkspaceDir,
+      sessionMutatedPaths: [],
+      mutationStall: {
+        stalledStreak: 0,
+        bestPassedCases: null,
+        mutationsSinceLastEval: 0,
+        stalledHolds: 0
+      },
+      stalledMutationHolds: 0,
+      staleGroundingBlocks: 0,
+      infallibleAuditBlocks: 0
     };
     const attestedScopes = inferGoalAttestedScopes(goal, allowedScopes);
     const now = Date.now();
@@ -1544,6 +2468,12 @@ export function createGroundedHarnessEngine({
       enableAuthDriftGuard,
       enable_dart_boundary_guard,
       enableDartBoundaryGuard,
+      enable_mutation_stall_guard,
+      enableMutationStallGuard,
+      allow_stalled_mutation,
+      allowStalledMutation,
+      max_stalled_mutations,
+      maxStalledMutations,
       suppress_turn0_reads = true,
       block_spin_loop = false
     } = params || {};
@@ -1701,6 +2631,7 @@ export function createGroundedHarnessEngine({
     }
 
     // 2.3. Early Scope & Authorization Drift Guard + SERS Data Minimization (INV-GH-12)
+    let updatedDriftStateObj = null;
     let updatedDriftStateJson = null;
     if (authDriftEnabled) {
       const groundedFiles = safeParseJsonObject(session.file_digests_json);
@@ -1731,10 +2662,11 @@ export function createGroundedHarnessEngine({
         maxBulkLimit: sessionMaxBulkLimit
       });
 
-      updatedDriftStateJson = JSON.stringify({
+      updatedDriftStateObj = {
         ...storedDriftState,
         ...driftVerdict.nextDriftState
-      });
+      };
+      updatedDriftStateJson = JSON.stringify(updatedDriftStateObj);
 
       if (driftVerdict.decision === 'BLOCK') {
         insertEventStmt.run(
@@ -2025,7 +2957,86 @@ export function createGroundedHarnessEngine({
       });
     }
 
-    // 4. Mutating path: duplicate-write prevention (with GH-EVO-01 rollback exemption) + SMALL_MODEL soft holds
+    // 4. Mutating path: 3-strike mutation stall breaker (INV-GH-13) + duplicate-write prevention + SMALL_MODEL soft holds
+    const stallGuardEnabled =
+      storedDriftState.enableMutationStallGuard !== false &&
+      enable_mutation_stall_guard !== false &&
+      enableMutationStallGuard !== false;
+    const allowStalled =
+      allow_stalled_mutation === true || allowStalledMutation === true;
+
+    if (stallGuardEnabled && !allowStalled) {
+      const priorStall =
+        storedDriftState.mutationStall && typeof storedDriftState.mutationStall === 'object'
+          ? storedDriftState.mutationStall
+          : {};
+      const effectiveMaxStall =
+        max_stalled_mutations ??
+        maxStalledMutations ??
+        storedDriftState.maxStalledMutations ??
+        3;
+      const stallCheck = evaluateMutationStallGuard({
+        priorState: priorStall,
+        isMutating: false,
+        maxStalledMutations: effectiveMaxStall
+      });
+      if (stallCheck.stalled) {
+        const nextStallHolds = Number(storedDriftState.stalledMutationHolds || 0) + 1;
+        const nextMutationStall = {
+          ...stallCheck.nextState,
+          stalledHolds: Number(priorStall.stalledHolds || 0) + 1
+        };
+        const baseDrift = updatedDriftStateObj || storedDriftState;
+        const stalledDriftJson = JSON.stringify({
+          ...baseDrift,
+          mutationStall: nextMutationStall,
+          stalledMutationHolds: nextStallHolds
+        });
+        const stallIssues = [
+          {
+            code: 'STALLED_MUTATION_LOOP',
+            stalledStreak: stallCheck.stalledStreak,
+            bestPassedCases: stallCheck.bestPassedCases,
+            maxStalledMutations: stallCheck.maxStalledMutations,
+            message: stallCheck.correctivePrompt
+          }
+        ];
+        insertEventStmt.run(
+          eventId,
+          sessionId,
+          stepNum,
+          toolName,
+          1,
+          0,
+          canonicalArgsJson,
+          callSignature,
+          'HOLD',
+          'HELD',
+          JSON.stringify(stallIssues),
+          '',
+          now,
+          now
+        );
+        db.prepare(
+          'UPDATE grounded_sessions SET drift_state_json = ?, updated_at_ms = ? WHERE session_id = ?'
+        ).run(stalledDriftJson, now, sessionId);
+        return okEnvelope(
+          'krusch_grounded_intercept',
+          `Held ${toolName} by mutation stall guard (${stallCheck.stalledStreak} stalled verified cycle(s)).`,
+          {
+            event_id: eventId,
+            decision: 'HOLD',
+            reason: 'STALLED_MUTATION_LOOP',
+            stalledStreak: stallCheck.stalledStreak,
+            bestPassedCases: stallCheck.bestPassedCases,
+            maxStalledMutations: stallCheck.maxStalledMutations,
+            correctivePrompt: stallCheck.correctivePrompt,
+            issues: stallIssues
+          }
+        );
+      }
+    }
+
     const exemptDuplicateWrite = activeEvolvedRules.some(
       (rule) =>
         rule.action === SYNTHESIZED_RULE_ACTIONS.EXEMPT_DUPLICATE_WRITE &&
@@ -2130,18 +3141,40 @@ export function createGroundedHarnessEngine({
     });
   }
 
-  function recordToolOutcome({
-    session_id,
-    event_id,
-    ok = true,
-    result_preview = '',
-    timed_out = false,
-    partial_stdout = '',
-    pending_diffs_delta = 0,
-    verification_passed = undefined,
-    clear_pending_diffs = undefined
-  } = {}) {
-    const sessionId = String(session_id || '').trim();
+  function recordToolOutcome(params = {}) {
+    const {
+      session_id,
+      sessionId: altSessionId,
+      event_id,
+      eventId: altEventId,
+      ok = true,
+      result_preview,
+      resultPreview,
+      timed_out,
+      timedOut,
+      partial_stdout,
+      partialStdout,
+      pending_diffs_delta,
+      pendingDiffsDelta,
+      verification_passed,
+      verificationPassed,
+      clear_pending_diffs,
+      clearPendingDiffs,
+      passed_cases,
+      passedCases,
+      total_cases,
+      totalCases,
+      mutated_paths,
+      mutatedPaths,
+      reset_mutation_stall,
+      resetMutationStall,
+      max_stalled_mutations,
+      maxStalledMutations,
+      updated_file_digests,
+      updatedFileDigests
+    } = params || {};
+
+    const sessionId = String(session_id ?? altSessionId ?? '').trim();
     const session = sessionId ? selectSessionStmt.get(sessionId) : null;
     if (!session) {
       return okEnvelope(
@@ -2151,23 +3184,32 @@ export function createGroundedHarnessEngine({
         false
       );
     }
-    const event = event_id ? selectEventStmt.get(String(event_id).trim(), sessionId) : null;
+    const resolvedEventId = String(event_id ?? altEventId ?? '').trim();
+    const event = resolvedEventId ? selectEventStmt.get(resolvedEventId, sessionId) : null;
     if (!event) {
       return okEnvelope(
         'krusch_grounded_outcome',
-        `Event "${String(event_id || '')}" not found.`,
+        `Event "${resolvedEventId}" not found.`,
         { status: 'EVENT_NOT_FOUND' },
         false
       );
     }
 
-    const isTimeout = Boolean(timed_out);
+    const isTimeout = Boolean(timed_out ?? timedOut ?? false);
     const finalStatus = !isTimeout && ok !== false ? 'COMMITTED' : 'FAILED';
+    const rawPreview = result_preview ?? resultPreview ?? '';
+    const rawPartial = partial_stdout ?? partialStdout ?? '';
     const preview = isTimeout
-      ? String(partial_stdout || result_preview || '').slice(0, 2000)
-      : String(result_preview || '').slice(0, 1024);
+      ? String(rawPartial || rawPreview || '').slice(0, 2000)
+      : String(rawPreview || '').slice(0, 1024);
     const now = Date.now();
-    const deltaNum = Number(pending_diffs_delta || 0);
+    const deltaNum = Number(pending_diffs_delta ?? pendingDiffsDelta ?? 0);
+    const effectiveVerificationPassed =
+      verification_passed !== undefined ? verification_passed : verificationPassed;
+    const effectiveClearPendingDiffs =
+      clear_pending_diffs !== undefined ? clear_pending_diffs : clearPendingDiffs;
+    const effectivePassedCases = passed_cases !== undefined ? passed_cases : passedCases;
+    const effectiveTotalCases = total_cases !== undefined ? total_cases : totalCases;
 
     const eventArgs = safeParseJsonObject(event.canonical_args_json);
     const eventCommandText = extractCommandTextFromArgs(eventArgs);
@@ -2175,9 +3217,11 @@ export function createGroundedHarnessEngine({
 
     let nextDiffs = Number(session.pending_diffs_count || 0);
     let nextVerifyPassed = Number(session.latest_verification_passed ?? 1);
+    let exemptCleanupDiff = false;
+    let creditedInlineVerify = false;
 
     if (finalStatus === 'COMMITTED') {
-      const exemptCleanupDiff =
+      exemptCleanupDiff =
         Boolean(event.is_mutating) &&
         nextDiffs === 0 &&
         nextVerifyPassed === 1 &&
@@ -2189,34 +3233,134 @@ export function createGroundedHarnessEngine({
 
       if (!exemptCleanupDiff) {
         nextDiffs = Math.max(0, nextDiffs + deltaNum);
-        if (deltaNum > 0 && verification_passed === undefined) {
+        if (deltaNum > 0 && effectiveVerificationPassed === undefined) {
           nextVerifyPassed = 0;
         }
       }
 
-      if (verification_passed === undefined && deltaNum <= 0) {
+      if (effectiveVerificationPassed === undefined && deltaNum <= 0) {
         const creditInlineVerify = activeEvolvedRules.some(
           (rule) =>
             rule.action === SYNTHESIZED_RULE_ACTIONS.CREDIT_INLINE_VERIFY &&
             matchesEvolvedRule(rule, eventToolName, eventCommandText)
         );
         if (creditInlineVerify) {
+          creditedInlineVerify = true;
           nextVerifyPassed = 1;
-          if (clear_pending_diffs !== false) {
+          if (effectiveClearPendingDiffs !== false) {
             nextDiffs = 0;
           }
         }
       }
     }
 
-    if (verification_passed === true) {
+    if (effectiveVerificationPassed === true) {
       nextVerifyPassed = 1;
-      if (clear_pending_diffs !== false) {
+      if (effectiveClearPendingDiffs !== false) {
         nextDiffs = 0;
       }
-    } else if (verification_passed === false) {
+    } else if (effectiveVerificationPassed === false) {
       nextVerifyPassed = 0;
+    } else if (
+      effectivePassedCases !== undefined &&
+      effectivePassedCases !== null &&
+      effectiveTotalCases !== undefined &&
+      effectiveTotalCases !== null &&
+      Number.isFinite(Number(effectivePassedCases)) &&
+      Number.isFinite(Number(effectiveTotalCases)) &&
+      Number(effectiveTotalCases) > 0
+    ) {
+      if (Number(effectivePassedCases) >= Number(effectiveTotalCases)) {
+        nextVerifyPassed = 1;
+        if (effectiveClearPendingDiffs !== false) {
+          nextDiffs = 0;
+        }
+      } else {
+        nextVerifyPassed = 0;
+      }
     }
+
+    // Hydrate & evolve drift_state_json (sessionMutatedPaths + mutationStall)
+    const storedDriftState = safeParseJsonObject(session.drift_state_json);
+    const resolvedSessionRoot =
+      typeof storedDriftState.workspaceDir === 'string' && storedDriftState.workspaceDir.trim()
+        ? path.resolve(storedDriftState.workspaceDir.trim())
+        : null;
+    const existingMutatedPaths = Array.isArray(storedDriftState.sessionMutatedPaths)
+      ? storedDriftState.sessionMutatedPaths.map((p) => String(p))
+      : [];
+    const mutatedSet = new Set(existingMutatedPaths);
+    if (finalStatus === 'COMMITTED' && Boolean(event.is_mutating) && !exemptCleanupDiff) {
+      const newlyMutated = extractMutatedPathsFromArgs(
+        eventArgs,
+        mutated_paths ?? mutatedPaths ?? [],
+        resolvedSessionRoot
+      );
+      for (const mp of newlyMutated) mutatedSet.add(mp);
+    } else if (Array.isArray(mutated_paths ?? mutatedPaths)) {
+      const extraMutated = extractMutatedPathsFromArgs(
+        null,
+        mutated_paths ?? mutatedPaths,
+        resolvedSessionRoot
+      );
+      for (const mp of extraMutated) mutatedSet.add(mp);
+    }
+    const nextMutatedPaths = [...mutatedSet];
+
+    const priorStall =
+      storedDriftState.mutationStall && typeof storedDriftState.mutationStall === 'object'
+        ? storedDriftState.mutationStall
+        : {
+            stalledStreak: 0,
+            bestPassedCases: null,
+            mutationsSinceLastEval: 0,
+            stalledHolds: 0
+          };
+    const shouldResetStall =
+      reset_mutation_stall === true || resetMutationStall === true;
+    const effectiveMaxStall =
+      max_stalled_mutations ??
+      maxStalledMutations ??
+      storedDriftState.maxStalledMutations ??
+      3;
+
+    let nextMutationStall;
+    if (shouldResetStall) {
+      nextMutationStall = {
+        stalledStreak: 0,
+        bestPassedCases: null,
+        mutationsSinceLastEval: 0,
+        stalledHolds: Number(priorStall.stalledHolds || 0)
+      };
+    } else {
+      const evalVerifSignal =
+        typeof effectiveVerificationPassed === 'boolean'
+          ? effectiveVerificationPassed
+          : creditedInlineVerify
+            ? true
+            : undefined;
+      const stallEval = evaluateMutationStallGuard({
+        priorState: priorStall,
+        isMutating: Boolean(event.is_mutating) && finalStatus === 'COMMITTED' && !exemptCleanupDiff,
+        passedCases: effectivePassedCases,
+        totalCases: effectiveTotalCases,
+        verificationPassed: evalVerifSignal,
+        maxStalledMutations: effectiveMaxStall
+      });
+      nextMutationStall = stallEval.nextState;
+    }
+
+    const nextDriftStateJson = JSON.stringify({
+      ...storedDriftState,
+      sessionMutatedPaths: nextMutatedPaths,
+      mutationStall: nextMutationStall
+    });
+
+    const rawUpdatedDigests = updated_file_digests ?? updatedFileDigests;
+    const nextFileDigestsJson =
+      rawUpdatedDigests && typeof rawUpdatedDigests === 'object' && !Array.isArray(rawUpdatedDigests)
+        ? JSON.stringify(rawUpdatedDigests)
+        : null;
 
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -2235,9 +3379,21 @@ export function createGroundedHarnessEngine({
             timeouts_with_partial_stdout = timeouts_with_partial_stdout + ?,
             pending_diffs_count = ?,
             latest_verification_passed = ?,
+            drift_state_json = ?,
+            file_digests_json = COALESCE(?, file_digests_json),
             updated_at_ms = ?
         WHERE session_id = ?
-      `).run(addRead, addMut, addTimeout, nextDiffs, nextVerifyPassed, now, sessionId);
+      `).run(
+        addRead,
+        addMut,
+        addTimeout,
+        nextDiffs,
+        nextVerifyPassed,
+        nextDriftStateJson,
+        nextFileDigestsJson,
+        now,
+        sessionId
+      );
       db.exec('COMMIT');
     } catch (err) {
       try {
@@ -2254,6 +3410,8 @@ export function createGroundedHarnessEngine({
       status: finalStatus,
       pending_diffs_count: nextDiffs,
       latest_verification_passed: nextVerifyPassed,
+      mutation_stall: nextMutationStall,
+      session_mutated_paths: nextMutatedPaths,
       timed_out: isTimeout,
       preserved_stdout: isTimeout ? preview : undefined,
       has_final_answer: false,
@@ -2261,19 +3419,43 @@ export function createGroundedHarnessEngine({
     });
   }
 
-  function verifyStop({
-    session_id,
-    assistant_text = '',
-    candidate_answer = undefined,
-    finish_reason = null,
-    truncated_tool_calls = false,
-    tool_calls = [],
-    expect_non_empty_answer = false,
-    pending_diffs_count = undefined,
-    latest_verification_passed = undefined,
-    verification_command = 'npm test'
-  } = {}) {
-    const sessionId = String(session_id || '').trim();
+  function verifyStop(params = {}) {
+    const {
+      session_id,
+      sessionId: altSessionId,
+      assistant_text,
+      assistantText,
+      candidate_answer,
+      candidateAnswer,
+      finish_reason,
+      finishReason,
+      truncated_tool_calls,
+      truncatedToolCalls,
+      tool_calls,
+      toolCalls,
+      expect_non_empty_answer,
+      expectNonEmptyAnswer,
+      pending_diffs_count,
+      pendingDiffsCount,
+      latest_verification_passed,
+      latestVerificationPassed,
+      verification_command,
+      verificationCommand,
+      current_file_digests,
+      currentFileDigests,
+      workspace_dir,
+      workspaceDir,
+      session_mutated_paths,
+      sessionMutatedPaths,
+      audited_files,
+      auditedFiles,
+      enable_source_drift_guard,
+      enableSourceDriftGuard,
+      enable_infallible_audit,
+      enableInfallibleAudit
+    } = params || {};
+
+    const sessionId = String(session_id ?? altSessionId ?? '').trim();
     const session = sessionId ? selectSessionStmt.get(sessionId) : null;
     if (!session) {
       return okEnvelope(
@@ -2286,14 +3468,36 @@ export function createGroundedHarnessEngine({
 
     const now = Date.now();
     const scaleProfile = JSON.parse(session.scale_profile_json);
+    const effectiveAssistantText = String(assistant_text ?? assistantText ?? '');
+    const effectiveCandidateAnswer =
+      candidate_answer !== undefined ? candidate_answer : candidateAnswer;
+    const effectiveFinishReason = finish_reason ?? finishReason ?? null;
+    const effectiveTruncatedToolCalls = Boolean(
+      truncated_tool_calls ?? truncatedToolCalls ?? false
+    );
+    const effectiveToolCalls = Array.isArray(tool_calls ?? toolCalls)
+      ? (tool_calls ?? toolCalls)
+      : [];
+    const effectiveExpectNonEmpty = Boolean(
+      expect_non_empty_answer ?? expectNonEmptyAnswer ?? false
+    );
+    const rawPendingOverride =
+      pending_diffs_count !== undefined ? pending_diffs_count : pendingDiffsCount;
     const effectivePendingDiffs =
-      pending_diffs_count !== undefined
-        ? Number(pending_diffs_count)
+      rawPendingOverride !== undefined
+        ? Number(rawPendingOverride)
         : Number(session.pending_diffs_count || 0);
-    const effectiveVerified =
+    const rawVerifiedOverride =
       latest_verification_passed !== undefined
-        ? Boolean(latest_verification_passed)
+        ? latest_verification_passed
+        : latestVerificationPassed;
+    const effectiveVerified =
+      rawVerifiedOverride !== undefined
+        ? Boolean(rawVerifiedOverride)
         : Boolean(session.latest_verification_passed);
+    const effectiveVerifyCmd = String(
+      verification_command ?? verificationCommand ?? 'npm test'
+    );
 
     // 1. Staged-diff-only FORCE_VERIFY (INV-GH-05: ONLY when pendingDiffsCount > 0 && !latestVerificationPassed)
     if (effectivePendingDiffs > 0 && !effectiveVerified) {
@@ -2308,19 +3512,169 @@ export function createGroundedHarnessEngine({
           shouldNudge: true,
           action: 'FORCE_VERIFY',
           reason: 'UNVERIFIED_STAGED_DIFFS',
-          correctivePrompt: `Run verification (${verification_command}) before completing ${effectivePendingDiffs} staged diff(s).`
+          correctivePrompt: `Run verification (${effectiveVerifyCmd}) before completing ${effectivePendingDiffs} staged diff(s).`
         }
       );
     }
 
-    // 2. Universal zero-turn-when-healthy Output Defect Gate (max 1 defect retry)
+    const storedDriftState = safeParseJsonObject(session.drift_state_json);
+
+    // 2. Upstream Source Fingerprint Drift Invalidation (INV-GH-14)
+    const sourceDriftEnabled =
+      storedDriftState.enableSourceDriftGuard !== false &&
+      enable_source_drift_guard !== false &&
+      enableSourceDriftGuard !== false;
+    const rawCurrentDigests = current_file_digests ?? currentFileDigests ?? null;
+    const rawVerifyWorkspace =
+      workspace_dir ?? workspaceDir ?? storedDriftState.workspaceDir ?? null;
+    const resolvedVerifyWorkspace =
+      typeof rawVerifyWorkspace === 'string' && rawVerifyWorkspace.trim()
+        ? path.resolve(workspaceRoot, rawVerifyWorkspace.trim())
+        : null;
+
+    if (
+      sourceDriftEnabled &&
+      ((rawCurrentDigests && typeof rawCurrentDigests === 'object') || resolvedVerifyWorkspace)
+    ) {
+      const baselineDigests = safeParseJsonObject(session.file_digests_json);
+      const storedMutated = Array.isArray(storedDriftState.sessionMutatedPaths)
+        ? storedDriftState.sessionMutatedPaths
+        : [];
+      const extraMutated = Array.isArray(session_mutated_paths ?? sessionMutatedPaths)
+        ? (session_mutated_paths ?? sessionMutatedPaths)
+        : [];
+      const driftCheck = evaluateSourceFingerprintDrift({
+        baselineDigests,
+        currentDigests: rawCurrentDigests,
+        workspaceDir: resolvedVerifyWorkspace,
+        sessionMutatedPaths: [...storedMutated, ...extraMutated]
+      });
+      if (driftCheck.drifted) {
+        const nextStaleBlocks = Number(storedDriftState.staleGroundingBlocks || 0) + 1;
+        const updatedDriftJson = JSON.stringify({
+          ...storedDriftState,
+          staleGroundingBlocks: nextStaleBlocks
+        });
+        db.prepare(
+          `UPDATE grounded_sessions
+           SET verify_nudges_used = verify_nudges_used + 1,
+               latest_verification_passed = 0,
+               drift_state_json = ?,
+               updated_at_ms = ?
+           WHERE session_id = ?`
+        ).run(updatedDriftJson, now, sessionId);
+        return okEnvelope(
+          'krusch_grounded_verify_stop',
+          `Blocked stop: ${driftCheck.driftedFiles.length} upstream file(s) drifted since Turn-0 grounding.`,
+          {
+            allowStop: false,
+            shouldNudge: true,
+            action: 'FORCE_REVERIFY_STALE_SOURCE',
+            reason: driftCheck.reason,
+            driftedFiles: driftCheck.driftedFiles,
+            checkedCount: driftCheck.checkedCount,
+            nudgePrompt: driftCheck.correctivePrompt,
+            correctivePrompt: driftCheck.correctivePrompt
+          }
+        );
+      }
+    }
+
+    // 3. // INFALLIBLE: <reason> Panic & Assertion Surface Auditor (INV-GH-15)
+    const infallibleAuditEnabled =
+      storedDriftState.enableInfallibleAudit !== false &&
+      enable_infallible_audit !== false &&
+      enableInfallibleAudit !== false;
+    const rawAuditedFiles = audited_files ?? auditedFiles;
+
+    if (infallibleAuditEnabled && rawAuditedFiles) {
+      const normalizedFileEntries = [];
+      if (Array.isArray(rawAuditedFiles)) {
+        for (const item of rawAuditedFiles) {
+          if (!item || typeof item !== 'object') continue;
+          const itemPath = String(item.filePath ?? item.file_path ?? item.path ?? item.file ?? '');
+          let itemCode = item.code ?? item.content ?? item.source;
+          if (itemCode === undefined && itemPath && resolvedVerifyWorkspace) {
+            const fullPath = path.resolve(resolvedVerifyWorkspace, itemPath);
+            const relCheck = path.relative(resolvedVerifyWorkspace, fullPath);
+            if (relCheck && !relCheck.startsWith('..') && !path.isAbsolute(relCheck)) {
+              try {
+                if (fs.existsSync(fullPath) && fs.lstatSync(fullPath).isFile()) {
+                  itemCode = fs.readFileSync(fullPath, 'utf8');
+                }
+              } catch {
+                itemCode = '';
+              }
+            }
+          }
+          normalizedFileEntries.push({
+            filePath: itemPath,
+            code: String(itemCode ?? ''),
+            language: String(item.language ?? item.lang ?? ''),
+            requireFallibleContract:
+              item.requireFallibleContract ?? item.require_fallible_contract ?? true
+          });
+        }
+      } else if (typeof rawAuditedFiles === 'object') {
+        for (const [fPath, fCode] of Object.entries(rawAuditedFiles)) {
+          normalizedFileEntries.push({
+            filePath: String(fPath),
+            code: String(fCode ?? ''),
+            language: '',
+            requireFallibleContract: true
+          });
+        }
+      }
+
+      const allFindings = [];
+      const prompts = [];
+      for (const entry of normalizedFileEntries) {
+        const auditRes = auditInfallibleAssertions(entry);
+        if (!auditRes.passed) {
+          allFindings.push(...auditRes.findings);
+          if (auditRes.correctivePrompt) prompts.push(auditRes.correctivePrompt);
+        }
+      }
+
+      if (allFindings.length > 0) {
+        const nextInfallibleBlocks = Number(storedDriftState.infallibleAuditBlocks || 0) + 1;
+        const updatedDriftJson = JSON.stringify({
+          ...storedDriftState,
+          infallibleAuditBlocks: nextInfallibleBlocks
+        });
+        const mergedPrompt = prompts.join(' ');
+        db.prepare(
+          `UPDATE grounded_sessions
+           SET verify_nudges_used = verify_nudges_used + 1,
+               drift_state_json = ?,
+               updated_at_ms = ?
+           WHERE session_id = ?`
+        ).run(updatedDriftJson, now, sessionId);
+        return okEnvelope(
+          'krusch_grounded_verify_stop',
+          `Blocked stop: ${allFindings.length} unannotated panic/exit/stub assertion(s) detected.`,
+          {
+            allowStop: false,
+            shouldNudge: true,
+            action: 'REJECT_UNEXPLAINED_PANIC',
+            reason: 'UNEXPLAINED_INFALLIBLE_ASSERTION',
+            infallibleFindings: allFindings,
+            findings: allFindings,
+            nudgePrompt: mergedPrompt,
+            correctivePrompt: mergedPrompt
+          }
+        );
+      }
+    }
+
+    // 4. Universal zero-turn-when-healthy Output Defect Gate (max 1 defect retry)
     const defectCheck = inspectOutputDefects({
-      candidateAnswer: candidate_answer,
-      assistantText: assistant_text,
-      finishReason: finish_reason,
-      truncatedToolCalls: truncated_tool_calls,
-      toolCalls: tool_calls,
-      expectNonEmptyAnswer: expect_non_empty_answer
+      candidateAnswer: effectiveCandidateAnswer,
+      assistantText: effectiveAssistantText,
+      finishReason: effectiveFinishReason,
+      truncatedToolCalls: effectiveTruncatedToolCalls,
+      toolCalls: effectiveToolCalls,
+      expectNonEmptyAnswer: effectiveExpectNonEmpty
     });
     if (defectCheck.hasDefect && Number(session.output_defects_caught || 0) < 1) {
       db.prepare(
@@ -2340,13 +3694,13 @@ export function createGroundedHarnessEngine({
       );
     }
 
-    // 3. SMALL_MODEL uncommitted draft rescue (never nudges policy abstentions!)
+    // 5. SMALL_MODEL uncommitted draft rescue (never nudges policy abstentions!)
     if (
       scaleProfile.maxMechanicalVerifyNudges > 0 &&
       Number(session.committed_mutations || 0) === 0 &&
       Number(session.verify_nudges_used || 0) < scaleProfile.maxMechanicalVerifyNudges &&
-      UNCOMMITTED_DRAFT_RE.test(String(assistant_text || '')) &&
-      !POLICY_ABSTENTION_RE.test(String(assistant_text || ''))
+      UNCOMMITTED_DRAFT_RE.test(effectiveAssistantText) &&
+      !POLICY_ABSTENTION_RE.test(effectiveAssistantText)
     ) {
       db.prepare(
         'UPDATE grounded_sessions SET verify_nudges_used = verify_nudges_used + 1, updated_at_ms = ? WHERE session_id = ?'
@@ -2376,8 +3730,8 @@ export function createGroundedHarnessEngine({
     });
   }
 
-  function sessionSummary({ session_id } = {}) {
-    const sessionId = String(session_id || '').trim();
+  function sessionSummary(params = {}) {
+    const sessionId = String(params?.session_id ?? params?.sessionId ?? '').trim();
     const row = sessionId ? selectSessionStmt.get(sessionId) : null;
     if (!row) {
       return okEnvelope(
@@ -2400,6 +3754,21 @@ export function createGroundedHarnessEngine({
     }));
 
     const hydratedDrift = safeParseJsonObject(row.drift_state_json);
+    const rawMutationStall =
+      hydratedDrift.mutationStall && typeof hydratedDrift.mutationStall === 'object'
+        ? hydratedDrift.mutationStall
+        : {};
+    const mutationStall = {
+      stalledStreak: Number(rawMutationStall.stalledStreak || 0),
+      bestPassedCases:
+        rawMutationStall.bestPassedCases !== null &&
+        rawMutationStall.bestPassedCases !== undefined &&
+        Number.isFinite(Number(rawMutationStall.bestPassedCases))
+          ? Number(rawMutationStall.bestPassedCases)
+          : null,
+      mutationsSinceLastEval: Number(rawMutationStall.mutationsSinceLastEval || 0),
+      stalledHolds: Number(rawMutationStall.stalledHolds || 0)
+    };
 
     return okEnvelope('krusch_grounded_summary', `Summary for grounded session ${sessionId}.`, {
       session: {
@@ -2431,6 +3800,10 @@ export function createGroundedHarnessEngine({
         taintedDomains: Array.isArray(hydratedDrift.taintedDomains)
           ? hydratedDrift.taintedDomains
           : [],
+        stalledMutationHolds: Number(hydratedDrift.stalledMutationHolds || 0),
+        staleGroundingBlocks: Number(hydratedDrift.staleGroundingBlocks || 0),
+        infallibleAuditBlocks: Number(hydratedDrift.infallibleAuditBlocks || 0),
+        mutationStall,
         truncationRecoveries: Number(row.truncation_recoveries || 0),
         verifyNudgesUsed: Number(row.verify_nudges_used || 0)
       },

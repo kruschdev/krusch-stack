@@ -22,11 +22,14 @@ import {
   evolveRulesFromTraces,
   SENSITIVE_SCOPE_DOMAINS,
   AUTH_DRIFT_REASON_CODES,
-  auditTrajectoryAuthorizationDrift
+  auditTrajectoryAuthorizationDrift,
+  evaluateMutationStallGuard,
+  evaluateSourceFingerprintDrift,
+  auditInfallibleAssertions
 } from '../src/engines/grounded-harness-engine.js';
 import { startHttpGateway } from '../bin/krusch-stack.js';
 
-describe('Tier 3B Extension: Grounded Harness Engine (INV-STACK-11 / INV-GH-01..12)', () => {
+describe('Tier 3B Extension: Grounded Harness Engine (INV-STACK-11 / INV-GH-01..15)', () => {
   test('INV-GH-01 & INV-GH-08: Turn-0 grounding extracts CSV "NA" keep_default_na=False, JSON null/[] hazards, SQLite DDL, excludes .env, and pins prefixHash', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-stack-gh-'));
     try {
@@ -639,5 +642,409 @@ describe('Tier 3B Extension: Grounded Harness Engine (INV-STACK-11 / INV-GH-01..
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  test('INV-GH-13: evaluateMutationStallGuard allows multi-file edits prior to eval, resets on test progress, and holds 4th mutating attempt after 3 stalled cycles', () => {
+    // 1. Direct unit checks: baseline capture -> multi-file edits -> 3 stalled cycles -> progress reset -> allPassed reset
+    let state = {};
+    const baseline = evaluateMutationStallGuard({
+      priorState: state,
+      isMutating: false,
+      passedCases: 4,
+      totalCases: 10
+    });
+    assert.equal(baseline.stalled, false);
+    assert.equal(baseline.stalledStreak, 0);
+    assert.equal(baseline.bestPassedCases, 4);
+    state = baseline.nextState;
+
+    // 4 consecutive mutating file edits before verification must NOT increment stalledStreak
+    for (let i = 1; i <= 4; i += 1) {
+      const m = evaluateMutationStallGuard({ priorState: state, isMutating: true });
+      assert.equal(m.stalled, false);
+      assert.equal(m.stalledStreak, 0);
+      assert.equal(m.mutationsSinceLastEval, i);
+      state = m.nextState;
+    }
+
+    // Stalled eval #1 (4/10 == bestPassedCases 4) -> streak 1
+    const stall1 = evaluateMutationStallGuard({
+      priorState: state,
+      passedCases: 4,
+      totalCases: 10,
+      verificationPassed: false
+    });
+    assert.equal(stall1.stalledStreak, 1);
+    assert.equal(stall1.stalled, false);
+    assert.equal(stall1.mutationsSinceLastEval, 0);
+    state = stall1.nextState;
+
+    // Partial progress (6/10 > 4) -> resets streak to 0 and raises bestPassedCases to 6
+    const progress = evaluateMutationStallGuard({
+      priorState: state,
+      passedCases: 6,
+      totalCases: 10,
+      verificationPassed: false
+    });
+    assert.equal(progress.stalledStreak, 0);
+    assert.equal(progress.bestPassedCases, 6);
+    state = progress.nextState;
+
+    // 3 consecutive zero-progress evals (6/10, 5/10, 6/10) -> triggers STALLED_MUTATION_LOOP
+    for (const [idx, cases] of [6, 5, 6].entries()) {
+      const editStep = evaluateMutationStallGuard({ priorState: state, isMutating: true });
+      const evalStep = evaluateMutationStallGuard({
+        priorState: editStep.nextState,
+        passedCases: cases,
+        totalCases: 10,
+        verificationPassed: false
+      });
+      assert.equal(evalStep.stalledStreak, idx + 1);
+      state = evalStep.nextState;
+      if (idx === 2) {
+        assert.equal(evalStep.stalled, true);
+        assert.equal(evalStep.reason, 'STALLED_MUTATION_LOOP');
+        assert.match(evalStep.correctivePrompt, /STALLED_MUTATION_LOOP/);
+      }
+    }
+
+    // Full pass (10/10) clears stall state
+    const fullPass = evaluateMutationStallGuard({
+      priorState: state,
+      passedCases: 10,
+      totalCases: 10
+    });
+    assert.equal(fullPass.stalled, false);
+    assert.equal(fullPass.stalledStreak, 0);
+    assert.equal(fullPass.bestPassedCases, 10);
+
+    // 2. End-to-end session test via createKruschStack
+    const stack = createKruschStack({ ephemeral: true });
+    stack.groundedHarness.startSession({
+      session_id: 'gh-stall-e2e',
+      goal: 'Fix tariff calculation across multi-file module and pass 8 unit tests',
+      model: 'gemini-4-argon'
+    });
+
+    // Multi-file initial edit (3 files before running tests) must all ALLOW
+    for (let f = 1; f <= 3; f += 1) {
+      const edit = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-stall-e2e',
+        step: f,
+        tool_name: 'write_file',
+        args: { path: `src/part_${f}.js`, content: `export const v${f} = ${f};\n` },
+        mutating: true
+      });
+      assert.equal(edit.data.decision, 'ALLOW');
+      stack.groundedHarness.recordToolOutcome({
+        session_id: 'gh-stall-e2e',
+        event_id: edit.data.event_id,
+        ok: true,
+        pending_diffs_delta: 1
+      });
+    }
+
+    // Cycle 1..3: each edit + failed test run fails to improve past 3/8 passing cases
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      if (cycle > 1) {
+        const edit = stack.groundedHarness.interceptToolCall({
+          session_id: 'gh-stall-e2e',
+          step: 10 + cycle * 2,
+          tool_name: 'write_file',
+          args: { path: 'src/part_1.js', content: `export const v1 = ${100 + cycle};\n` },
+          mutating: true
+        });
+        assert.equal(edit.data.decision, 'ALLOW');
+        stack.groundedHarness.recordToolOutcome({
+          session_id: 'gh-stall-e2e',
+          event_id: edit.data.event_id,
+          ok: true,
+          pending_diffs_delta: 1
+        });
+      }
+      const testCall = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-stall-e2e',
+        step: 11 + cycle * 2,
+        tool_name: 'run_tests',
+        args: { suite: `attempt_${cycle}` }
+      });
+      assert.equal(testCall.data.decision, 'ALLOW');
+      const out = stack.groundedHarness.recordToolOutcome({
+        session_id: 'gh-stall-e2e',
+        event_id: testCall.data.event_id,
+        ok: false,
+        passed_cases: 3,
+        total_cases: 8,
+        verification_passed: false
+      });
+      assert.equal(out.data.mutation_stall.stalledStreak, cycle);
+    }
+
+    // 4th mutating attempt is HELD with STALLED_MUTATION_LOOP, while diagnostic reads still ALLOW
+    const heldEdit = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-stall-e2e',
+      step: 20,
+      tool_name: 'write_file',
+      args: { path: 'src/part_1.js', content: 'export const v1 = 999;\n' },
+      mutating: true
+    });
+    assert.equal(heldEdit.data.decision, 'HOLD');
+    assert.equal(heldEdit.data.reason, 'STALLED_MUTATION_LOOP');
+    assert.equal(heldEdit.data.stalledStreak, 3);
+    assert.equal(heldEdit.data.bestPassedCases, 3);
+
+    const diagRead = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-stall-e2e',
+      step: 21,
+      tool_name: 'read_file',
+      args: { path: 'docs/domain-rules.md' }
+    });
+    assert.equal(diagRead.data.decision, 'ALLOW');
+
+    // Explicit allow_stalled_mutation override allows recovery edit, followed by passing verification
+    const overrideEdit = stack.groundedHarness.interceptToolCall({
+      session_id: 'gh-stall-e2e',
+      step: 22,
+      tool_name: 'write_file',
+      args: { path: 'src/part_1.js', content: 'export const v1 = 42;\n' },
+      mutating: true,
+      allow_stalled_mutation: true
+    });
+    assert.equal(overrideEdit.data.decision, 'ALLOW');
+    stack.groundedHarness.recordToolOutcome({
+      session_id: 'gh-stall-e2e',
+      event_id: overrideEdit.data.event_id,
+      ok: true,
+      pending_diffs_delta: 1,
+      passed_cases: 8,
+      total_cases: 8,
+      verification_passed: true
+    });
+
+    const summary = stack.groundedHarness.sessionSummary({ session_id: 'gh-stall-e2e' });
+    assert.equal(summary.ok, true);
+    assert.equal(summary.data.metrics.stalledMutationHolds, 1);
+    assert.equal(summary.data.metrics.mutationStall.stalledStreak, 0);
+    assert.equal(summary.data.metrics.mutationStall.bestPassedCases, 8);
+    stack.db.close();
+  });
+
+  test('INV-GH-14: evaluateSourceFingerprintDrift skips sessionMutatedPaths, blocks upstream drift with FORCE_REVERIFY_STALE_SOURCE, and guards path traversal', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-stack-drift-'));
+    try {
+      fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(tmpDir, 'src', 'owned.js'), 'export const owned = 1;\n', 'utf8');
+      fs.writeFileSync(path.join(tmpDir, 'src', 'upstream.js'), 'export const upstream = 1;\n', 'utf8');
+      fs.writeFileSync(path.join(tmpDir, 'src', 'removed.js'), 'export const removed = true;\n', 'utf8');
+
+      const stack = createKruschStack({ ephemeral: true, workspaceRoot: tmpDir });
+      const grounded = stack.groundedHarness.groundAndStartSession({
+        session_id: 'gh-drift-e2e',
+        workspace_dir: tmpDir,
+        goal: 'Update src/owned.js while upstream files stay consistent',
+        model: 'gemini-4-argon'
+      });
+      assert.equal(grounded.ok, true);
+
+      // Path traversal keys in direct evaluateSourceFingerprintDrift are safely ignored
+      const traversalRes = evaluateSourceFingerprintDrift({
+        baselineDigests: {
+          '../../outside_escape.txt': 'a'.repeat(64),
+          './src\\owned.js': grounded.data.grounding.fileDigests['src/owned.js']
+        },
+        workspaceDir: tmpDir,
+        sessionMutatedPaths: ['src/owned.js']
+      });
+      assert.equal(traversalRes.drifted, false);
+      assert.equal(traversalRes.checkedCount, 0);
+
+      // Session mutates src/owned.js and verifies -> verifyStop must ALLOW because src/owned.js is in sessionMutatedPaths
+      const editOwned = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-drift-e2e',
+        step: 1,
+        tool_name: 'write_file',
+        args: { path: './src/owned.js', content: 'export const owned = 2;\n' },
+        mutating: true
+      });
+      assert.equal(editOwned.data.decision, 'ALLOW');
+      fs.writeFileSync(path.join(tmpDir, 'src', 'owned.js'), 'export const owned = 2;\n', 'utf8');
+      stack.groundedHarness.recordToolOutcome({
+        session_id: 'gh-drift-e2e',
+        event_id: editOwned.data.event_id,
+        ok: true,
+        pending_diffs_delta: 1,
+        verification_passed: true
+      });
+
+      // Now simulate external upstream modification + deletion outside this session
+      fs.writeFileSync(path.join(tmpDir, 'src', 'upstream.js'), 'export const upstream = 999;\n', 'utf8');
+      fs.unlinkSync(path.join(tmpDir, 'src', 'removed.js'));
+
+      const blockedStop = stack.groundedHarness.verifyStop({
+        session_id: 'gh-drift-e2e',
+        assistant_text: 'Updated src/owned.js.'
+      });
+      assert.equal(blockedStop.data.allowStop, false);
+      assert.equal(blockedStop.data.action, 'FORCE_REVERIFY_STALE_SOURCE');
+      assert.equal(blockedStop.data.reason, 'STALE_GROUNDING_DRIFT');
+      assert.equal(blockedStop.data.driftedFiles.length, 2);
+      assert.deepEqual(
+        blockedStop.data.driftedFiles.map((f) => `${f.path}:${f.status}`),
+        ['src/removed.js:DELETED_UPSTREAM', 'src/upstream.js:MODIFIED_UPSTREAM']
+      );
+
+      // Re-ground workspace digests via recordToolOutcome and verify clean stop
+      const regroundRead = stack.groundedHarness.interceptToolCall({
+        session_id: 'gh-drift-e2e',
+        step: 2,
+        tool_name: 'read_file',
+        args: { path: 'src/upstream.js' }
+      });
+      const freshGrounding = compileTurnZeroGrounding({ workspaceDir: tmpDir, goal: 'reground' });
+      stack.groundedHarness.recordToolOutcome({
+        session_id: 'gh-drift-e2e',
+        event_id: regroundRead.data.event_id,
+        ok: true,
+        verification_passed: true,
+        updated_file_digests: freshGrounding.data.fileDigests
+      });
+
+      const cleanStop = stack.groundedHarness.verifyStop({
+        session_id: 'gh-drift-e2e',
+        assistant_text: 'Re-verified against upstream changes.'
+      });
+      assert.equal(cleanStop.data.allowStop, true);
+      assert.equal(cleanStop.data.action, 'ALLOW_STOP');
+
+      const summary = stack.groundedHarness.sessionSummary({ session_id: 'gh-drift-e2e' });
+      assert.equal(summary.data.metrics.staleGroundingBlocks, 1);
+      stack.db.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('INV-GH-15: auditInfallibleAssertions enforces // INFALLIBLE: <reason> on Rust & JS fallible modules, ignores raw strings and #[cfg(test)], and blocks unported stubs in verifyStop', () => {
+    const rustCode = [
+      "pub fn parse_header<'a>(raw: &'a str) -> Result<&'a str, String> {",
+      '  let literal = r#"ignored .unwrap() and panic!("raw") and todo!()"#;',
+      '  let fake = "// INFALLIBLE: fake inside string";',
+      '  // INFALLIBLE: static regex pattern validated at compile time',
+      '  let trimmed = raw.strip_prefix("X-").unwrap();',
+      '  let safe_default = raw.strip_prefix("Y-").unwrap_or("fallback");',
+      '  let bad = trimmed.strip_prefix("Z-").unwrap();',
+      '  // INFALLIBLE: todo stubs must never be excused by comments',
+      '  todo!("finish parser");',
+      '}',
+      '',
+      '#[cfg(test)]',
+      'mod tests {',
+      '  #[test]',
+      '  fn unit_check() {',
+      '    let v: Result<i32, &str> = Ok(7);',
+      '    assert_eq!(v.unwrap(), 7);',
+      '    panic!("allowed in cfg(test)");',
+      '  }',
+      '}'
+    ].join('\n');
+
+    const rustAudit = auditInfallibleAssertions({
+      code: rustCode,
+      filePath: 'src/parser.rs'
+    });
+    assert.equal(rustAudit.passed, false);
+    assert.equal(rustAudit.language, 'rust');
+    assert.equal(rustAudit.fallibleContractDetected, true);
+    assert.equal(rustAudit.reason, 'UNEXPLAINED_INFALLIBLE_ASSERTION');
+    assert.deepEqual(
+      rustAudit.findings.map((f) => ({ line: f.line, kind: f.kind })),
+      [
+        { line: 7, kind: 'unwrap' },
+        { line: 9, kind: 'todo!' }
+      ]
+    );
+
+    // JS fallible module vs non-fallible standalone script
+    const jsNonFallible = 'console.log("cli");\nprocess.exit(1);\n';
+    const jsSkipped = auditInfallibleAssertions({
+      code: jsNonFallible,
+      filePath: 'scripts/cli.js'
+    });
+    assert.equal(jsSkipped.passed, true);
+    assert.equal(jsSkipped.fallibleContractDetected, false);
+
+    const jsFallibleBad = [
+      "import { okEnvelope, errorEnvelope } from './http.js';",
+      'export function handleReq(input) {',
+      '  if (!input) process.exit(1);',
+      '  const tmpl = `interp: ${input ? "ok" : process.exit(2)}`;',
+      '  return okEnvelope("svc", tmpl, {});',
+      '}'
+    ].join('\n');
+    const jsAuditBad = auditInfallibleAssertions({
+      code: jsFallibleBad,
+      filePath: 'src/handler.js'
+    });
+    assert.equal(jsAuditBad.passed, false);
+    assert.deepEqual(
+      jsAuditBad.findings.map((f) => ({ line: f.line, kind: f.kind })),
+      [
+        { line: 3, kind: 'process.exit' },
+        { line: 4, kind: 'process.exit' }
+      ]
+    );
+
+    const jsFallibleAnnotated = [
+      "import { okEnvelope } from './http.js';",
+      'export function bootCli() {',
+      '  process.exit(0); // INFALLIBLE: top-level CLI exit boundary',
+      '  return okEnvelope("svc", "ok", {});',
+      '}'
+    ].join('\n');
+    assert.equal(
+      auditInfallibleAssertions({ code: jsFallibleAnnotated, filePath: 'src/cli.js' }).passed,
+      true
+    );
+
+    // End-to-end verifyStop REJECT_UNEXPLAINED_PANIC -> ALLOW_STOP
+    const stack = createKruschStack({ ephemeral: true });
+    stack.groundedHarness.startSession({
+      session_id: 'gh-infallible-e2e',
+      goal: 'Port parser module to fallible Result contract',
+      model: 'gemini-4-argon'
+    });
+
+    const rejected = stack.groundedHarness.verifyStop({
+      session_id: 'gh-infallible-e2e',
+      assistant_text: 'Port complete.',
+      audited_files: [{ path: 'src/parser.rs', code: rustCode }]
+    });
+    assert.equal(rejected.data.allowStop, false);
+    assert.equal(rejected.data.action, 'REJECT_UNEXPLAINED_PANIC');
+    assert.equal(rejected.data.reason, 'UNEXPLAINED_INFALLIBLE_ASSERTION');
+    assert.equal(rejected.data.infallibleFindings.length, 2);
+    assert.equal(rejected.data.findings.length, 2);
+
+    const cleanRust = [
+      "pub fn parse_header<'a>(raw: &'a str) -> Result<&'a str, String> {",
+      '  let trimmed = raw.strip_prefix("X-").ok_or_else(|| "missing X-".to_string())?;',
+      '  // INFALLIBLE: non-empty ASCII prefix guaranteed after validation',
+      '  let first = trimmed.chars().next().expect("validated non-empty");',
+      '  let _ = first;',
+      '  Ok(trimmed)',
+      '}'
+    ].join('\n');
+
+    const accepted = stack.groundedHarness.verifyStop({
+      session_id: 'gh-infallible-e2e',
+      assistant_text: 'Replaced unwrap/todo with Result propagation and documented invariant.',
+      audited_files: [{ path: 'src/parser.rs', code: cleanRust }]
+    });
+    assert.equal(accepted.data.allowStop, true);
+    assert.equal(accepted.data.action, 'ALLOW_STOP');
+
+    const summary = stack.groundedHarness.sessionSummary({ session_id: 'gh-infallible-e2e' });
+    assert.equal(summary.data.metrics.infallibleAuditBlocks, 1);
+    stack.db.close();
   });
 });
