@@ -5,8 +5,9 @@
 [![MCP Compatible](https://img.shields.io/badge/MCP-5%20to%2039%20Tools-blueviolet.svg)](https://modelcontextprotocol.io)
 [![DolphinBench 91.17% (Queued UUID c047b063)](https://img.shields.io/badge/DolphinBench-91.17%25%20Queued%20(UUID%20c047b063)-00e5ff.svg)](https://krusch.dev/articles/return-on-memory-dolphinbench)
 [![DolphinBench Open-Weights 57.33% ($0.00)](https://img.shields.io/badge/DolphinBench%20Open--Weights-57.33%25%20Gemma%204%2031B%20(%240.00)-brightgreen.svg)](https://huggingface.co/krush420/gemma4-31b-sre-lora)
+[![Audited by AddonAudit](https://addonaudit.com/badges/dev-krusch-krusch-stack.svg)](https://addonaudit.com/addon/dev-krusch-krusch-stack/)
 
-`krusch-stack` (`v1.3.0`) is a local, zero-cloud control plane for AI coding agents (Claude Code, Cursor, Windsurf, Antigravity, Codex). It gives your agent persistent cross-session memory, Turn-0 workspace grounding, spin-loop protection, and two-phase commit (2PC) file safety backed by Node 22 native `node:sqlite`.
+`krusch-stack` (`v1.3.1`) is a local, zero-cloud control plane for AI coding agents (Claude Code, Cursor, Windsurf, Antigravity, Codex). It gives your agent persistent cross-session memory, Turn-0 workspace grounding, spin-loop protection, and two-phase commit (2PC) file safety backed by Node 22 native `node:sqlite`.
 
 ---
 
