@@ -98,7 +98,7 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
     assert.ok(chatOnlyRes.data.totalAllocatedTokens <= 512);
   });
 
-  await t.test('#12 evaluateCostKillSwitch downgrades frontier calls near $0.50 and halts on budget/depth breach', () => {
+  await t.test('#12 evaluateCostKillSwitch halts write turns near $0.50, downgrades bounded read_only turns to Inkling, and halts on context/budget/depth breach', () => {
     const sessionId = 'cost-session-alpha';
     const r1 = stack.resilience.evaluateCostKillSwitch({
       sessionId,
@@ -106,7 +106,7 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
       promptTokens: 2000,
       projectedCompletionTokens: 1000,
       hardLimitUsd: 0.50,
-      maxLoopDepth: 4
+      maxLoopDepth: 6
     });
     assert.equal(r1.ok, true);
 
@@ -117,17 +117,45 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
       completionTokens: 4000
     });
 
-    // ~0.45 USD spent: next frontier call projects > $0.50 so must downgrade to local Ollama
-    const r2 = stack.resilience.evaluateCostKillSwitch({
+    // ~0.45 USD spent: default mutating write turn MUST halt and report instead of silently downgrading
+    const rWriteHalt = stack.resilience.evaluateCostKillSwitch({
+      sessionId,
+      model: 'claude-4-opus',
+      promptTokens: 5000,
+      projectedCompletionTokens: 2000,
+      hardLimitUsd: 0.50
+    });
+    assert.equal(rWriteHalt.ok, false);
+    assert.equal(rWriteHalt.data.status, 'HALTED_BUDGET_EXCEEDED');
+    assert.equal(rWriteHalt.data.reason, 'WRITE_TURN_HALT_AND_REPORT');
+    assert.equal(rWriteHalt.data.selectedModel, null);
+
+    // Bounded read_only wrap-up turn downgrades to $0.00 1st-Chair Inkling by default
+    const rReadOnly = stack.resilience.evaluateCostKillSwitch({
       sessionId,
       model: 'claude-4-opus',
       promptTokens: 5000,
       projectedCompletionTokens: 2000,
       hardLimitUsd: 0.50,
-      fallbackModel: 'qwen2.5-coder:7b'
+      turnMode: 'read_only'
     });
-    assert.equal(r2.ok, true);
-    assert.equal(r2.data.effectiveModel, 'qwen2.5-coder:7b');
+    assert.equal(rReadOnly.ok, true);
+    assert.equal(rReadOnly.data.status, 'DOWNGRADED_LOCAL_FALLBACK');
+    assert.equal(rReadOnly.data.effectiveModel, 'inkling-2-mini:ud-iq4_xs-dspark');
+    assert.equal(rReadOnly.data.projectedCallCostUsd, 0);
+
+    // Oversized read_only turn (>32K context) halts instead of truncating into Inkling's 32K window
+    const rOversized = stack.resilience.evaluateCostKillSwitch({
+      sessionId,
+      model: 'claude-4-opus',
+      promptTokens: 32000,
+      projectedCompletionTokens: 2048,
+      hardLimitUsd: 0.50,
+      turnMode: 'read_only'
+    });
+    assert.equal(rOversized.ok, false);
+    assert.equal(rOversized.data.status, 'HALTED_BUDGET_EXCEEDED');
+    assert.equal(rOversized.data.reason, 'FALLBACK_CONTEXT_WINDOW_EXCEEDED');
 
     // Push past $0.50 hard cap
     stack.resilience.recordCostUsage({
@@ -141,7 +169,8 @@ test('createResilienceEngine (#2 Context Budget, #7 HITL Gate, #8 DAG Gate, #12 
       model: 'gemini-4-argon',
       promptTokens: 1000,
       projectedCompletionTokens: 1000,
-      hardLimitUsd: 0.50
+      hardLimitUsd: 0.50,
+      turnMode: 'read_only'
     });
     assert.equal(r3.ok, false);
     assert.equal(r3.data.status, 'HALTED_BUDGET_EXCEEDED');

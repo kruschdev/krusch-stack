@@ -66,6 +66,7 @@ const FRONTIER_MODEL_PRICING_PER_1M = Object.freeze({
 const LOCAL_MODEL_PATTERNS = [
   /^ollama\//i,
   /^local\//i,
+  /^inkling/i,
   /^qwen/i,
   /^gemma/i,
   /^hermes/i,
@@ -75,8 +76,11 @@ const LOCAL_MODEL_PATTERNS = [
   /^llama/i,
   /^mistral/i,
   /^spectralquant/i,
-  /:(7b|8b|9b|14b|27b|30b|32b|70b|120b|e4b|latest)$/i
+  /:(7b|8b|9b|14b|27b|30b|32b|70b|120b|e2b|e4b|latest)$/i
 ];
+
+export const DEFAULT_LOCAL_FALLBACK_MODEL = 'inkling-2-mini:ud-iq4_xs-dspark';
+export const DEFAULT_FALLBACK_MAX_CONTEXT_TOKENS = 32768;
 
 const SLACK_REPLAY_WINDOW_MS = 5 * 60 * 1000;
 
@@ -744,8 +748,11 @@ export function createResilienceEngine({ db = null } = {}) {
 
   /**
    * 2B. Evaluate $0.50 cost kill-switch and max loop-depth circuit breaker.
-   * Downgrades paid frontier calls to $0.00 local Ollama (`qwen2.5-coder:7b`) before $0.50 overflow,
-   * and halts (`ok: false, status: 'HALTED_BUDGET_EXCEEDED'`) at `>= $0.50` or `> maxLoopDepth`.
+   * Halts and reports (`ok: false, status: 'HALTED_BUDGET_EXCEEDED'`) by default on mutating
+   * (`turnMode: 'write'`) or oversized-context turns before $0.50 overflow so a smaller local
+   * model never takes over a late-stage code diff. Scopes $0.00 local fallback
+   * (`inkling-2-mini:ud-iq4_xs-dspark`, 32K ctx) strictly to bounded `turnMode: 'read_only'`
+   * wrap-up / handoff turns, and hard-halts at `>= $0.50` or `> maxLoopDepth`.
    */
   function evaluateCostKillSwitch({
     sessionId = 'default',
@@ -754,11 +761,21 @@ export function createResilienceEngine({ db = null } = {}) {
     projectedCompletionTokens = 2048,
     hardLimitUsd = 0.5,
     maxLoopDepth = 12,
-    fallbackModel = 'qwen2.5-coder:7b'
+    fallbackModel = DEFAULT_LOCAL_FALLBACK_MODEL,
+    turnMode = 'write',
+    fallbackMaxContextTokens = DEFAULT_FALLBACK_MAX_CONTEXT_TOKENS
   } = {}) {
     const session = getOrCreateSession(sessionId);
     const limitUsd = Number(hardLimitUsd);
     const maxDepth = Math.floor(Number(maxLoopDepth));
+    const normalizedTurnMode =
+      String(turnMode || 'write').trim().toLowerCase() === 'read_only' ? 'read_only' : 'write';
+    const maxFallbackCtx = Math.max(
+      1,
+      Math.floor(Number(fallbackMaxContextTokens) || DEFAULT_FALLBACK_MAX_CONTEXT_TOKENS)
+    );
+    const projectedTotalTokens =
+      Math.max(0, Number(promptTokens) || 0) + Math.max(0, Number(projectedCompletionTokens) || 0);
 
     session.loopDepth += 1;
     session.pendingEvalStep = true;
@@ -782,6 +799,7 @@ export function createResilienceEngine({ db = null } = {}) {
             requestedModel,
             selectedModel: null,
             downgraded: false,
+            turnMode: normalizedTurnMode,
             cumulativeUsd: session.cumulativeUsd,
             projectedCallCostUsd: rawProjectedCostUsd,
             projectedTotalUsd: Number((session.cumulativeUsd + rawProjectedCostUsd).toFixed(8)),
@@ -806,6 +824,7 @@ export function createResilienceEngine({ db = null } = {}) {
             requestedModel,
             selectedModel: null,
             downgraded: false,
+            turnMode: normalizedTurnMode,
             cumulativeUsd: session.cumulativeUsd,
             projectedCallCostUsd: rawProjectedCostUsd,
             projectedTotalUsd: Number((session.cumulativeUsd + rawProjectedCostUsd).toFixed(8)),
@@ -821,13 +840,67 @@ export function createResilienceEngine({ db = null } = {}) {
     const projectedTotalUsd = Number((session.cumulativeUsd + rawProjectedCostUsd).toFixed(8));
 
     if (projectedTotalUsd >= limitUsd && rawProjectedCostUsd > 0) {
+      if (normalizedTurnMode !== 'read_only') {
+        return attachStatusAccessor(
+          okEnvelope(
+            'krusch_cost_kill_switch',
+            `Kill-switch halted mutating write turn for session '${session.sessionId}': projected spend $${projectedTotalUsd.toFixed(4)} >= $${limitUsd.toFixed(2)}; halt and report instead of downgrading`,
+            {
+              status: 'HALTED_BUDGET_EXCEEDED',
+              reason: 'WRITE_TURN_HALT_AND_REPORT',
+              sessionId: session.sessionId,
+              requestedModel,
+              selectedModel: null,
+              effectiveModel: null,
+              downgraded: false,
+              turnMode: normalizedTurnMode,
+              cumulativeUsd: session.cumulativeUsd,
+              projectedCallCostUsd: rawProjectedCostUsd,
+              projectedTotalUsd,
+              hardLimitUsd: limitUsd,
+              loopDepth: session.loopDepth,
+              maxLoopDepth: maxDepth
+            },
+            false
+          )
+        );
+      }
+
+      if (projectedTotalTokens > maxFallbackCtx) {
+        return attachStatusAccessor(
+          okEnvelope(
+            'krusch_cost_kill_switch',
+            `Kill-switch halted read-only fallback for session '${session.sessionId}': projected context ${projectedTotalTokens} tokens exceeds local fallback ceiling ${maxFallbackCtx}`,
+            {
+              status: 'HALTED_BUDGET_EXCEEDED',
+              reason: 'FALLBACK_CONTEXT_WINDOW_EXCEEDED',
+              sessionId: session.sessionId,
+              requestedModel,
+              selectedModel: null,
+              effectiveModel: null,
+              downgraded: false,
+              turnMode: normalizedTurnMode,
+              projectedTotalTokens,
+              fallbackMaxContextTokens: maxFallbackCtx,
+              cumulativeUsd: session.cumulativeUsd,
+              projectedCallCostUsd: rawProjectedCostUsd,
+              projectedTotalUsd,
+              hardLimitUsd: limitUsd,
+              loopDepth: session.loopDepth,
+              maxLoopDepth: maxDepth
+            },
+            false
+          )
+        );
+      }
+
       const cleanFallback = String(fallbackModel || '').trim();
       if (cleanFallback && isLocalZeroCostModel(cleanFallback)) {
         session.downgradedCalls += 1;
         return attachStatusAccessor(
           okEnvelope(
             'krusch_cost_kill_switch',
-            `Projected spend $${projectedTotalUsd.toFixed(4)} would breach $${limitUsd.toFixed(2)} limit; downgraded ${requestedModel} to $0.00 local ${cleanFallback}`,
+            `Projected spend $${projectedTotalUsd.toFixed(4)} would breach $${limitUsd.toFixed(2)} limit on read-only turn; downgraded ${requestedModel} to $0.00 local ${cleanFallback}`,
             {
               status: 'DOWNGRADED_LOCAL_FALLBACK',
               reason: 'PROJECTED_BUDGET_OVERFLOW_DOWNGRADE',
@@ -836,6 +909,9 @@ export function createResilienceEngine({ db = null } = {}) {
               selectedModel: cleanFallback,
               effectiveModel: cleanFallback,
               downgraded: true,
+              turnMode: normalizedTurnMode,
+              projectedTotalTokens,
+              fallbackMaxContextTokens: maxFallbackCtx,
               cumulativeUsd: session.cumulativeUsd,
               projectedCallCostUsd: 0,
               avoidedCostUsd: rawProjectedCostUsd,
@@ -859,7 +935,9 @@ export function createResilienceEngine({ db = null } = {}) {
             sessionId: session.sessionId,
             requestedModel,
             selectedModel: null,
+            effectiveModel: null,
             downgraded: false,
+            turnMode: normalizedTurnMode,
             cumulativeUsd: session.cumulativeUsd,
             projectedCallCostUsd: rawProjectedCostUsd,
             projectedTotalUsd,
@@ -884,6 +962,7 @@ export function createResilienceEngine({ db = null } = {}) {
           selectedModel: requestedModel,
           effectiveModel: requestedModel,
           downgraded: false,
+          turnMode: normalizedTurnMode,
           cumulativeUsd: session.cumulativeUsd,
           projectedCallCostUsd: rawProjectedCostUsd,
           projectedTotalUsd,
