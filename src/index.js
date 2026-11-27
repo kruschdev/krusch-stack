@@ -177,7 +177,7 @@ import {
 import { runStackDoctor, runStackCrashRecoveryDrill } from './installer/doctor.js';
 import { runStackDemo, formatStackDemoText } from './installer/demo.js';
 
-export const VERSION = '1.3.1';
+export const VERSION = '1.3.2';
 
 const DEFAULT_STACK_TOOL_GRAPH_SPINE = Object.freeze([
   {

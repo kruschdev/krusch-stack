@@ -1,7 +1,7 @@
 # KruschStack (`krusch-stack`) Specification
 
 > **Repository**: `https://github.com/kruschdev/krusch-stack.git`
-> **Version**: `1.3.1`
+> **Version**: `1.3.2`
 > **Runtime**: Node.js `>=22.0.0` (Native ESM + `node:sqlite`) & Docker Compose (`pgvector/pgvector:pg16` DDL parity)
 > **License**: MIT
 
@@ -102,9 +102,9 @@
     - `listDriveWorkspace({ folder = "" })`
     - `getWorkspaceStatus()`
 - **`src/engines/router-engine.js`**:
-  - Exports `VERSION = '1.3.1'` and `createRouterEngine({ config })` returning:
+  - Exports `VERSION = '1.3.2'` and `createRouterEngine({ config })` returning:
     - `routeTask({ prompt, task_type, budget_tier })` (aligned with the 3-Chair Bandit fleet: `gemma4:e2b`, `qwen3-coder-30b-moe:latest`, `inkling-2-mini:ud-iq4_xs-dspark`)
-    - `getStackStatus({ engines, db })` (reporting `version: '1.3.1'`, `auxiliary_engines`, `hydrascope_tables_ready`, and `brick_exchange_tables_ready`)
+    - `getStackStatus({ engines, db })` (reporting `version: '1.3.2'`, `auxiliary_engines`, `hydrascope_tables_ready`, and `brick_exchange_tables_ready`)
 
 ### Module Group C: Installer, Doctor & Docker (`src/installer/ide-config.js`, `src/installer/doctor.js`, `Dockerfile`, `docker-compose.yml`, `db/init.sql`)
 - **`src/installer/ide-config.js`**:

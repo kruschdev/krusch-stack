@@ -8,7 +8,7 @@
 
 import { okEnvelope } from '../db/sqlite.js';
 
-export const VERSION = '1.3.1';
+export const VERSION = '1.3.2';
 
 export const THREE_CHAIR_MODELS = Object.freeze({
   first_chair: 'inkling-2-mini:ud-iq4_xs-dspark',
