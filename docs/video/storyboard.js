@@ -164,8 +164,8 @@ export const PILLAR_CARDS = Object.freeze([
   },
   {
     tier: 'TIER 5',
-    name: 'g-krusch',
-    title: 'Workspace Hub & Drive RAG',
+    name: 'krusch-workspace',
+    title: 'Local Workspace Hub & Docs RAG',
     bullets: ['Agent steering docs & hybrid document RAG', 'SQLite zero-setup local indexing & status checks', '6 tools: get_agent_steering, search_drive_rag, write'],
     accent: '#FBBF24'
   }

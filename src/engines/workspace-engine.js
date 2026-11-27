@@ -1,6 +1,6 @@
 /**
  * @module engines/workspace-engine
- * Workspace Hub & Hybrid RAG (g-krusch) for KruschStack.
+ * Local Workspace Hub & Hybrid RAG (krusch-workspace) for KruschStack.
  * Enforces INV-14 MIME disambiguation (.md, .gdoc, .gsheet, .slides),
  * stores workspace documents in SQLite (workspace_files), and mirrors under .krusch-stack/workspace/.
  */

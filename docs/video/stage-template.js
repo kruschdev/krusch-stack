@@ -803,7 +803,7 @@ function renderSceneCli(p) {
     '[Tier 3]  krusch-harness + gh   — 2PC Staged & Turn-0 Grounded Gates',
     '[Router]  krusch-cascade-router — <25µs L1-L3 Cognitive Cascade Router',
     '[Tier 4]  krusch-frontend-mcp   — Design Rules & 16 Lego Templates',
-    '[Tier 5]  g-krusch              — Workspace Hub & Hybrid Document RAG'
+    '[Tier 5]  krusch-workspace      — Local Workspace Hub & Hybrid Document RAG'
   ];
 
   let termHtml = \`<div><span style="color:#00F5D4;">~/workspace/app</span> <span style="color:#00E5FF;">$</span> \${escapeHtml(cmd1.slice(0, typed1Len))}\${p < 0.16 ? '<span style="color:#00E5FF;">▋</span>' : ''}</div>\`;

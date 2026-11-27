@@ -3,7 +3,7 @@
  * Unified Sovereign AI & Coding Agent Stack.
  * Bundles Tier 1 Working Memory (krusch-context-mcp), Tier 2A Git DAG & AST Graph (krusch-git),
  * Tier 2B Page-Anchored OS Filesystem (krusch-fs), Tier 3 2PC Staged Execution Harness (krusch-harness),
- * Frontend Design Engine (krusch-frontend-mcp), Google Workspace Hub (g-krusch), and L1-L3 Cascade Router.
+ * Frontend Design Engine (krusch-frontend-mcp), Local Workspace Hub (krusch-workspace), and L1-L3 Cascade Router.
  */
 
 import path from 'node:path';

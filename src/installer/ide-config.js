@@ -57,7 +57,7 @@ const CORE_MODULAR_SERVERS = [
 
 const FULL_EXTRA_SERVERS = [
   'krusch-frontend-mcp',
-  'g-krusch'
+  'krusch-workspace'
 ];
 
 /**

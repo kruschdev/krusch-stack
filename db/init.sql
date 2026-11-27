@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS frontend_design_rules (
   tokens_json TEXT NOT NULL DEFAULT '{}'
 );
 
--- Tier 5: g-krusch Workspace Files & RAG
+-- Tier 5: Local Workspace Files & RAG
 CREATE TABLE IF NOT EXISTS workspace_files (
   id BIGSERIAL PRIMARY KEY,
   path TEXT NOT NULL UNIQUE,

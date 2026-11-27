@@ -593,7 +593,7 @@ describe('KruschStack Unified Ecosystem Suite (v1.2.0)', () => {
     }
   });
 
-  test('Tier 4 (krusch-frontend-mcp) & Tier 5 (g-krusch) & Router (krusch-cascade-router)', async () => {
+  test('Tier 4 (krusch-frontend-mcp) & Tier 5 (krusch-workspace) & Router (krusch-cascade-router)', async () => {
     const ws = makeTempWorkspace();
     try {
       const stack = createKruschStack({ workspaceRoot: ws, ephemeral: true });

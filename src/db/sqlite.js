@@ -182,7 +182,7 @@ export const STACK_SCHEMA_SQL = `
     tokens_json TEXT NOT NULL DEFAULT '{}'
   );
 
-  -- Tier 5: g-krusch Workspace Files & RAG
+  -- Tier 5: Local Workspace Files & RAG
   CREATE TABLE IF NOT EXISTS workspace_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,

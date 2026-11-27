@@ -111,9 +111,9 @@ const ALL_COMPONENTS = [
   },
   {
     id: 'workspace',
-    name: 'g-krusch',
+    name: 'krusch-workspace',
     tier: 'Tier 5',
-    description: 'Workspace Hub, Steering & Hybrid Document RAG',
+    description: 'Local Workspace Hub, Steering & Hybrid Document RAG',
     core: false
   }
 ];

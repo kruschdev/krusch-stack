@@ -41,7 +41,7 @@ const SERVER_TO_COMPONENT = {
   'krusch-harness': 'harness',
   'krusch-grounded-harness': 'grounded-harness',
   'krusch-frontend-mcp': 'frontend',
-  'g-krusch': 'workspace',
+  'krusch-workspace': 'workspace',
   'krusch-cascade-router': 'router'
 };
 
@@ -774,7 +774,7 @@ export const ALL_STACK_TOOLS = [
   }),
 
   // ============================================================================
-  // Tier 5: g-krusch Workspace Hub (6 tools)
+  // Tier 5: Local Workspace Hub (krusch-workspace, 6 tools)
   // ============================================================================
   defineTool({
     name: 'get_agent_steering',
